@@ -1,0 +1,22 @@
+Source: mold
+Section: unknown
+Priority: optional
+Maintainer: Sylvestre Ledru <sylvestre@debian.org>
+Build-Depends: debhelper-compat (= 13),
+ clang, cmake, libstdc++-10-dev, libssl-dev, libxxhash-dev,
+ zlib1g-dev
+Standards-Version: 4.6.0
+Homepage: https://github.com/rui314/mold
+Vcs-Browser: https://salsa.debian.org/pkg-llvm-team/mold
+Vcs-Git: https://salsa.debian.org/pkg-llvm-team/mold.git
+Rules-Requires-Root: no
+
+Package: mold
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Drop-in linker
+ mold is a faster drop-in replacement for existing Unix linkers.
+ It is several times faster than LLVM lld linker
+ mold is created for increasing developer productivity by reducing
+ build time especially in rapid debug-edit-rebuild cycles.
+
