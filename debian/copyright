@@ -6,6 +6,37 @@ Files-Excluded: third-party/mimalloc/docs/jquery.js
                 third-party/mimalloc/bin/mimalloc-redirect.dll
                 third-party/mimalloc/bin/mimalloc-redirect32.dll
 
+Files: *
+Copyright: 2020-2021 Rui Ueyama <ruiu@cs.stanford.edu>
+License: AGPL-3
+
+Files: third-party/tbb/*
+Copyright: 2005-2021, Intel Corporation
+License: Apache-2.0
+ On Debian systems the full text of the Apache Software License 2.0 can be
+ found in the `/usr/share/common-licenses/Apache-2.0' file.
+
+Files: third-party/mimalloc/*
+Copyright: 2018, 2020, Microsoft Research, Daan Leijen
+License: expat
+ Permission is hereby granted, free of charge, to any person obtaining
+ a copy of this data (the "Data"), to deal in the Data without
+ restriction, including without limitation the rights to use, copy,
+ modify, merge, publish, distribute, sublicense, and/or sell copies of
+ the Data, and to permit persons to whom the Data is furnished to do
+ so, subject to the following conditions:
+ .
+ The above copyright notice and this permission notice shall be
+ included in all copies or substantial portions of the Data.
+ .
+ THE DATA ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+ LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+ WITH THE DATA OR THE USE OR OTHER DEALINGS IN THE DATA.
+
 Files: third-party/tbb/python/tbb/pool.py
  third-party/tbb/python/tbb/test.py
 Copyright: 2006-2008, R Oudkerk (multiprocessing.Pool)
@@ -51,36 +82,6 @@ License: Apache-2.0
  On Debian systems the full text of the Apache Software License 2.0 can be
  found in the `/usr/share/common-licenses/Apache-2.0' file.
 
-Files: third-party/tbb/*
-Copyright: 2005-2021, Intel Corporation
-License: Apache-2.0
- On Debian systems the full text of the Apache Software License 2.0 can be
- found in the `/usr/share/common-licenses/Apache-2.0' file.
-
-Files: *
-Copyright: 2020-2021 Rui Ueyama <ruiu@cs.stanford.edu>
-License: AGPL-3
-
-Files: third-party/mimalloc/*
-Copyright: 2018, 2020, Microsoft Research, Daan Leijen
-License: expat
- Permission is hereby granted, free of charge, to any person obtaining
- a copy of this data (the "Data"), to deal in the Data without
- restriction, including without limitation the rights to use, copy,
- modify, merge, publish, distribute, sublicense, and/or sell copies of
- the Data, and to permit persons to whom the Data is furnished to do
- so, subject to the following conditions:
- .
- The above copyright notice and this permission notice shall be
- included in all copies or substantial portions of the Data.
- .
- THE DATA ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
- OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
- LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
- OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
- WITH THE DATA OR THE USE OR OTHER DEALINGS IN THE DATA.
 
 Files: third-party/mimalloc/docs/dynsections.js
  third-party/mimalloc/docs/navtree.js
