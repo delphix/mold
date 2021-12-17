@@ -1,0 +1,26 @@
+From fbee0ec5887e46676a5b6020b219e433762c3e35 Mon Sep 17 00:00:00 2001
+From: Sylvestre Ledru <sylvestre@debian.org>
+Date: Fri, 17 Dec 2021 09:59:24 +0100
+Subject: [PATCH] test/pie.sh: extend the check to other output
+
+On debian unstable, the output doesn't contain 'Shared object file'
+Parsing a different output
+
+Signed-off-by: Sylvestre Ledru <sylvestre@debian.org>
+---
+ test/elf/pie.sh | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/test/elf/pie.sh b/test/elf/pie.sh
+index 09c2ffd4..b0513554 100755
+--- a/test/elf/pie.sh
++++ b/test/elf/pie.sh
+@@ -16,7 +16,7 @@ int main() {
+ EOF
+ 
+ clang -fuse-ld=$mold -pie -o $t/exe $t/a.o
+-readelf --file-header $t/exe | grep -q 'Shared object file'
++readelf --file-header $t/exe | grep -q -E '(Shared object file|Position-Independent Executable file)'
+ $t/exe | grep -q 'Hello world'
+ 
+ echo OK
