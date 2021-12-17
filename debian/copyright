@@ -3,6 +3,8 @@ Upstream-Name: mold
 Upstream-Contact: ruiu@cs.stanford.edu
 Source: https://github.com/rui314/mold
 
+Files-Excluded: third-party/mimalloc/docs/jquery.js, third-party/mimalloc/bin/mimalloc-redirect.dll, third-party/mimalloc/bin/mimalloc-redirect32.dll
+
 Files: third-party/tbb/*
 Copyright: 2005-2021, Intel Corporation
 License: Apache-2.0
@@ -13,7 +15,6 @@ Files: *
 Copyright: 2020-2021 Rui Ueyama <ruiu@cs.stanford.edu>
 License: AGPL-3
 
-License
 Files: third-party/mimalloc/*
 Copyright: 2018, 2020, Microsoft Research, Daan Leijen
 License: expat
@@ -86,7 +87,8 @@ Files: third-party/tbb/test/common/doctest.h
 Copyright: 2016-2019, Viktor Kirilov
   2020-2021, Intel Corporation
 License: Apache-2.0 and/or Expat
-: AGPL-3
+
+License: AGPL-3
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU Affero General Public License as published by
  the Free Software Foundation, either version 3 of the License, or
