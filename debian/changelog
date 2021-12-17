@@ -1,4 +1,4 @@
-mold (1.0.0-1) UNRELEASED; urgency=medium
+mold (1.0.0-1) unstable; urgency=medium
 
   * Initial release (Closes: #1001812)
 
