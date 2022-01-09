@@ -2,12 +2,12 @@ Index: mold/Makefile
 ===================================================================
 --- mold.orig/Makefile
 +++ mold/Makefile
-@@ -18,7 +18,7 @@ STRIP ?= strip
- OS ?= $(shell uname -s)
+@@ -92,7 +92,7 @@ endif
+ all: mold mold-wrapper.so
  
- # Used for both C and C++
--COMMON_FLAGS = -pthread -fPIE -fno-unwind-tables -fno-asynchronous-unwind-tables
-+COMMON_FLAGS = -pthread -fPIE -fno-unwind-tables -fno-asynchronous-unwind-tables -pie
+ mold: $(OBJS) $(MIMALLOC_LIB) $(TBB_LIB)
+-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) $(OBJS) -o $@ $(LIBS)
++	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -pie $(LDFLAGS) $(OBJS) -o $@ $(LIBS)
+ 	ln -sf mold ld
+ 	ln -sf mold ld64.mold
  
- CFLAGS ?= -O2
- CFLAGS += $(COMMON_FLAGS)
