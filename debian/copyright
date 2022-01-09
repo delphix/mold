@@ -5,6 +5,7 @@ Source: https://github.com/rui314/mold
 Files-Excluded: third-party/mimalloc/docs/jquery.js
                 third-party/mimalloc/bin/mimalloc-redirect.dll
                 third-party/mimalloc/bin/mimalloc-redirect32.dll
+                docs/mold.jpg
 
 Files: *
 Copyright: 2020-2021 Rui Ueyama <ruiu@cs.stanford.edu>
