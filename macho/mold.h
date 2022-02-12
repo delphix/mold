@@ -13,14 +13,14 @@
 
 namespace mold::macho {
 
-static constexpr i64 PAGE_SIZE = 0x4000;
+static constexpr i64 COMMON_PAGE_SIZE = 0x4000;
 static constexpr i64 SHA256_SIZE = 32;
 
 template <typename E> class Chunk;
+template <typename E> class InputSection;
 template <typename E> class OutputSection;
+template <typename E> class Subsection;
 template <typename E> struct Context;
-template <typename E> struct InputSection;
-template <typename E> struct Subsection;
 template <typename E> struct Symbol;
 
 //
@@ -766,6 +766,7 @@ struct Context {
   struct {
     bool ObjC = false;
     bool adhoc_codesign = true;
+    bool color_diagnostics = false;
     bool dead_strip = true;
     bool dead_strip_dylibs = false;
     bool deduplicate = true;
@@ -885,7 +886,7 @@ u64 Symbol<E>::get_tlv_addr(Context<E> &ctx) const {
 }
 
 template <typename E>
-inline Symbol<E> *intern(Context<E> &ctx, std::string_view name) {
+inline Symbol<E> *get_symbol(Context<E> &ctx, std::string_view name) {
   typename decltype(ctx.symbol_map)::const_accessor acc;
   ctx.symbol_map.insert(acc, {name, Symbol<E>(name)});
   return (Symbol<E> *)(&acc->second);

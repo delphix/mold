@@ -19,10 +19,10 @@ on a simulated 8-core 16-threads machine.
 | Firefox 89 libxul (1.64 GiB)  | 32.95s   | 6.80s    | 1.42s
 
 mold is so fast that it is only 2x _slower_ than `cp` on the same
-machine.
+machine. Feel free to [file a bug](https://github.com/rui314/mold/issues)
+if you find mold is not faster than other linkers.
 
-Feel free to [file a bug](https://github.com/rui314/mold/issues) if
-you find mold is not faster than other linkers.
+mold currently supports x86-64, i386 and ARM64.
 
 ## Why does the speed of linking matter?
 
@@ -37,11 +37,20 @@ mold can make it faster, saving your time and keeping you from being
 distracted while waiting for a long build to finish. The difference is
 most noticeable when you are in rapid debug-edit-rebuild cycles.
 
+## Install
+
+Binary packages for the following distros are currently available.
+
+[![Packaging status](https://repology.org/badge/vertical-allrepos/mold.svg)](https://repology.org/project/mold/versions)
+
 ## How to build
 
-mold is written in C++20, so you need a very recent version of GCC or
-Clang. I'm using Ubuntu 20.04 as a development platform. In that
-environment, you can build mold by the following commands.
+mold is written in C++20, so if you build mold yourself, you need a
+recent version of a C++ compiler and a C++ standard library. GCC 10.2
+or Clang 12.0.0 as well as libstdc++ 10 or libc++ 7 are recommended.
+
+I'm using Ubuntu 20.04 as a development platform. In that environment,
+you can build mold by the following commands.
 
 ### Install dependencies
 
@@ -49,13 +58,13 @@ environment, you can build mold by the following commands.
 
 ```shell
 sudo apt-get update
-sudo apt-get install -y build-essential git clang cmake libstdc++-10-dev libssl-dev libxxhash-dev zlib1g-dev
+sudo apt-get install -y build-essential git clang cmake libstdc++-10-dev libssl-dev libxxhash-dev zlib1g-dev pkg-config
 ```
 
 #### Fedora 34 and later
 
 ```shell
-sudo dnf install -y git clang-c++ cmake openssl-devel xxhash-devel zlib-devel
+sudo dnf install -y git clang cmake openssl-devel xxhash-devel zlib-devel libstdc++-devel
 ```
 
 ### Compile mold
@@ -63,10 +72,14 @@ sudo dnf install -y git clang-c++ cmake openssl-devel xxhash-devel zlib-devel
 ```shell
 git clone https://github.com/rui314/mold.git
 cd mold
-git checkout v1.0.0
-make -j$(nproc)
+git checkout v1.0.3
+make -j$(nproc) CXX=clang++
 sudo make install
 ```
+
+You may need to pass a C++20 compiler command name to `make`.
+In the above case, `clang++` is passed. If it doesn't work for you,
+try a specific version of a compiler such as `g++-10` or `clang++-12`.
 
 By default, `mold` is installed to `/usr/local/bin`.
 
@@ -87,15 +100,55 @@ sudo apt-get install bsdmainutils dwarfdump libc6-dev:i386 lib32gcc-10-dev libst
 
 ## How to use
 
+<details><summary>A classic way to use mold</summary>
+
 On Unix, the linker command (which is usually `/usr/bin/ld`) is
-invoked indirectly by `cc` (or `gcc` or `clang`), which is typically
-in turn indirectly invoked by `make` or some other build system command.
+invoked indirectly by the compiler driver (which is usually `cc`,
+`gcc` or `clang`), which is typically in turn indirectly invoked by
+`make` or some other build system command.
 
-A classic way to use `mold`:
+If you can specify an additional command line option to your compiler
+driver by modifying build system's config files, add one of the
+following flags to use `mold` instead of `/usr/bin/ld`:
 
-- `clang` before 12.0: pass `-fuse-ld=<absolute-path-to-mold-executable>`;
-- clang after 12.0: pass `--ld-path=<absolute-path-to-mold-executable>`;
-- gcc: `--ld-path` patch [has been declined by GCC maintainers](https://gcc.gnu.org/pipermail/gcc-patches/2021-June/573833.html), instead they advise to use a [workaround](https://gcc.gnu.org/pipermail/gcc-patches/2021-June/573823.html): create directory `<dirname>`, then `ln -s <path-to-mold> <dirname>/ld`, and then pass `-B<dirname>` (`-B` tells GCC to look for `ld` in specified location).
+- Clang: pass `-fuse-ld=mold`
+
+- GCC 12.1.0 (upcoming version) or later: pass `-fuse-ld=mold`
+
+- GCC before 12.1.0: `-fuse-ld` does not accept `mold` as a valid
+  argument, so you need to use `-B` option instead. `-B` is an option
+  to tell GCC where to look for external commands such as `ld`.
+
+  If you have installed mold with `make install`, there should be a
+  directory named `/usr/libexec/mold` (or `/usr/local/libexec/mold`,
+  depending on your $PREFIX), and `ld` command should be there. The
+  `ld` is actually a symlink to `mold`. So, all you need is to pass
+  `-B/usr/libexec/mold` (or `-B/usr/local/libexec/mold`) to GCC.
+
+If you haven't installed `mold` to any `$PATH`, you can still pass
+`-fuse-ld=/absolute/path/to/mold` to clang to use mold. GCC does not
+take an absolute path as an argument for `-fuse-ld` though.
+
+</details>
+
+<details><summary>If you are using Rust</summary>
+
+Create `.cargo/config.toml` in your project directory with the following:
+
+```
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=/path/to/mold"]
+```
+
+where `/path/to/mold` is an absolute path to `mold` exectuable.
+
+If you want to use mold for all projects, put the above snippet to
+`~/.cargo/config.toml`.
+
+</details>
+
+<details><summary>mold -run</summary>
 
 It is sometimes very hard to pass an appropriate command line option
 to `cc` to specify an alternative linker.  To deal with the situation,
@@ -118,6 +171,8 @@ Internally, mold invokes a given command with `LD_PRELOAD` environment
 variable set to its companion shared object file. The shared object
 file intercepts all function calls to `exec(3)`-family functions to
 replace `argv[0]` with `mold` if it is `ld`, `ld.gold` or `ld.lld`.
+
+</details>
 
 mold leaves its identification string in `.comment` section in an output
 file. You can print it out to verify that you are actually using mold.

@@ -1,19 +1,23 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ... "
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename -s .sh "$0")
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t=out/test/elf/$testname
 mkdir -p $t
 
-cat <<EOF | clang -c -o $t/a.o -xc -
+cat <<EOF | $CC -c -o $t/a.o -xc -
 void foo() {}
 EOF
 
-clang -fuse-ld=$mold -shared -o $t/b.so $t/a.o
+$CC -B. -shared -o $t/b.so $t/a.o
 ! readelf --dynamic $t/b.so | grep -Pq 'Flags: NODUMP' || false
 
-clang -fuse-ld=$mold -shared -o $t/b.so $t/a.o -Wl,-z,nodump
+$CC -B. -shared -o $t/b.so $t/a.o -Wl,-z,nodump
 readelf --dynamic $t/b.so | grep -Pq 'Flags: NODUMP'
 
 echo OK

@@ -151,7 +151,7 @@ static std::vector<u8> create_main_cmd(Context<E> &ctx) {
 
   cmd.cmd = LC_MAIN;
   cmd.cmdsize = buf.size();
-  cmd.entryoff = intern(ctx, ctx.arg.entry)->get_addr(ctx) - ctx.arg.pagezero_size;
+  cmd.entryoff = get_symbol(ctx, ctx.arg.entry)->get_addr(ctx) - ctx.arg.pagezero_size;
   return buf;
 }
 
@@ -484,12 +484,12 @@ void OutputSegment<E>::set_offset(Context<E> &ctx, i64 fileoff, u64 vmaddr) {
     vmaddr += sec.hdr.size;
   }
 
-  cmd.vmsize = align_to(vmaddr - cmd.vmaddr, PAGE_SIZE);
+  cmd.vmsize = align_to(vmaddr - cmd.vmaddr, COMMON_PAGE_SIZE);
 
   if (this == ctx.segments.back().get())
     cmd.filesize = fileoff - cmd.fileoff;
   else
-    cmd.filesize = align_to(fileoff - cmd.fileoff, PAGE_SIZE);
+    cmd.filesize = align_to(fileoff - cmd.fileoff, COMMON_PAGE_SIZE);
 }
 
 template <typename E>
@@ -969,7 +969,8 @@ void OutputIndirectSymtabSection<E>::copy_buf(Context<E> &ctx) {
 
 template <typename E>
 void CodeSignatureSection<E>::compute_size(Context<E> &ctx) {
-  i64 filename_size = align_to(path_filename(ctx.arg.output).size() + 1, 16);
+  std::string filename = filepath(ctx.arg.output).filename();
+  i64 filename_size = align_to(filename.size() + 1, 16);
   i64 num_blocks = align_to(this->hdr.offset, BLOCK_SIZE) / BLOCK_SIZE;
   this->hdr.size = sizeof(CodeSignatureHeader) + sizeof(CodeSignatureBlobIndex) +
                    sizeof(CodeSignatureDirectory) + filename_size +
@@ -980,7 +981,7 @@ template <typename E>
 void CodeSignatureSection<E>::write_signature(Context<E> &ctx) {
   u8 *buf = ctx.buf + this->hdr.offset;
 
-  std::string_view filename = path_filename(ctx.arg.output);
+  std::string filename = filepath(ctx.arg.output).filename();
   i64 filename_size = align_to(filename.size() + 1, 16);
   i64 num_blocks = align_to(this->hdr.offset, BLOCK_SIZE) / BLOCK_SIZE;
 

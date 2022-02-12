@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
 #include <iostream>
 #include <mutex>
 #include <span>
@@ -20,6 +21,12 @@
 #include <tbb/enumerable_thread_specific.h>
 #include <unistd.h>
 #include <vector>
+
+#ifdef NDEBUG
+#  define unreachable() __builtin_unreachable()
+#else
+#  define unreachable() assert(0 && "unreachable")
+#endif
 
 namespace mold {
 
@@ -60,7 +67,7 @@ public:
   }
 
   ~SyncOut() {
-    std::lock_guard lock(mu);
+    std::scoped_lock lock(mu);
     out << ss.str() << "\n";
   }
 
@@ -102,7 +109,11 @@ template <typename C>
 class Error {
 public:
   Error(C &ctx) : out(ctx, std::cerr) {
-    out << "mold: ";
+    if (ctx.arg.color_diagnostics)
+      out << "mold: \033[0;1;31merror:\033[0m ";
+    else
+      out << "mold: error: ";
+
     ctx.has_error = true;
   }
 
@@ -119,9 +130,18 @@ template <typename C>
 class Warn {
 public:
   Warn(C &ctx) : out(ctx, std::cerr) {
-    out << "mold: ";
-    if (ctx.arg.fatal_warnings)
+    if (ctx.arg.fatal_warnings) {
+      if (ctx.arg.color_diagnostics)
+        out << "mold: \033[0;1;31merror:\033[0m ";
+      else
+        out << "mold: error: ";
       ctx.has_error = true;
+    } else {
+      if (ctx.arg.color_diagnostics)
+        out << "mold: \033[0;1;35mwarning:\033[0m ";
+      else
+        out << "mold: warning: ";
+    }
   }
 
   template <class T> Warn &operator<<(T &&val) {
@@ -132,8 +152,6 @@ public:
 private:
   SyncOut<C> out;
 };
-
-#define unreachable() assert(0 && "unreachable")
 
 //
 // Utility functions
@@ -158,6 +176,22 @@ inline u64 next_power_of_two(u64 val) {
   return (u64)1 << (64 - __builtin_clzl(val - 1));
 }
 
+template <typename T, typename Compare = std::less<T>>
+void update_minimum(std::atomic<T> &atomic, u64 new_val,
+                    Compare cmp = {}) {
+  T old_val = atomic;
+  while (cmp(new_val, old_val) &&
+         !atomic.compare_exchange_weak(old_val, new_val));
+}
+
+template <typename T, typename Compare = std::less<T>>
+void update_maximum(std::atomic<T> &atomic, u64 new_val,
+                    Compare cmp = {}) {
+  T old_val = atomic;
+  while (cmp(old_val, new_val) &&
+         !atomic.compare_exchange_weak(old_val, new_val));
+}
+
 template <typename T, typename U>
 inline void append(std::vector<T> &vec1, std::vector<U> vec2) {
   vec1.insert(vec1.end(), vec2.begin(), vec2.end());
@@ -169,11 +203,6 @@ inline std::vector<T> flatten(std::vector<std::vector<T>> &vec) {
   for (std::vector<T> &v : vec)
     append(ret, v);
   return ret;
-}
-
-template <typename T, typename U>
-inline void erase(std::vector<T> &vec, U pred) {
-  vec.erase(std::remove_if(vec.begin(), vec.end(), pred), vec.end());
 }
 
 template <typename T>
@@ -376,7 +405,7 @@ public:
   }
 
 private:
-  std::unique_ptr<u8[]> vec;
+  std::unique_ptr<u8[]> vec = nullptr;
 };
 
 //
@@ -394,18 +423,15 @@ public:
   HyperLogLog() : buckets(NBUCKETS) {}
 
   void insert(u32 hash) {
-    merge_one(hash & (NBUCKETS - 1), __builtin_clz(hash) + 1);
-  }
-
-  void merge_one(i64 idx, u8 newval) {
-    u8 cur = buckets[idx];
-    while (cur < newval)
-      if (buckets[idx].compare_exchange_strong(cur, newval))
-        break;
+    update_maximum(buckets[hash & (NBUCKETS - 1)], __builtin_clz(hash) + 1);
   }
 
   i64 get_cardinality() const;
-  void merge(const HyperLogLog &other);
+
+  void merge(const HyperLogLog &other) {
+    for (i64 i = 0; i < NBUCKETS; i++)
+      update_maximum(buckets[i], other.buckets[i]);
+  }
 
 private:
   static constexpr i64 NBUCKETS = 2048;
@@ -418,15 +444,14 @@ private:
 // filepath.cc
 //
 
-// These are various utility functions to deal with file pathnames.
-std::string get_current_dir();
+template <typename T>
+std::filesystem::path filepath(const T &path) {
+  return {path, std::filesystem::path::format::generic_format};
+}
+
 std::string get_realpath(std::string_view path);
-bool path_is_dir(std::string_view path);
-std::string_view path_dirname(std::string_view path);
-std::string_view path_filename(std::string_view path);
-std::string_view path_basename(std::string_view path);
-std::string path_to_absolute(std::string_view path);
 std::string path_clean(std::string_view path);
+std::filesystem::path to_abs_path(std::filesystem::path path);
 
 //
 // demangle.cc
@@ -470,7 +495,7 @@ class Counter {
 public:
   Counter(std::string_view name, i64 value = 0) : name(name), values(value) {
     static std::mutex mu;
-    std::lock_guard lock(mu);
+    std::scoped_lock lock(mu);
     instances.push_back(this);
   }
 
@@ -525,6 +550,8 @@ public:
     record = new TimerRecord(name, parent ? parent->record : nullptr);
     ctx.timer_records.push_back(std::unique_ptr<TimerRecord>(record));
   }
+
+  Timer(const Timer &) = delete;
 
   ~Timer() {
     record->stop();
@@ -582,14 +609,6 @@ public:
 
   std::string_view get_contents() {
     return std::string_view((char *)data, size);
-  }
-
-  bool write_to(std::string path) {
-    FILE *fp = fopen(path.c_str(), "w");
-    if (!fp)
-      return false;
-    fwrite(data, size, 1, fp);
-    return true;
   }
 
   std::string name;

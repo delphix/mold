@@ -1,14 +1,18 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ... "
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename -s .sh "$0")
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t=out/test/elf/$testname
 mkdir -p $t
 
-if [ $(uname -m) = x86_64 ]; then
+if [ "$(uname -m)" = x86_64 ]; then
   dialect=gnu
-elif [ $(uname -m) = aarch64 ]; then
+elif [ "$(uname -m)" = aarch64 ]; then
   dialect=trad
 else
   echo skipped
@@ -25,7 +29,7 @@ int bar() {
 }
 EOF
 
-clang -fuse-ld=$mold -shared -o $t/c.so $t/b.o -Wl,--version-script=$t/a.ver \
+$CC -B. -shared -o $t/c.so $t/b.o -Wl,--version-script=$t/a.ver \
   -Wl,--no-relax
 
 readelf -W --dyn-syms $t/c.so | grep -Pq 'TLS     LOCAL  DEFAULT   \d+ foo'

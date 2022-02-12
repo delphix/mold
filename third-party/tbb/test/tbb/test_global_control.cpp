@@ -189,11 +189,16 @@ namespace TestBlockingTerminateNS {
     };
 
     void TestExceptions() {
-        ExceptionTest1 Test1(0), Test2(1);
+        ExceptionTest1 Test1(0);
         TestException( Test1 );
+        ExceptionTest1 Test2(1);
         TestException( Test2 );
-        ExceptionTest2 Test3;
-        TestException( Test3 );
+        if (utils::get_platform_max_threads() > 1) {
+            // TODO: Fix the arena leak issue on single threaded machine
+            // (see https://github.com/oneapi-src/oneTBB/issues/396)
+            ExceptionTest2 Test3;
+            TestException(Test3);
+        }
     }
 
 #endif /* TBB_USE_EXCEPTIONS */
@@ -215,6 +220,17 @@ void TestTerminationAndAutoinit(bool autoinit) {
     }
     bool res2 = tbb::finalize(ctl2.get(), std::nothrow);
     REQUIRE(res2);
+}
+
+//! Check no reference leak for an external thread
+//! \brief \ref regression \ref error_guessing
+TEST_CASE("test decrease reference") {
+    tbb::task_scheduler_handle handle = tbb::task_scheduler_handle::get();
+
+    std::thread thr([] { tbb::parallel_for(0, 1, [](int) {}); } );
+    thr.join();
+
+    REQUIRE(tbb::finalize(handle, std::nothrow));
 }
 
 //! Testing lifetime control conformance

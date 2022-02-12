@@ -90,7 +90,7 @@ void ObjectFile<E>::parse_symtab(Context<E> &ctx) {
     std::string_view name = (char *)(this->mf->data + cmd->stroff + msym.stroff);
 
     if (msym.ext) {
-      this->syms.push_back(intern(ctx, name));
+      this->syms.push_back(get_symbol(ctx, name));
     } else {
       local_syms.emplace_back(name);
       this->syms.push_back(&local_syms.back());
@@ -129,7 +129,7 @@ static std::vector<SplitInfo<E>> split(Context<E> &ctx, ObjectFile<E> &file) {
     }
   }
 
-  erase(vec, [](const SplitInfo<E> &info) { return !info.isec; });
+  std::erase_if(vec, [](const SplitInfo<E> &info) { return !info.isec; });
 
   sort(vec, [](const SplitInfo<E> &a, const SplitInfo<E> &b) {
     return a.isec->hdr.addr < b.isec->hdr.addr;
@@ -401,7 +401,7 @@ void ObjectFile<E>::resolve_regular_symbols(Context<E> &ctx) {
       continue;
 
     Symbol<E> &sym = *this->syms[i];
-    std::lock_guard lock(sym.mu);
+    std::scoped_lock lock(sym.mu);
     if (get_rank(this, msym, false) < get_rank(sym))
       override_symbol(ctx, i);
   }
@@ -415,7 +415,7 @@ void ObjectFile<E>::resolve_lazy_symbols(Context<E> &ctx) {
       continue;
 
     Symbol<E> &sym = *this->syms[i];
-    std::lock_guard lock(sym.mu);
+    std::scoped_lock lock(sym.mu);
 
     if (get_rank(this, msym, true) < get_rank(sym)) {
       sym.file = this;
@@ -453,7 +453,7 @@ std::vector<ObjectFile<E> *> ObjectFile<E>::mark_live_objects(Context<E> &ctx) {
       continue;
 
     Symbol<E> &sym = *this->syms[i];
-    std::lock_guard lock(sym.mu);
+    std::scoped_lock lock(sym.mu);
 
     if (msym.is_undef()) {
       if (sym.file && !sym.file->is_alive.exchange(true))
@@ -535,7 +535,7 @@ void DylibFile<E>::read_trie(Context<E> &ctx, u8 *start, i64 offset,
     read_uleb(buf); // size
     read_uleb(buf); // flags
     read_uleb(buf); // addr
-    this->syms.push_back(intern(ctx, prefix));
+    this->syms.push_back(get_symbol(ctx, prefix));
   } else {
     buf++;
   }
@@ -587,7 +587,7 @@ void DylibFile<E>::parse(Context<E> &ctx) {
   case FileType::TAPI: {
     TextDylib tbd = parse_tbd(ctx, this->mf);
     for (std::string_view sym : tbd.exports)
-      this->syms.push_back(intern(ctx, sym));
+      this->syms.push_back(get_symbol(ctx, sym));
     install_name = tbd.install_name;
     break;
   }
@@ -602,7 +602,7 @@ void DylibFile<E>::parse(Context<E> &ctx) {
 template <typename E>
 void DylibFile<E>::resolve_symbols(Context<E> &ctx) {
   for (Symbol<E> *sym : this->syms) {
-    std::lock_guard lock(sym->mu);
+    std::scoped_lock lock(sym->mu);
     if (sym->file && sym->file->priority < this->priority)
       continue;
     sym->file = this;

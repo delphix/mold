@@ -1,12 +1,16 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ... "
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename -s .sh "$0")
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t=out/test/elf/$testname
 mkdir -p $t
 
-cat <<EOF | cc -o $t/a.o -c -x assembler -
+cat <<EOF | $CC -o $t/a.o -c -x assembler -
   .globl foo, bar, this_is_global
 local1:
 foo:
@@ -14,7 +18,7 @@ bar:
   .byte 0
 EOF
 
-cat <<EOF | cc -o $t/b.o -c -x assembler -
+cat <<EOF | $CC -o $t/b.o -c -x assembler -
   .globl this_is_global
 local2:
 this_is_global:
@@ -25,7 +29,7 @@ EOF
 
 echo '{ local: module_local; };' > $t/c.map
 
-$mold -o $t/exe $t/a.o $t/b.o --version-script=$t/c.map
+"$mold" -o $t/exe $t/a.o $t/b.o --version-script=$t/c.map
 
 readelf --symbols $t/exe > $t/log
 

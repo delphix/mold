@@ -30,12 +30,7 @@ template <typename E> struct ElfEhdr;
 template <typename E> struct ElfPhdr;
 template <typename E> struct ElfRel;
 template <typename E> struct ElfDyn;
-template <typename E> struct ElfVerneed;
-template <typename E> struct ElfVernaux;
-template <typename E> struct ElfVerdef;
-template <typename E> struct ElfVerdaux;
 template <typename E> struct ElfChdr;
-template <typename E> struct ElfNhdr;
 
 template <typename E>
 std::string rel_to_string(u32 r_type);
@@ -68,6 +63,7 @@ static constexpr u32 SHT_FINI_ARRAY = 15;
 static constexpr u32 SHT_PREINIT_ARRAY = 16;
 static constexpr u32 SHT_GROUP = 17;
 static constexpr u32 SHT_SYMTAB_SHNDX = 18;
+static constexpr u32 SHT_RELR = 19;
 static constexpr u32 SHT_GNU_HASH = 0x6ffffff6;
 static constexpr u32 SHT_GNU_VERDEF = 0x6ffffffd;
 static constexpr u32 SHT_GNU_VERNEED = 0x6ffffffe;
@@ -190,6 +186,9 @@ static constexpr u32 DT_INIT_ARRAYSZ = 27;
 static constexpr u32 DT_FINI_ARRAYSZ = 28;
 static constexpr u32 DT_RUNPATH = 29;
 static constexpr u32 DT_FLAGS = 30;
+static constexpr u32 DT_RELRSZ = 35;
+static constexpr u32 DT_RELR = 36;
+static constexpr u32 DT_RELRENT = 37;
 static constexpr u32 DT_GNU_HASH = 0x6ffffef5;
 static constexpr u32 DT_VERSYM = 0x6ffffff0;
 static constexpr u32 DT_RELACOUNT = 0x6ffffff9;
@@ -214,6 +213,7 @@ static constexpr u32 DF_1_INITFIRST = 0x00000020;
 static constexpr u32 DF_1_NOOPEN = 0x00000040;
 static constexpr u32 DF_1_ORIGIN = 0x00000080;
 static constexpr u32 DF_1_INTERPOSE = 0x00000400;
+static constexpr u32 DF_1_NODEFLIB = 0x00000800;
 static constexpr u32 DF_1_NODUMP = 0x00001000;
 static constexpr u32 DF_1_PIE = 0x08000000;
 
@@ -225,6 +225,9 @@ static constexpr u32 NT_GNU_PROPERTY_TYPE_0 = 5;
 
 static constexpr u32 GNU_PROPERTY_AARCH64_FEATURE_1_AND = 0xc0000000;
 static constexpr u32 GNU_PROPERTY_X86_FEATURE_1_AND = 0xc0000002;
+
+static constexpr u32 GNU_PROPERTY_X86_FEATURE_1_IBT = 1;
+static constexpr u32 GNU_PROPERTY_X86_FEATURE_1_SHSTK = 2;
 
 static constexpr u32 ELFCOMPRESS_ZLIB = 1;
 
@@ -807,7 +810,7 @@ struct Elf32Dyn {
   u32 d_val;
 };
 
-struct Elf64Verneed {
+struct ElfVerneed {
   u16 vn_version;
   u16 vn_cnt;
   u32 vn_file;
@@ -815,7 +818,7 @@ struct Elf64Verneed {
   u32 vn_next;
 };
 
-struct Elf64Vernaux {
+struct ElfVernaux {
   u32 vna_hash;
   u16 vna_flags;
   u16 vna_other;
@@ -823,7 +826,7 @@ struct Elf64Vernaux {
   u32 vna_next;
 };
 
-struct Elf64Verdef {
+struct ElfVerdef {
   u16 vd_version;
   u16 vd_flags;
   u16 vd_ndx;
@@ -833,7 +836,7 @@ struct Elf64Verdef {
   u32 vd_next;
 };
 
-struct Elf64Verdaux {
+struct ElfVerdaux {
   u32 vda_name;
   u32 vda_next;
 };
@@ -851,7 +854,7 @@ struct Elf32Chdr {
   u32 ch_addralign;
 };
 
-struct Elf64Nhdr {
+struct ElfNhdr {
   u32 n_namesz;
   u32 n_descsz;
   u32 n_type;
@@ -872,9 +875,8 @@ struct X86_64 {
   static constexpr u32 R_TLSDESC = R_X86_64_TLSDESC;
 
   static constexpr u32 word_size = 8;
+  static constexpr u32 page_size = 4096;
   static constexpr u32 e_machine = EM_X86_64;
-  static constexpr u32 plt_hdr_size = 16;
-  static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 8;
   static constexpr bool is_rel = false;
   static constexpr bool is_le = true;
@@ -886,12 +888,7 @@ template <> struct ElfEhdr<X86_64> : public Elf64Ehdr {};
 template <> struct ElfPhdr<X86_64> : public Elf64Phdr {};
 template <> struct ElfRel<X86_64> : public Elf64Rela {};
 template <> struct ElfDyn<X86_64> : public Elf64Dyn {};
-template <> struct ElfVerneed<X86_64> : public Elf64Verneed {};
-template <> struct ElfVernaux<X86_64> : public Elf64Vernaux {};
-template <> struct ElfVerdef<X86_64> : public Elf64Verdef {};
-template <> struct ElfVerdaux<X86_64> : public Elf64Verdaux {};
 template <> struct ElfChdr<X86_64> : public Elf64Chdr {};
-template <> struct ElfNhdr<X86_64> : public Elf64Nhdr {};
 
 struct I386 {
   using WordTy = u32;
@@ -908,9 +905,8 @@ struct I386 {
   static constexpr u32 R_TLSDESC = R_386_TLS_DESC;
 
   static constexpr u32 word_size = 4;
+  static constexpr u32 page_size = 4096;
   static constexpr u32 e_machine = EM_386;
-  static constexpr u32 plt_hdr_size = 16;
-  static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 8;
   static constexpr bool is_rel = true;
   static constexpr bool is_le = true;
@@ -922,12 +918,7 @@ template <> struct ElfEhdr<I386> : public Elf32Ehdr {};
 template <> struct ElfPhdr<I386> : public Elf32Phdr {};
 template <> struct ElfRel<I386> : public Elf32Rel {};
 template <> struct ElfDyn<I386> : public Elf32Dyn {};
-template <> struct ElfVerneed<I386> : public Elf64Verneed {};
-template <> struct ElfVernaux<I386> : public Elf64Vernaux {};
-template <> struct ElfVerdef<I386> : public Elf64Verdef {};
-template <> struct ElfVerdaux<I386> : public Elf64Verdaux {};
 template <> struct ElfChdr<I386> : public Elf32Chdr {};
-template <> struct ElfNhdr<I386> : public Elf64Nhdr {};
 
 struct ARM64 {
   using WordTy = u64;
@@ -944,9 +935,8 @@ struct ARM64 {
   static constexpr u32 R_TLSDESC = R_AARCH64_TLSDESC;
 
   static constexpr u32 word_size = 8;
+  static constexpr u32 page_size = 65536;
   static constexpr u32 e_machine = EM_AARCH64;
-  static constexpr u32 plt_hdr_size = 32;
-  static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 16;
   static constexpr bool is_rel = false;
   static constexpr bool is_le = true;
@@ -958,11 +948,6 @@ template <> struct ElfEhdr<ARM64> : public Elf64Ehdr {};
 template <> struct ElfPhdr<ARM64> : public Elf64Phdr {};
 template <> struct ElfRel<ARM64> : public Elf64Rela {};
 template <> struct ElfDyn<ARM64> : public Elf64Dyn {};
-template <> struct ElfVerneed<ARM64> : public Elf64Verneed {};
-template <> struct ElfVernaux<ARM64> : public Elf64Vernaux {};
-template <> struct ElfVerdef<ARM64> : public Elf64Verdef {};
-template <> struct ElfVerdaux<ARM64> : public Elf64Verdaux {};
 template <> struct ElfChdr<ARM64> : public Elf64Chdr {};
-template <> struct ElfNhdr<ARM64> : public Elf64Nhdr {};
 
 } // namespace mold::elf

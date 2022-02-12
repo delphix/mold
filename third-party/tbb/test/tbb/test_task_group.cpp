@@ -763,6 +763,11 @@ namespace TestIsolationNS {
 }
 #endif
 
+#if __TBB_USE_ADDRESS_SANITIZER
+//! Test for thread safety for the task_group
+//! \brief \ref error_guessing \ref resource_usage
+TEST_CASE("Memory leaks test is not applicable under ASAN\n" * doctest::skip(true)) {}
+#else
 //! Test for thread safety for the task_group
 //! \brief \ref error_guessing \ref resource_usage
 TEST_CASE("Thread safety test for the task group") {
@@ -779,6 +784,7 @@ TEST_CASE("Thread safety test for the task group") {
         TestThreadSafety<tbb::task_group>();
     }
 }
+#endif
 
 //! Fibonacci test for task group
 //! \brief \ref interface \ref requirement
@@ -824,6 +830,12 @@ TEST_CASE("Move semantics test for the task group") {
 }
 
 #if TBB_PREVIEW_ISOLATED_TASK_GROUP
+
+#if __TBB_USE_ADDRESS_SANITIZER
+//! Test for thread safety for the isolated_task_group
+//! \brief \ref error_guessing
+TEST_CASE("Memory leaks test is not applicable under ASAN\n" * doctest::skip(true)) {}
+#else
 //! Test for thread safety for the isolated_task_group
 //! \brief \ref error_guessing
 TEST_CASE("Thread safety test for the isolated task group") {
@@ -840,6 +852,7 @@ TEST_CASE("Thread safety test for the isolated task group") {
         TestThreadSafety<tbb::isolated_task_group>();
     }
 }
+#endif
 
 //! Cancellation and exception test for the isolated task group
 //! \brief \ref interface \ref requirement
@@ -1160,6 +1173,23 @@ TEST_CASE("Task handle run"){
     CHECK_MESSAGE(h == nullptr, "Delayed task can be executed only once");
 }
 
+//! Basic test for task handle
+//! \brief \ref interface \ref requirement
+TEST_CASE("Task handle run_and_wait"){
+    tbb::task_handle h;
+
+    tbb::task_group tg;
+    bool run {false};
+
+    h = tg.defer([&]{
+        run = true;
+    });
+    CHECK_MESSAGE(run == false, "delayed task should not be run until run(task_handle) is called");
+    tg.run_and_wait(std::move(h));
+    CHECK_MESSAGE(run == true, "Delayed task should be completed when task_group::wait exits");
+
+    CHECK_MESSAGE(h == nullptr, "Delayed task can be executed only once");
+}
 //! Test for empty check
 //! \brief \ref interface
 TEST_CASE("Task handle empty check"){
@@ -1173,6 +1203,25 @@ TEST_CASE("Task handle empty check"){
     h = tg.defer([]{});
 
     CHECK_MESSAGE(h != nullptr, "delayed task returned by task_group::delayed should not be empty");
+}
+
+//! Test for comparison operations
+//! \brief \ref interface
+TEST_CASE("Task handle comparison/empty checks"){
+    tbb::task_group tg;
+
+    tbb::task_handle h;
+
+    bool empty =  ! static_cast<bool>(h);
+    CHECK_MESSAGE(empty, "default constructed task_handle should be empty");
+    CHECK_MESSAGE(h == nullptr, "default constructed task_handle should be empty");
+    CHECK_MESSAGE(nullptr == h, "default constructed task_handle should be empty");
+
+    h = tg.defer([]{});
+
+    CHECK_MESSAGE(h != nullptr, "deferred task returned by task_group::defer() should not be empty");
+    CHECK_MESSAGE(nullptr != h, "deferred task returned by task_group::defer() should not be empty");
+
 }
 
 //! Test that task_handle prolongs task_group::wait
@@ -1276,7 +1325,7 @@ TEST_CASE("task_handle cannot be scheduled into different task_group"){
 //! The test for error in task_handle being scheduled into task_group different from one it was created from
 //! \brief \ref requirement
 TEST_CASE("task_handle cannot be scheduled into other task_group of the same context"
-        * doctest::should_fail()    //Implementation is no there yet, as it is not clear that is the expected behaviour
+        * doctest::should_fail()    //Implementation is no there yet, as it is not clear that is the expected behavior
         * doctest::skip()           //skip the test for now, to not pollute the test log
 )
 {

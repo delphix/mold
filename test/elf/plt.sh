@@ -1,14 +1,18 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ... "
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename -s .sh "$0")
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t=out/test/elf/$testname
 mkdir -p $t
 
-[ $(uname -m) = x86_64 ] || { echo skipped; exit; }
+[ "$(uname -m)" = x86_64 ] || { echo skipped; exit; }
 
-cat <<'EOF' | cc -o $t/a.o -c -x assembler -
+cat <<'EOF' | $CC -o $t/a.o -c -x assembler -
   .text
   .globl main
 main:
@@ -25,7 +29,7 @@ msg:
   .string "Hello world\n"
 EOF
 
-clang -fuse-ld=$mold -o $t/exe $t/a.o
+$CC -B. -o $t/exe $t/a.o
 
 readelf --sections $t/exe | fgrep -q '.got'
 readelf --sections $t/exe | fgrep -q '.got.plt'

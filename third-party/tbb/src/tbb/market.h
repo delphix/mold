@@ -105,12 +105,6 @@ private:
     //! Number of workers currently requested from RML
     int my_num_workers_requested;
 
-    //! The target serialization epoch for callers of adjust_job_count_estimate
-    int my_adjust_demand_target_epoch;
-
-    //! The current serialization epoch for callers of adjust_job_count_estimate
-    d1::waitable_atomic<int> my_adjust_demand_current_epoch;
-
     //! First unused index of worker
     /** Used to assign indices to the new workers coming from RML, and busy part
         of my_workers array. **/
@@ -294,7 +288,7 @@ public:
     //! Array of pointers to the registered workers
     /** Used by cancellation propagation mechanism.
         Must be the last data member of the class market. **/
-    thread_data* my_workers[1];
+    std::atomic<thread_data*> my_workers[1];
 
     static unsigned max_num_workers() {
         global_market_mutex_type::scoped_lock lock( theMarketMutex );

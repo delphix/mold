@@ -24,11 +24,16 @@
 
 #include "common/allocator_overload.h"
 
-#if !HARNESS_SKIP_TEST && TBB_USE_EXCEPTIONS
+// Under ASAN current approach is not viable as it breaks the ASAN itself as well
+#if !HARNESS_SKIP_TEST && TBB_USE_EXCEPTIONS && !__TBB_USE_ADDRESS_SANITIZER
 
-#include "../../src/tbb/tls.h"
+#if _MSC_VER
+#pragma warning (push)
+// Forcing value to bool 'true' or 'false' (occurred inside tls.h)
+#pragma warning (disable: 4800)
+#endif //#if _MSC_VER
 
-tbb::detail::r1::tls<bool> new_handler_called;
+thread_local bool new_handler_called = false;
 void customNewHandler() {
     new_handler_called = true;
     throw std::bad_alloc();
@@ -75,4 +80,9 @@ TEST_CASE("New handler callback") {
     // Undo custom handler
     std::set_new_handler(0);
 }
+
+#if _MSC_VER
+#pragma warning (pop)
+#endif
+
 #endif // !HARNESS_SKIP_TEST && TBB_USE_EXCEPTIONS
