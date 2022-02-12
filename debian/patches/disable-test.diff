@@ -2,10 +2,9 @@ Index: mold/test/elf/i386-mergeable-strings.sh
 ===================================================================
 --- mold.orig/test/elf/i386-mergeable-strings.sh
 +++ mold/test/elf/i386-mergeable-strings.sh
-@@ -1,4 +1,6 @@
+@@ -1,4 +1,5 @@
  #!/bin/bash
-+echo OK
 +exit 0
+ export LANG=
  set -e
- cd $(dirname $0)
- mold=`pwd`/../../mold
+ CC="${CC:-cc}"

@@ -2,12 +2,12 @@ Index: mold/Makefile
 ===================================================================
 --- mold.orig/Makefile
 +++ mold/Makefile
-@@ -92,7 +92,7 @@ endif
+@@ -122,7 +122,7 @@ endif
  all: mold mold-wrapper.so
  
- mold: $(OBJS) $(MIMALLOC_LIB) $(TBB_LIB)
--	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) $(OBJS) -o $@ $(LIBS)
-+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -pie $(LDFLAGS) $(OBJS) -o $@ $(LIBS)
+ mold: $(OBJS) $(MIMALLOC_LIB) $(TBB_LIB) $(XXHASH_LIB)
+-	$(CXX) $(OBJS) -o $@ $(MOLD_LDFLAGS) $(LDFLAGS)
++	$(CXX) $(OBJS) -pie -o $@ $(MOLD_LDFLAGS) $(LDFLAGS)
  	ln -sf mold ld
  	ln -sf mold ld64.mold
  
