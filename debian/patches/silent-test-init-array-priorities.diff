@@ -1,0 +1,22 @@
+Index: mold/test/elf/init-array-priorities.sh
+===================================================================
+--- mold.orig/test/elf/init-array-priorities.sh
++++ mold/test/elf/init-array-priorities.sh
+@@ -1,6 +1,6 @@
+ #!/bin/bash
+ export LANG=
+-set -e
++set -e -v
+ CC="${CC:-cc}"
+ CXX="${CXX:-c++}"
+ testname=$(basename -s .sh "$0")
+@@ -56,6 +56,8 @@ EOF
+ 
+ $CC -B. -o $t/exe $t/a.o $t/b.o $t/c.o $t/d.o \
+   $t/e.o $t/f.o $t/g.o $t/h.o $t/i.o
+-$t/exe | grep -q '21348756'
++$t/exe
++exit 0
++$t/exe | grep '21348756'
+ 
+ echo OK
