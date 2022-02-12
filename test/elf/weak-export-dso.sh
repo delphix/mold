@@ -1,12 +1,16 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ... "
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename -s .sh "$0")
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t=out/test/elf/$testname
 mkdir -p $t
 
-cat <<EOF | cc -fPIC -c -o $t/a.o -xc -
+cat <<EOF | $CC -fPIC -c -o $t/a.o -xc -
 #include <stdio.h>
 
 __attribute__((weak)) int foo();
@@ -16,8 +20,8 @@ int main() {
 }
 EOF
 
-clang -fuse-ld=$mold -o $t/b.so $t/a.o -shared
-clang -fuse-ld=$mold -o $t/c.so $t/a.o -shared -Wl,-z,defs
+$CC -B. -o $t/b.so $t/a.o -shared
+$CC -B. -o $t/c.so $t/a.o -shared -Wl,-z,defs
 
 readelf --dyn-syms $t/b.so | grep -q 'WEAK   DEFAULT  UND foo'
 readelf --dyn-syms $t/c.so | grep -q 'WEAK   DEFAULT  UND foo'

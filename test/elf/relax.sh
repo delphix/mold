@@ -1,15 +1,19 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ... "
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename -s .sh "$0")
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t=out/test/elf/$testname
 mkdir -p $t
 
 # Skip if target is not x86-64
-[ $(uname -m) = x86_64 ] || { echo skipped; exit; }
+[ "$(uname -m)" = x86_64 ] || { echo skipped; exit; }
 
-cat <<EOF | clang -o $t/a.o -c -x assembler -Wa,-mrelax-relocations=yes -
+cat <<EOF | $CC -o $t/a.o -c -x assembler -Wa,-mrelax-relocations=yes -
 .globl bar
 bar:
   mov foo@GOTPCREL(%rip), %rax
@@ -32,7 +36,7 @@ bar:
   jmp  *foo@GOTPCREL(%rip)
 EOF
 
-cat <<EOF | clang -o $t/b.o -c -xc -
+cat <<EOF | $CC -o $t/b.o -c -xc -
 void foo() {}
 
 int main() {
@@ -40,7 +44,7 @@ int main() {
 }
 EOF
 
-clang -fuse-ld=$mold -o $t/exe $t/a.o $t/b.o
+$CC -B. -o $t/exe $t/a.o $t/b.o
 objdump -d $t/exe | grep -A20 '<bar>:' > $t/log
 
 grep -Pq 'lea \s*0x.+\(%rip\),%rax .*<foo>' $t/log
@@ -61,7 +65,7 @@ grep -Pq 'lea \s*0x.+\(%rip\),%r15 .*<foo>' $t/log
 grep -Pq 'call.*<foo>' $t/log
 grep -Pq 'jmp.*<foo>' $t/log
 
-clang -fuse-ld=$mold -o $t/exe $t/a.o $t/b.o -Wl,-no-relax
+$CC -B. -o $t/exe $t/a.o $t/b.o -Wl,-no-relax
 objdump -d $t/exe | grep -A20 '<bar>:' > $t/log
 
 grep -Pq 'mov \s*0x.+\(%rip\),%rax' $t/log

@@ -1,9 +1,13 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ..."
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename -s .sh "$0")
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t=out/test/elf/$testname
 mkdir -p $t
 
 which dwarfdump >& /dev/null || { echo skipped; exit; }
@@ -20,7 +24,7 @@ int foo() {
 }
 EOF
 
-clang -fuse-ld=$mold -o $t/exe $t/a.o $t/b.o
+$CC -B. -o $t/exe $t/a.o $t/b.o
 dwarfdump $t/exe > /dev/null
 readelf --sections $t/exe | fgrep -q .debug_info
 

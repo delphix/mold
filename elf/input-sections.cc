@@ -28,29 +28,8 @@ template <typename E>
 InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file,
                               const ElfShdr<E> &shdr, std::string_view name,
                               std::string_view contents, i64 section_idx)
-  : file(file), shdr(shdr), nameptr(name.data()), namelen(name.size()),
-    contents(contents), section_idx(section_idx) {
-  // As a special case, we want to map .ctors and .dtors to
-  // .init_array and .fini_array, respectively. However, old CRT
-  // object files are not compatible with this translation, so we need
-  // to keep them as-is if a section came from crtbegin.o or crtend.o.
-  //
-  // Yeah, this is an ugly hack, but the fundamental problem is that
-  // we have two different mechanism, ctors/dtors and init_array/fini_array
-  // for the same purpose. The latter was introduced to replace the
-  // former, but as it is often the case, the former still lingers
-  // around, so we need to keep this code to conver the old mechanism
-  // to the new one.
-  std::string_view stem = path_filename(file.filename);
-  if (stem != "crtbegin.o" && stem != "crtend.o" &&
-      stem != "crtbeginS.o" && stem != "crtendS.o" &&
-      stem != "crtbeginT.o" && stem != "crtendT.o") {;
-    if (name == ".ctors" || name.starts_with(".ctors."))
-      name = ".init_array";
-    else if (name == ".dtors" || name.starts_with(".dtors."))
-      name = ".fini_array";
-  }
-
+  : file(file), shdr(shdr), contents(contents), nameptr(name.data()),
+    namelen(name.size()), section_idx(section_idx) {
   output_section =
     OutputSection<E>::get_instance(ctx, name, shdr.sh_type, shdr.sh_flags);
 }
@@ -68,18 +47,6 @@ void InputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
     apply_reloc_alloc(ctx, buf);
   else
     apply_reloc_nonalloc(ctx, buf);
-
-  // As a special case, .ctors and .dtors section contents are
-  // reversed. These sections are now obsolete and mapped to
-  // .init_array and .fini_array, but they have to be reversed to
-  // maintain the original semantics.
-  bool init_fini = output_section->name == ".init_array" ||
-                   output_section->name == ".fini_array";
-  bool ctors_dtors = name().starts_with(".ctors") ||
-                     name().starts_with(".dtors");
-  if (init_fini && ctors_dtors)
-    std::reverse((typename E::WordTy *)buf,
-                 (typename E::WordTy *)(buf + shdr.sh_size));
 }
 
 template <typename E>
@@ -92,8 +59,8 @@ static i64 get_output_type(Context<E> &ctx) {
 }
 
 template <typename E>
-static i64 get_sym_type(Context<E> &ctx, Symbol<E> &sym) {
-  if (sym.is_absolute(ctx))
+static i64 get_sym_type(Symbol<E> &sym) {
+  if (sym.is_absolute())
     return 0;
   if (!sym.is_imported)
     return 1;
@@ -105,7 +72,7 @@ static i64 get_sym_type(Context<E> &ctx, Symbol<E> &sym) {
 template <typename E>
 void InputSection<E>::dispatch(Context<E> &ctx, Action table[3][4], i64 i,
                                const ElfRel<E> &rel, Symbol<E> &sym) {
-  Action action = table[get_output_type(ctx)][get_sym_type(ctx, sym)];
+  Action action = table[get_output_type(ctx)][get_sym_type(sym)];
   bool is_code = (shdr.sh_flags & SHF_EXECINSTR);
   bool is_writable = (shdr.sh_flags & SHF_WRITE);
 
@@ -125,12 +92,15 @@ void InputSection<E>::dispatch(Context<E> &ctx, Action table[3][4], i64 i,
       error();
       return;
     }
+
     if (sym.esym().st_visibility == STV_PROTECTED) {
       Error(ctx) << *this
                  << ": cannot make copy relocation for protected symbol '"
-                 << sym << "', defined in " << *sym.file;
+                 << sym << "', defined in " << *sym.file
+                 << "; recompile with -fPIC";
       return;
     }
+
     sym.flags |= NEEDS_COPYREL;
     return;
   case PLT:
@@ -144,7 +114,8 @@ void InputSection<E>::dispatch(Context<E> &ctx, Action table[3][4], i64 i,
       }
       ctx.has_textrel = true;
     }
-    sym.flags |= NEEDS_DYNSYM;
+
+    assert(sym.is_imported);
     needs_dynrel[i] = true;
     file.num_dynrel++;
     return;
@@ -156,8 +127,10 @@ void InputSection<E>::dispatch(Context<E> &ctx, Action table[3][4], i64 i,
       }
       ctx.has_textrel = true;
     }
+
     needs_baserel[i] = true;
-    file.num_dynrel++;
+    if (!is_relr_reloc(ctx, rel))
+      file.num_dynrel++;
     return;
   default:
     unreachable();
@@ -167,19 +140,19 @@ void InputSection<E>::dispatch(Context<E> &ctx, Action table[3][4], i64 i,
 template <typename E>
 void InputSection<E>::report_undef(Context<E> &ctx, Symbol<E> &sym) {
   switch (ctx.arg.unresolved_symbols) {
-  case UnresolvedKind::ERROR:
+  case UNRESOLVED_ERROR:
     Error(ctx) << "undefined symbol: " << file << ": " << sym;
     break;
-  case UnresolvedKind::WARN:
+  case UNRESOLVED_WARN:
     Warn(ctx) << "undefined symbol: " << file << ": " << sym;
     break;
-  case UnresolvedKind::IGNORE:
+  case UNRESOLVED_IGNORE:
     break;
   }
 }
 
 #define INSTANTIATE(E)                          \
-  template class CieRecord<E>;                  \
+  template struct CieRecord<E>;                 \
   template class InputSection<E>;
 
 INSTANTIATE(X86_64);

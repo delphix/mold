@@ -1,14 +1,18 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ... "
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename -s .sh "$0")
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t=out/test/elf/$testname
 mkdir -p $t
 
-if [ $(uname -m) = x86_64 ]; then
+if [ "$(uname -m)" = x86_64 ]; then
   dialect=gnu2
-elif [ $(uname -m) = aarch64 ]; then
+elif [ "$(uname -m)" = aarch64 ]; then
   dialect=desc
 else
   echo skipped
@@ -32,7 +36,7 @@ _Thread_local int foo = 5;
 _Thread_local int bar;
 EOF
 
-clang -fuse-ld=$mold -o $t/exe $t/a.o $t/b.so
+$CC -B. -o $t/exe $t/a.o $t/b.so
 $t/exe | grep -q '5 7'
 
 echo OK
