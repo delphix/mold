@@ -1,0 +1,10 @@
+Index: mold/Makefile
+===================================================================
+--- mold.orig/Makefile
++++ mold/Makefile
+@@ -1,4 +1,4 @@
+-PREFIX = /usr/local
++PREFIX = /usr
+ BINDIR = $(PREFIX)/bin
+ LIBDIR = $(PREFIX)/lib
+ LIBEXECDIR = $(PREFIX)/libexec
