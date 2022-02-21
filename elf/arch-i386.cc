@@ -4,19 +4,6 @@ namespace mold::elf {
 
 using E = I386;
 
-template <>
-void GotPltSection<E>::copy_buf(Context<E> &ctx) {
-  u32 *buf = (u32 *)(ctx.buf + this->shdr.sh_offset);
-
-  // The first slot of .got.plt points to _DYNAMIC.
-  buf[0] = ctx.dynamic ? ctx.dynamic->shdr.sh_addr : 0;
-  buf[1] = 0;
-  buf[2] = 0;
-
-  for (Symbol<E> *sym : ctx.plt->symbols)
-    buf[sym->get_gotplt_idx(ctx)] = sym->get_plt_addr(ctx) + 6;
-}
-
 static void write_plt_header(Context<E> &ctx, u8 *buf) {
   if (ctx.arg.pic) {
     static const u8 plt0[] = {
@@ -103,17 +90,17 @@ void PltGotSection<E>::copy_buf(Context<E> &ctx) {
 
 template <>
 void EhFrameSection<E>::apply_reloc(Context<E> &ctx, ElfRel<E> &rel,
-                                    u64 loc, u64 val) {
-  u8 *base = ctx.buf + this->shdr.sh_offset;
+                                    u64 offset, u64 val) {
+  u8 *loc = ctx.buf + this->shdr.sh_offset + offset;
 
   switch (rel.r_type) {
   case R_386_NONE:
     return;
   case R_386_32:
-    *(u32 *)(base + loc) = val;
+    *(u32 *)loc = val;
     return;
   case R_386_PC32:
-    *(u32 *)(base + loc) = val - this->shdr.sh_addr - loc;
+    *(u32 *)loc = val - this->shdr.sh_addr - offset;
     return;
   }
   unreachable();
@@ -184,12 +171,8 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       continue;
     }
 
-    if (needs_baserel[i]) {
-      if (!is_relr_reloc(ctx, rel))
-        *dynrel++ = {P, R_386_RELATIVE, 0};
-      write32(S + A);
-      continue;
-    }
+    if (needs_baserel[i] && !is_relr_reloc(ctx, rel))
+      *dynrel++ = {P, R_386_RELATIVE, 0};
 
     switch (rel.r_type) {
     case R_386_8:
@@ -275,7 +258,6 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 template <>
 void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
   std::span<ElfRel<E>> rels = get_rels(ctx);
-  i64 frag_idx = 0;
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
@@ -286,7 +268,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
     u8 *loc = base + rel.r_offset;
 
     if (!sym.file) {
-      report_undef(ctx, sym);
+      report_undef(ctx, file, sym);
       continue;
     }
 
@@ -369,7 +351,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
 
 template <>
 void InputSection<E>::scan_relocations(Context<E> &ctx) {
-  assert(shdr.sh_flags & SHF_ALLOC);
+  assert(shdr().sh_flags & SHF_ALLOC);
 
   this->reldyn_offset = file.num_dynrel * sizeof(ElfRel<E>);
   std::span<ElfRel<E>> rels = get_rels(ctx);
@@ -383,7 +365,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     Symbol<E> &sym = *file.symbols[rel.r_sym];
 
     if (!sym.file) {
-      report_undef(ctx, sym);
+      report_undef(ctx, file, sym);
       continue;
     }
 
@@ -409,7 +391,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
         // Absolute  Local    Imported data  Imported code
         {  NONE,     BASEREL, DYNREL,        DYNREL },     // DSO
         {  NONE,     BASEREL, DYNREL,        DYNREL },     // PIE
-        {  NONE,     NONE,    COPYREL,       PLT },        // PDE
+        {  NONE,     NONE,    COPYREL,       PLT    },     // PDE
       };
       dispatch(ctx, table, i, rel, sym);
       break;
@@ -428,9 +410,9 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_386_PC32: {
       Action table[][4] = {
         // Absolute  Local  Imported data  Imported code
-        {  BASEREL,  NONE,  DYNREL,        DYNREL },     // DSO
-        {  BASEREL,  NONE,  COPYREL,       PLT   },      // PIE
-        {  NONE,     NONE,  COPYREL,       PLT   },      // PDE
+        {  ERROR,    NONE,  DYNREL,        DYNREL },     // DSO
+        {  ERROR,    NONE,  COPYREL,       PLT    },     // PIE
+        {  NONE,     NONE,  COPYREL,       PLT    },     // PDE
       };
       dispatch(ctx, table, i, rel, sym);
       break;
@@ -440,10 +422,16 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_386_GOTPC:
       sym.flags |= NEEDS_GOT;
       break;
-    case R_386_PLT32:
-      if (sym.is_imported)
-        sym.flags |= NEEDS_PLT;
+    case R_386_PLT32: {
+      Action table[][4] = {
+        // Absolute  Local  Imported data  Imported code
+        {  NONE,     NONE,  PLT,           PLT    },     // DSO
+        {  NONE,     NONE,  PLT,           PLT    },     // PIE
+        {  NONE,     NONE,  PLT,           PLT    },     // PDE
+      };
+      dispatch(ctx, table, i, rel, sym);
       break;
+    }
     case R_386_TLS_GOTIE:
     case R_386_TLS_LE:
     case R_386_TLS_IE:
@@ -453,7 +441,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       sym.flags |= NEEDS_TLSGD;
       break;
     case R_386_TLS_LDM:
-      sym.flags |= NEEDS_TLSLD;
+      ctx.needs_tlsld = true;
       break;
     case R_386_TLS_GOTDESC:
       if (!ctx.arg.relax || ctx.arg.shared)

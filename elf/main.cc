@@ -28,7 +28,26 @@ static ObjectFile<E> *new_object_file(Context<E> &ctx, MappedFile<Context<E>> *m
   bool in_lib = ctx.in_lib || (!archive_name.empty() && !ctx.whole_archive);
   ObjectFile<E> *file = ObjectFile<E>::create(ctx, mf, archive_name, in_lib);
   file->priority = ctx.file_priority++;
-  ctx.tg.run([file, &ctx]() { file->parse(ctx); });
+  ctx.tg.run([file, &ctx] { file->parse(ctx); });
+  if (ctx.arg.trace)
+    SyncOut(ctx) << "trace: " << *file;
+  return file;
+}
+
+template <typename E>
+static ObjectFile<E> *new_lto_obj(Context<E> &ctx, MappedFile<Context<E>> *mf,
+                                  std::string archive_name) {
+  static Counter count("parsed_lto_objs");
+  count++;
+
+  if (ctx.arg.ignore_ir_file.count(mf->get_identifier()))
+    return new ObjectFile<E>;
+
+  ObjectFile<E> *file = read_lto_object(ctx, mf);
+  file->priority = ctx.file_priority++;
+  file->is_in_lib = ctx.in_lib || (!archive_name.empty() && !ctx.whole_archive);
+  file->is_alive = !file->is_in_lib;
+  ctx.has_lto_object = true;
   if (ctx.arg.trace)
     SyncOut(ctx) << "trace: " << *file;
   return file;
@@ -42,7 +61,7 @@ new_shared_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 
   SharedFile<E> *file = SharedFile<E>::create(ctx, mf);
   file->priority = ctx.file_priority++;
-  ctx.tg.run([file, &ctx]() { file->parse(ctx); });
+  ctx.tg.run([file, &ctx] { file->parse(ctx); });
   if (ctx.arg.trace)
     SyncOut(ctx) << "trace: " << *file;
   return file;
@@ -64,18 +83,27 @@ void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
     return;
   case FileType::AR:
   case FileType::THIN_AR:
-    for (MappedFile<Context<E>> *child : read_archive_members(ctx, mf))
-      if (get_file_type(child) == FileType::ELF_OBJ)
+    for (MappedFile<Context<E>> *child : read_archive_members(ctx, mf)) {
+      switch (get_file_type(child)) {
+      case FileType::ELF_OBJ:
         ctx.objs.push_back(new_object_file(ctx, child, mf->name));
+        break;
+      case FileType::GCC_LTO_OBJ:
+      case FileType::LLVM_BITCODE:
+        ctx.objs.push_back(new_lto_obj(ctx, child, mf->name));
+        break;
+      default:
+        break;
+      }
+    }
     ctx.visited.insert(mf->name);
     return;
   case FileType::TEXT:
     parse_linker_script(ctx, mf);
     return;
+  case FileType::GCC_LTO_OBJ:
   case FileType::LLVM_BITCODE:
-    Warn(ctx) << mf->name << ": looks like this is an LLVM bitcode, "
-              << "but mold does not support LTO";
-    ctx.llvm_lto = true;
+    ctx.objs.push_back(new_lto_obj(ctx, mf, ""));
     return;
   default:
     Fatal(ctx) << mf->name << ": unknown file type: " << type;
@@ -89,6 +117,7 @@ static i64 get_machine_type(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   switch (get_file_type(mf)) {
   case FileType::ELF_OBJ:
   case FileType::ELF_DSO:
+  case FileType::GCC_LTO_OBJ:
     return ((ElfEhdr<E> *)mf->data)->e_machine;
   case FileType::AR:
     for (MappedFile<Context<E>> *child : read_fat_archive_members(ctx, mf))
@@ -275,7 +304,7 @@ static void show_stats(Context<E> &ctx) {
       static Counter alloc("reloc_alloc");
       static Counter nonalloc("reloc_nonalloc");
 
-      if (sec->shdr.sh_flags & SHF_ALLOC)
+      if (sec->shdr().sh_flags & SHF_ALLOC)
         alloc += sec->get_rels(ctx).size();
       else
         nonalloc += sec->get_rels(ctx).size();
@@ -321,10 +350,13 @@ static void show_stats(Context<E> &ctx) {
   }
 
   Counter::print();
+
+  for (std::unique_ptr<MergedSection<E>> &sec : ctx.merged_sections)
+    sec->print_stats(ctx);
 }
 
 static i64 get_default_thread_count() {
-  // mold doesn't scale above 32 threads.
+  // mold doesn't scale well above 32 threads.
   int n = tbb::global_control::active_value(
     tbb::global_control::max_allowed_parallelism);
   return std::min(n, 32);
@@ -355,6 +387,8 @@ static int elf_main(int argc, char **argv) {
       return elf_main<I386>(argc, argv);
     case EM_AARCH64:
       return elf_main<ARM64>(argc, argv);
+    case EM_RISCV:
+      return elf_main<RISCV64>(argc, argv);
     }
     unreachable();
   }
@@ -416,13 +450,6 @@ static int elf_main(int argc, char **argv) {
     }
   }
 
-  {
-    Timer t(ctx, "register_section_pieces");
-    tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-      file->register_section_pieces(ctx);
-    });
-  }
-
   // Uniquify shared object files by soname
   {
     std::unordered_set<std::string_view> seen;
@@ -445,23 +472,8 @@ static int elf_main(int argc, char **argv) {
   // included to the final output.
   resolve_symbols(ctx);
 
-  // We currently do not natively support LTO.
-  // If LLVM LTO is in use, fallback to the lld linker by invoking
-  // it with the exact same command line arguments as we got.
-  if (ctx.llvm_lto) {
-    Warn(ctx) << "LLVM LTO is detected, so falling back to ld.lld";
-    argv[0] = (char *)"ld.lld";
-    execvp("ld.lld", argv);
-    Fatal(ctx) << "execvp failed: ld.lld: " << errno_string();
-  }
-
-  // Do the same for GCC LTO.
-  if (Symbol<E> *sym = get_symbol(ctx, "__gnu_lto_slim"); sym->file) {
-    Warn(ctx) << *sym->file
-              << "GCC LTO is detected, so falling back to ld.bfd";
-    execvp("ld.bfd", argv);
-    Fatal(ctx) << "execvp failed: ld.bfd: " << errno_string();
-  }
+  // Resolve mergeable section pieces to merge them.
+  register_section_pieces(ctx);
 
   // Remove redundant comdat sections (e.g. duplicate inline functions).
   eliminate_comdats(ctx);
@@ -508,6 +520,12 @@ static int elf_main(int argc, char **argv) {
   if (ctx.arg.z_cet_report != CET_REPORT_NONE)
     check_cet_errors(ctx);
 
+  // Handle --print-dependencies
+  if (ctx.arg.print_dependencies == 1)
+    print_dependencies(ctx);
+  else if (ctx.arg.print_dependencies == 2)
+    print_dependencies_full(ctx);
+
   // If we are linking a .so file, remaining undefined symbols does
   // not cause a linker error. Instead, they are treated as if they
   // were imported symbols.
@@ -518,6 +536,10 @@ static int elf_main(int argc, char **argv) {
   claim_unresolved_symbols(ctx);
 
   // Beyond this point, no new symbols will be added to the result.
+
+  // Handle -repro
+  if (ctx.arg.repro)
+    write_repro_file(ctx);
 
   // Make sure that all symbols have been resolved.
   if (!ctx.arg.allow_multiple_definition)
@@ -531,6 +553,10 @@ static int elf_main(int argc, char **argv) {
   // .init_array and .fini_array contents have to be sorted by
   // a special rule. Sort them.
   sort_init_fini(ctx);
+
+  // Handle --shuffle-sections
+  if (ctx.arg.shuffle_sections)
+    shuffle_sections(ctx);
 
   // Compute sizes of output sections while assigning offsets
   // within an output section to input sections.
@@ -576,12 +602,7 @@ static int elf_main(int argc, char **argv) {
   ctx.verneed->construct(ctx);
 
   // Compute .symtab and .strtab sizes for each file.
-  {
-    Timer t(ctx, "compute_symtab");
-    tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-      file->compute_symtab(ctx);
-    });
-  }
+  create_output_symtab(ctx);
 
   // .eh_frame is a special section from the linker's point of view,
   // as its contents are parsed and reconstructed by the linker,
@@ -591,22 +612,27 @@ static int elf_main(int argc, char **argv) {
   {
     Timer t(ctx, "eh_frame");
     std::erase_if(ctx.chunks, [](Chunk<E> *chunk) {
-      return chunk->kind == Chunk<E>::REGULAR && chunk->name == ".eh_frame";
+      return chunk->is_output_section() && chunk->name == ".eh_frame";
     });
     ctx.eh_frame->construct(ctx);
   }
 
-  // Update shdr.sh_size for each chunk and remove empty ones.
+  // If --emit-relocs is given, we'll copy relocation sections from input
+  // files to an output file.
+  if (ctx.arg.emit_relocs)
+    create_reloc_sections(ctx);
+
+  // Update sh_size for each chunk and remove empty ones.
   for (Chunk<E> *chunk : ctx.chunks)
     chunk->update_shdr(ctx);
 
   std::erase_if(ctx.chunks, [](Chunk<E> *chunk) {
-    return chunk->kind == Chunk<E>::SYNTHETIC && chunk->shdr.sh_size == 0;
+    return !chunk->is_output_section() && chunk->shdr.sh_size == 0;
   });
 
   // Set section indices.
   for (i64 i = 0, shndx = 1; i < ctx.chunks.size(); i++)
-    if (ctx.chunks[i]->kind != Chunk<E>::HEADER)
+    if (!ctx.chunks[i]->is_header())
       ctx.chunks[i]->shndx = shndx++;
 
   // Some types of section header refer other section by index.
@@ -622,6 +648,13 @@ static int elf_main(int argc, char **argv) {
   // ±128 MiB.
   if constexpr (E::e_machine == EM_AARCH64)
     filesize = create_range_extension_thunks(ctx);
+
+  // On RISC-V, branches are encode using multiple instructions so
+  // that they can jump to anywhere in ±2 GiB by default. They may
+  // be replaced with shorter instruction sequences if destinations
+  // are close enough. Do this optimization.
+  if constexpr (E::e_machine == EM_RISCV)
+    filesize = riscv_resize_sections(ctx);
 
   // Fix linker-synthesized symbol addresses.
   fix_synthetic_symbols(ctx);
@@ -691,6 +724,9 @@ static int elf_main(int argc, char **argv) {
   // Close the output file. This is the end of the linker's main job.
   ctx.output_file->close(ctx);
 
+  if (ctx.has_lto_object)
+    lto_cleanup(ctx);
+
   t_total.stop();
   t_all.stop();
 
@@ -727,5 +763,6 @@ int main(int argc, char **argv) {
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
 INSTANTIATE(ARM64);
+INSTANTIATE(RISCV64);
 
 } // namespace mold::elf

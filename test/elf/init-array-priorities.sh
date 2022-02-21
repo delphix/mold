@@ -3,12 +3,16 @@ export LANG=
 set -e
 CC="${CC:-cc}"
 CXX="${CXX:-c++}"
-testname=$(basename -s .sh "$0")
+testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
 mold="$(pwd)/mold"
 t=out/test/elf/$testname
 mkdir -p $t
+
+# musl does not support GNU-style init/fini priorities
+echo 'int main() {}' | $CC -o $t/exe -xc -
+ldd $t/exe | grep -q ld-musl && { echo skipped; exit; }
 
 cat <<'EOF' | $CC -c -o $t/a.o -xc -
 #include <stdio.h>

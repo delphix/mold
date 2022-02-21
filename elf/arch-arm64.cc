@@ -22,30 +22,17 @@ static u64 page(u64 val) {
   return val & ~(u64)0xfff;
 }
 
-template <>
-void GotPltSection<E>::copy_buf(Context<E> &ctx) {
-  u64 *buf = (u64 *)(ctx.buf + this->shdr.sh_offset);
-
-  // The first slot of .got.plt points to _DYNAMIC.
-  buf[0] = ctx.dynamic ? ctx.dynamic->shdr.sh_addr : 0;
-  buf[1] = 0;
-  buf[2] = 0;
-
-  for (Symbol<E> *sym : ctx.plt->symbols)
-    buf[sym->get_gotplt_idx(ctx)] = ctx.plt->shdr.sh_addr;
-}
-
 static void write_plt_header(Context<E> &ctx, u8 *buf) {
   // Write PLT header
-  static const u8 plt0[] = {
-    0xf0, 0x7b, 0xbf, 0xa9, // stp    x16, x30, [sp,#-16]!
-    0x10, 0x00, 0x00, 0x90, // adrp   x16, .got.plt[2]
-    0x11, 0x02, 0x40, 0xf9, // ldr    x17, [x16, .got.plt[2]]
-    0x10, 0x02, 0x00, 0x91, // add    x16, x16, .got.plt[2]
-    0x20, 0x02, 0x1f, 0xd6, // br     x17
-    0x1f, 0x20, 0x03, 0xd5, // nop
-    0x1f, 0x20, 0x03, 0xd5, // nop
-    0x1f, 0x20, 0x03, 0xd5, // nop
+  static const u32 plt0[] = {
+    0xa9bf7bf0, // stp  x16, x30, [sp,#-16]!
+    0x90000010, // adrp x16, .got.plt[2]
+    0xf9400211, // ldr  x17, [x16, .got.plt[2]]
+    0x91000210, // add  x16, x16, .got.plt[2]
+    0xd61f0220, // br   x17
+    0xd503201f, // nop
+    0xd503201f, // nop
+    0xd503201f, // nop
   };
 
   u64 gotplt = ctx.gotplt->shdr.sh_addr + 16;
@@ -60,11 +47,11 @@ static void write_plt_header(Context<E> &ctx, u8 *buf) {
 static void write_plt_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
   u8 *ent = buf + ctx.plt_hdr_size + sym.get_plt_idx(ctx) * ctx.plt_size;
 
-  static const u8 data[] = {
-    0x10, 0x00, 0x00, 0x90, // adrp x16, .got.plt[n]
-    0x11, 0x02, 0x40, 0xf9, // ldr  x17, [x16, .got.plt[n]]
-    0x10, 0x02, 0x00, 0x91, // add  x16, x16, .got.plt[n]
-    0x20, 0x02, 0x1f, 0xd6, // br   x17
+  static const u32 data[] = {
+    0x90000010, // adrp x16, .got.plt[n]
+    0xf9400211, // ldr  x17, [x16, .got.plt[n]]
+    0x91000210, // add  x16, x16, .got.plt[n]
+    0xd61f0220, // br   x17
   };
 
   u64 gotplt = sym.get_gotplt_addr(ctx);
@@ -91,11 +78,11 @@ void PltGotSection<E>::copy_buf(Context<E> &ctx) {
   for (Symbol<E> *sym : symbols) {
     u8 *ent = buf + sym->get_pltgot_idx(ctx) * ARM64::pltgot_size;
 
-    static const u8 data[] = {
-      0x10, 0x00, 0x00, 0x90, // adrp x16, GOT[n]
-      0x11, 0x02, 0x40, 0xf9, // ldr  x17, [x16, GOT[n]]
-      0x20, 0x02, 0x1f, 0xd6, // br   x17
-      0x1f, 0x20, 0x03, 0xd5, // nop
+    static const u32 data[] = {
+      0x90000010, // adrp x16, GOT[n]
+      0xf9400211, // ldr  x17, [x16, GOT[n]]
+      0xd61f0220, // br   x17
+      0xd503201f, // nop
     };
 
     u64 got = sym->get_got_addr(ctx);
@@ -109,18 +96,18 @@ void PltGotSection<E>::copy_buf(Context<E> &ctx) {
 
 template <>
 void EhFrameSection<E>::apply_reloc(Context<E> &ctx, ElfRel<E> &rel,
-                                    u64 loc, u64 val) {
-  u8 *base = ctx.buf + this->shdr.sh_offset;
+                                    u64 offset, u64 val) {
+  u8 *loc = ctx.buf + this->shdr.sh_offset + offset;
 
   switch (rel.r_type) {
   case R_AARCH64_ABS64:
-    *(u64 *)(base + loc) = val;
+    *(u64 *)loc = val;
     return;
   case R_AARCH64_PREL32:
-    *(u32 *)(base + loc) = val - this->shdr.sh_addr - loc;
+    *(u32 *)loc = val - this->shdr.sh_addr - offset;
     return;
   case R_AARCH64_PREL64:
-    *(u64 *)(base + loc) = val - this->shdr.sh_addr - loc;
+    *(u64 *)loc = val - this->shdr.sh_addr - offset;
     return;
   }
   Fatal(ctx) << "unsupported relocation in .eh_frame: " << rel;
@@ -130,6 +117,7 @@ template <>
 void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
   ElfRel<E> *dynrel = nullptr;
   std::span<ElfRel<E>> rels = get_rels(ctx);
+  std::span<RangeExtensionRef> range_extn = get_range_extn();
 
   i64 frag_idx = 0;
 
@@ -168,12 +156,8 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       continue;
     }
 
-    if (needs_baserel[i]) {
-      if (!is_relr_reloc(ctx, rel))
-        *dynrel++ = {P, R_AARCH64_RELATIVE, 0, (i64)(S + A)};
-      *(u64 *)loc = S + A;
-      continue;
-    }
+    if (needs_baserel[i] && !is_relr_reloc(ctx, rel))
+      *dynrel++ = {P, R_AARCH64_RELATIVE, 0, (i64)(S + A)};
 
     switch (rel.r_type) {
     case R_AARCH64_ABS64:
@@ -357,7 +341,6 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 template <>
 void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
   std::span<ElfRel<E>> rels = get_rels(ctx);
-  i64 frag_idx = 0;
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
@@ -368,7 +351,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
     u8 *loc = base + rel.r_offset;
 
     if (!sym.file) {
-      report_undef(ctx, sym);
+      report_undef(ctx, file, sym);
       continue;
     }
 
@@ -399,7 +382,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
 
 template <>
 void InputSection<E>::scan_relocations(Context<E> &ctx) {
-  assert(shdr.sh_flags & SHF_ALLOC);
+  assert(shdr().sh_flags & SHF_ALLOC);
 
   this->reldyn_offset = file.num_dynrel * sizeof(ElfRel<E>);
   std::span<ElfRel<E>> rels = get_rels(ctx);
@@ -413,7 +396,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     Symbol<E> &sym = *file.symbols[rel.r_sym];
 
     if (!sym.file) {
-      report_undef(ctx, sym);
+      report_undef(ctx, file, sym);
       continue;
     }
 
@@ -494,8 +477,8 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 
 static void reset_thunk(RangeExtensionThunk<E> &thunk) {
   for (Symbol<E> *sym : thunk.symbols) {
-    sym->thunk_idx = -1;
-    sym->thunk_sym_idx = -1;
+    sym->extra.thunk_idx = -1;
+    sym->extra.thunk_sym_idx = -1;
     sym->flags &= (u8)~NEEDS_THUNK;
   }
 }
@@ -547,9 +530,9 @@ static void create_thunks(Context<E> &ctx, OutputSection<E> &osec) {
   while (b < members.size()) {
     // Move D foward as far as we can jump from B to D.
     while (d < members.size() && offset - members[b]->offset < MAX_DISTANCE) {
-      offset = align_to(offset, members[d]->shdr.sh_addralign);
+      offset = align_to(offset, 1 << members[d]->p2align);
       members[d]->offset = offset;
-      offset += members[d]->shdr.sh_size;
+      offset += members[d]->sh_size;
       d++;
     }
 
@@ -560,7 +543,7 @@ static void create_thunks(Context<E> &ctx, OutputSection<E> &osec) {
 
     // Move A forward so that A is reachable from C.
     if (c > 0) {
-      i64 c_end = members[c - 1]->offset + members[c - 1]->shdr.sh_size;
+      i64 c_end = members[c - 1]->offset + members[c - 1]->sh_size;
       while (a < osec.thunks.size() &&
              osec.thunks[a]->offset < c_end - MAX_DISTANCE)
         reset_thunk(*osec.thunks[a++]);
@@ -574,9 +557,11 @@ static void create_thunks(Context<E> &ctx, OutputSection<E> &osec) {
     thunk.offset = offset;
 
     // Scan relocations between B and C to collect symbols that need thunks.
-    tbb::parallel_for_each(&members[b], &members[c], [&](InputSection<E> *isec) {
+    tbb::parallel_for_each(members.begin() + b, members.begin() + c,
+                           [&](InputSection<E> *isec) {
       std::span<ElfRel<E>> rels = isec->get_rels(ctx);
-      isec->range_extn.resize(rels.size());
+      std::vector<RangeExtensionRef> &range_extn = isec->get_range_extn();
+      range_extn.resize(rels.size());
 
       for (i64 i = 0; i < rels.size(); i++) {
         const ElfRel<E> &rel = rels[i];
@@ -590,13 +575,13 @@ static void create_thunks(Context<E> &ctx, OutputSection<E> &osec) {
           continue;
 
         // If the symbol is already in another thunk, reuse it.
-        if (sym.thunk_idx != -1) {
-          isec->range_extn[i] = {sym.thunk_idx, sym.thunk_sym_idx};
+        if (sym.extra.thunk_idx != -1) {
+          range_extn[i] = {sym.extra.thunk_idx, sym.extra.thunk_sym_idx};
           continue;
         }
 
         // Otherwise, add the symbol to this thunk if it's not added already.
-        isec->range_extn[i] = {thunk.thunk_idx, -1};
+        range_extn[i] = {thunk.thunk_idx, -1};
 
         if (!(sym.flags.fetch_or(NEEDS_THUNK) & NEEDS_THUNK)) {
           std::scoped_lock lock(thunk.mu);
@@ -614,20 +599,20 @@ static void create_thunks(Context<E> &ctx, OutputSection<E> &osec) {
 
     // Assign offsets within the thunk to the symbols.
     for (i64 i = 0; Symbol<E> *sym : thunk.symbols) {
-      sym->thunk_idx = thunk.thunk_idx;
-      sym->thunk_sym_idx = i++;
+      sym->extra.thunk_idx = thunk.thunk_idx;
+      sym->extra.thunk_sym_idx = i++;
     }
 
     // Scan relocations again to fix symbol offsets in the last thunk.
-    tbb::parallel_for_each(&members[b], &members[c], [&](InputSection<E> *isec) {
+    tbb::parallel_for_each(members.begin() + b, members.begin() + c,
+                           [&](InputSection<E> *isec) {
       std::span<ElfRel<E>> rels = isec->get_rels(ctx);
+      std::span<RangeExtensionRef> range_extn = isec->get_range_extn();
 
       for (i64 i = 0; i < rels.size(); i++) {
-        RangeExtensionRef &ref = isec->range_extn[i];
-
-        if (ref.thunk_idx == thunk.thunk_idx) {
+        if (range_extn[i].thunk_idx == thunk.thunk_idx) {
           Symbol<E> &sym = *isec->file.symbols[rels[i].r_sym];
-          ref.sym_idx = sym.thunk_sym_idx;
+          range_extn[i].sym_idx = sym.extra.thunk_sym_idx;
         }
       }
     });
@@ -652,9 +637,10 @@ static void mark_thunk_symbols(Context<E> &ctx, OutputSection<E> &osec) {
   // Mark referenced thunk symbols
   tbb::parallel_for_each(osec.members, [&](InputSection<E> *isec) {
     std::span<ElfRel<E>> rels = isec->get_rels(ctx);
+    std::span<RangeExtensionRef> range_extn = isec->get_range_extn();
 
     for (i64 i = 0; i < rels.size(); i++) {
-      RangeExtensionRef &ref = isec->range_extn[i];
+      RangeExtensionRef &ref = range_extn[i];
       if (ref.thunk_idx == -1)
         continue;
 
@@ -685,16 +671,16 @@ static void shrink_section(Context<E> &ctx, OutputSection<E> &osec) {
 
   i64 offset = 0;
 
-  auto add_thunk = [&]() {
+  auto add_thunk = [&] {
     thunks[0]->offset = offset;
     offset += thunks[0]->size();
     thunks = thunks.subspan(1);
   };
 
-  auto add_isec = [&]() {
-    offset = align_to(offset, members[0]->shdr.sh_addralign);
+  auto add_isec = [&] {
+    offset = align_to(offset, 1 << members[0]->p2align);
     members[0]->offset = offset;
-    offset += members[0]->shdr.sh_size;
+    offset += members[0]->sh_size;
     members = members.subspan(1);
   };
 
@@ -722,6 +708,9 @@ static void shrink_section(Context<E> &ctx, OutputSection<E> &osec) {
 i64 create_range_extension_thunks(Context<E> &ctx) {
   Timer t(ctx, "create_range_extension_thunks");
 
+  for (ObjectFile<E> *file : ctx.objs)
+    file->range_extn.resize(file->sections.size());
+
   // First, we create thunks with a pessimistic assumption that all
   // out-of-section relocations would need thunks. To do so, we start
   // with an initial layout in which output sections are separated far
@@ -741,7 +730,7 @@ i64 create_range_extension_thunks(Context<E> &ctx) {
   set_osec_offsets(ctx);
 
   // Based on the current file layout, remove thunk symbols that turned
-  // to be unnecessary.
+  // out to be unnecessary.
   tbb::parallel_for_each(sections, [&](OutputSection<E> *osec) {
     mark_thunk_symbols(ctx, *osec);
   });
@@ -760,20 +749,20 @@ i64 create_range_extension_thunks(Context<E> &ctx) {
 void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
   u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
 
-  static const u8 insn[] = {
-    0x10, 0x00, 0x00, 0x90, // adrp x16, 0   # R_AARCH64_ADR_PREL_PG_HI21
-    0x10, 0x02, 0x00, 0x91, // add  x16, x16 # R_AARCH64_ADD_ABS_LO12_NC
-    0x00, 0x02, 0x1f, 0xd6, // br   x16
+  static const u32 data[] = {
+    0x90000010, // adrp x16, 0   # R_AARCH64_ADR_PREL_PG_HI21
+    0x91000210, // add  x16, x16 # R_AARCH64_ADD_ABS_LO12_NC
+    0xd61f0200, // br   x16
   };
 
-  static_assert(ENTRY_SIZE == sizeof(insn));
+  static_assert(ENTRY_SIZE == sizeof(data));
 
   for (i64 i = 0; i < symbols.size(); i++) {
     u64 S = symbols[i]->get_addr(ctx);
     u64 P = output_section.shdr.sh_addr + offset + i * ENTRY_SIZE;
 
     u8 *loc = buf + i * ENTRY_SIZE;
-    memcpy(loc , insn, sizeof(insn));
+    memcpy(loc , data, sizeof(data));
     write_adr(loc, bits(page(S) - page(P), 32, 12));
     *(u32 *)(loc + 4) |= bits(S, 11, 0) << 10;
   }

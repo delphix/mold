@@ -3,12 +3,16 @@ export LANG=
 set -e
 CC="${CC:-cc}"
 CXX="${CXX:-c++}"
-testname=$(basename -s .sh "$0")
+testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
 mold="$(pwd)/mold"
 t=out/test/elf/$testname
 mkdir -p $t
+
+# musl doesn't work with `-z noseparate-code`
+echo 'int main() {}' | $CC -o $t/exe -xc -
+ldd $t/exe | grep -q ld-musl && { echo skipped; exit; }
 
 cat <<EOF | $CC -o $t/a.o -c -xc -
 #include <stdio.h>
