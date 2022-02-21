@@ -9,8 +9,8 @@ Index: mold/test/elf/init-array-priorities.sh
 +set -e -v
  CC="${CC:-cc}"
  CXX="${CXX:-c++}"
- testname=$(basename -s .sh "$0")
-@@ -56,6 +56,8 @@ EOF
+ testname=$(basename "$0" .sh)
+@@ -60,6 +60,8 @@ EOF
  
  $CC -B. -o $t/exe $t/a.o $t/b.o $t/c.o $t/d.o \
    $t/e.o $t/f.o $t/g.o $t/h.o $t/i.o

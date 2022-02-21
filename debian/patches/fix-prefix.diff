@@ -2,7 +2,10 @@ Index: mold/Makefile
 ===================================================================
 --- mold.orig/Makefile
 +++ mold/Makefile
-@@ -1,4 +1,4 @@
+@@ -4,7 +4,7 @@
+ 
+ VERSION = 1.1
+ 
 -PREFIX = /usr/local
 +PREFIX = /usr
  BINDIR = $(PREFIX)/bin
