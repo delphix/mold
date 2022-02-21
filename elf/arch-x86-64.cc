@@ -4,25 +4,6 @@ namespace mold::elf {
 
 using E = X86_64;
 
-template <>
-void GotPltSection<E>::copy_buf(Context<E> &ctx) {
-  u64 *buf = (u64 *)(ctx.buf + this->shdr.sh_offset);
-
-  // The first slot of .got.plt points to _DYNAMIC, as requested by
-  // the x86-64 psABI. The second and the third slots are reserved by
-  // the psABI.
-  buf[0] = ctx.dynamic ? ctx.dynamic->shdr.sh_addr : 0;
-  buf[1] = 0;
-  buf[2] = 0;
-
-  for (Symbol<E> *sym : ctx.plt->symbols) {
-    if (ctx.arg.z_ibtplt)
-      buf[sym->get_gotplt_idx(ctx)] = sym->get_plt_addr(ctx) + 10;
-    else
-      buf[sym->get_gotplt_idx(ctx)] = sym->get_plt_addr(ctx) + 6;
-  }
-}
-
 // The compact PLT format is used when `-z now` is given. If the flag
 // is given, all PLT symbols are resolved eagerly on startup, so we
 // can omit code for lazy symbol resolution from PLT in that case.
@@ -145,23 +126,23 @@ void PltGotSection<E>::copy_buf(Context<E> &ctx) {
 
 template <>
 void EhFrameSection<E>::apply_reloc(Context<E> &ctx, ElfRel<E> &rel,
-                                    u64 loc, u64 val) {
-  u8 *base = ctx.buf + this->shdr.sh_offset;
+                                    u64 offset, u64 val) {
+  u8 *loc = ctx.buf + this->shdr.sh_offset + offset;
 
   switch (rel.r_type) {
   case R_X86_64_NONE:
     return;
   case R_X86_64_32:
-    *(u32 *)(base + loc) = val;
+    *(u32 *)loc = val;
     return;
   case R_X86_64_64:
-    *(u64 *)(base + loc) = val;
+    *(u64 *)loc = val;
     return;
   case R_X86_64_PC32:
-    *(u32 *)(base + loc) = val - this->shdr.sh_addr - loc;
+    *(u32 *)loc = val - this->shdr.sh_addr - offset;
     return;
   case R_X86_64_PC64:
-    *(u64 *)(base + loc) = val - this->shdr.sh_addr - loc;
+    *(u64 *)loc = val - this->shdr.sh_addr - offset;
     return;
   }
   unreachable();
@@ -297,12 +278,8 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       continue;
     }
 
-    if (needs_baserel[i]) {
-      if (!is_relr_reloc(ctx, rel))
-        *dynrel++ = {P, R_X86_64_RELATIVE, 0, (i64)(S + A)};
-      write64(S + A);
-      continue;
-    }
+    if (needs_baserel[i] && !is_relr_reloc(ctx, rel))
+      *dynrel++ = {P, R_X86_64_RELATIVE, 0, (i64)(S + A)};
 
     switch (rel.r_type) {
     case R_X86_64_8:
@@ -500,7 +477,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
     u8 *loc = base + rel.r_offset;
 
     if (!sym.file) {
-      report_undef(ctx, sym);
+      report_undef(ctx, file, sym);
       continue;
     }
 
@@ -584,7 +561,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
 // need to scan relocations.
 template <>
 void InputSection<E>::scan_relocations(Context<E> &ctx) {
-  assert(shdr.sh_flags & SHF_ALLOC);
+  assert(shdr().sh_flags & SHF_ALLOC);
 
   this->reldyn_offset = file.num_dynrel * sizeof(ElfRel<E>);
   std::span<ElfRel<E>> rels = get_rels(ctx);
@@ -599,7 +576,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     u8 *loc = (u8 *)(contents.data() + rel.r_offset);
 
     if (!sym.file) {
-      report_undef(ctx, sym);
+      report_undef(ctx, file, sym);
       continue;
     }
 
@@ -652,9 +629,9 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_X86_64_PC64: {
       Action table[][4] = {
         // Absolute  Local  Imported data  Imported code
-        {  BASEREL,  NONE,  DYNREL,        DYNREL },     // DSO
-        {  BASEREL,  NONE,  COPYREL,       PLT   },      // PIE
-        {  NONE,     NONE,  COPYREL,       PLT   },      // PDE
+        {  ERROR,    NONE,  DYNREL,        DYNREL },     // DSO
+        {  ERROR,    NONE,  COPYREL,       PLT    },     // PIE
+        {  NONE,     NONE,  COPYREL,       PLT    },     // PDE
       };
       dispatch(ctx, table, i, rel, sym);
       break;
@@ -688,10 +665,16 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       break;
     }
     case R_X86_64_PLT32:
-    case R_X86_64_PLTOFF64:
-      if (sym.is_imported)
-        sym.flags |= NEEDS_PLT;
+    case R_X86_64_PLTOFF64: {
+      Action table[][4] = {
+        // Absolute  Local  Imported data  Imported code
+        {  NONE,     NONE,  PLT,           PLT    },     // DSO
+        {  NONE,     NONE,  PLT,           PLT    },     // PIE
+        {  NONE,     NONE,  PLT,           PLT    },     // PDE
+      };
+      dispatch(ctx, table, i, rel, sym);
       break;
+    }
     case R_X86_64_TLSGD:
       if (i + 1 == rels.size())
         Fatal(ctx) << *this
@@ -710,7 +693,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       if (ctx.arg.relax && !ctx.arg.shared)
         i++;
       else
-        sym.flags |= NEEDS_TLSLD;
+        ctx.needs_tlsld = true;
       break;
     case R_X86_64_GOTTPOFF: {
       ctx.has_gottp_rel = true;

@@ -3,6 +3,7 @@
 #include "byteorder.h"
 
 #include <atomic>
+#include <bit>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -160,12 +161,12 @@ private:
 inline u64 align_to(u64 val, u64 align) {
   if (align == 0)
     return val;
-  assert(__builtin_popcount(align) == 1);
+  assert(std::popcount(align) == 1);
   return (val + align - 1) & ~(align - 1);
 }
 
 inline u64 align_down(u64 val, u64 align) {
-  assert(__builtin_popcount(align) == 1);
+  assert(std::popcount(align) == 1);
   return val & ~(align - 1);
 }
 
@@ -173,20 +174,18 @@ inline u64 next_power_of_two(u64 val) {
   assert(val >> 63 == 0);
   if (val == 0 || val == 1)
     return 1;
-  return (u64)1 << (64 - __builtin_clzl(val - 1));
+  return (u64)1 << (64 - std::countl_zero(val - 1));
 }
 
 template <typename T, typename Compare = std::less<T>>
-void update_minimum(std::atomic<T> &atomic, u64 new_val,
-                    Compare cmp = {}) {
+void update_minimum(std::atomic<T> &atomic, u64 new_val, Compare cmp = {}) {
   T old_val = atomic;
   while (cmp(new_val, old_val) &&
          !atomic.compare_exchange_weak(old_val, new_val));
 }
 
 template <typename T, typename Compare = std::less<T>>
-void update_maximum(std::atomic<T> &atomic, u64 new_val,
-                    Compare cmp = {}) {
+void update_maximum(std::atomic<T> &atomic, u64 new_val, Compare cmp = {}) {
   T old_val = atomic;
   while (cmp(old_val, new_val) &&
          !atomic.compare_exchange_weak(old_val, new_val));
@@ -280,6 +279,11 @@ std::string_view save_string(C &ctx, const std::string &str) {
 // Concurrent Map
 //
 
+// This is an implementation of a fast concurrent hash map. Unlike
+// ordinary hash tables, this impl just aborts if it becomes full.
+// So you need to give a correct estimation of the final size before
+// using it. We use this hash map to uniquify pieces of data in
+// mergeable sections.
 template <typename T>
 class ConcurrentMap {
 public:
@@ -292,7 +296,7 @@ public:
   ~ConcurrentMap() {
     if (keys) {
       free((void *)keys);
-      free((void *)sizes);
+      free((void *)key_sizes);
       free((void *)values);
     }
   }
@@ -304,7 +308,7 @@ public:
 
     this->nbuckets = nbuckets;
     keys = (std::atomic<const char *> *)calloc(nbuckets, sizeof(keys[0]));
-    sizes = (u32 *)calloc(nbuckets, sizeof(sizes[0]));
+    key_sizes = (u32 *)calloc(nbuckets, sizeof(key_sizes[0]));
     values = (T *)calloc(nbuckets, sizeof(values[0]));
   }
 
@@ -312,29 +316,28 @@ public:
     if (!keys)
       return {nullptr, false};
 
-    assert(__builtin_popcount(nbuckets) == 1);
+    assert(std::popcount<u64>(nbuckets) == 1);
     i64 idx = hash & (nbuckets - 1);
     i64 retry = 0;
 
     while (retry < MAX_RETRY) {
       const char *ptr = keys[idx];
-      if (ptr == locked) {
-#ifdef __x86_64__
-        asm volatile("pause" ::: "memory");
-#endif
+      if (ptr == marker) {
+        pause();
         continue;
       }
 
       if (ptr == nullptr) {
-        if (!keys[idx].compare_exchange_weak(ptr, locked))
+        if (!keys[idx].compare_exchange_weak(ptr, marker))
           continue;
         new (values + idx) T(val);
-        sizes[idx] = key.size();
+        key_sizes[idx] = key.size();
         keys[idx] = key.data();
         return {values + idx, true};
       }
 
-      if (key.size() == sizes[idx] && memcmp(ptr, key.data(), sizes[idx]) == 0)
+      if (key.size() == key_sizes[idx] &&
+          memcmp(ptr, key.data(), key_sizes[idx]) == 0)
         return {values + idx, false};
 
       u64 mask = nbuckets / NUM_SHARDS - 1;
@@ -356,11 +359,19 @@ public:
 
   i64 nbuckets = 0;
   std::atomic<const char *> *keys = nullptr;
-  u32 *sizes = nullptr;
+  u32 *key_sizes = nullptr;
   T *values = nullptr;
 
 private:
-  static constexpr const char *locked = "marker";
+  static void pause() {
+#if defined(__x86_64__)
+    asm volatile("pause");
+#elif defined(__aarch64__)
+    asm volatile("yield");
+#endif
+  }
+
+  static constexpr const char *marker = "marker";
 };
 
 //
@@ -423,7 +434,7 @@ public:
   HyperLogLog() : buckets(NBUCKETS) {}
 
   void insert(u32 hash) {
-    update_maximum(buckets[hash & (NBUCKETS - 1)], __builtin_clz(hash) + 1);
+    update_maximum(buckets[hash & (NBUCKETS - 1)], std::countl_zero(hash) + 1);
   }
 
   i64 get_cardinality() const;
@@ -571,24 +582,24 @@ private:
 
 // TarFile is a class to create a tar file.
 //
-// If you pass `--reproduce=repro.tar` to mold, mold collects all
-// input files and put them into `repro.tar`, so that it is easy to
+// If you pass `--repro` to mold, mold collects all input files and
+// put them into `<output-file-path>.repro.tar`, so that it is easy to
 // run the same command with the same command line arguments.
-class TarFile {
+class TarWriter {
 public:
-  TarFile(std::string basedir) : basedir(basedir) {}
+  static std::unique_ptr<TarWriter>
+  open(std::string output_path, std::string basedir);
+
+  ~TarWriter();
   void append(std::string path, std::string_view data);
-  void write_to(u8 *buf);
-  i64 size() const { return size_; }
 
 private:
   static constexpr i64 BLOCK_SIZE = 512;
 
-  std::string encode_path(std::string path);
+  TarWriter(FILE *out, std::string basedir) : out(out), basedir(basedir) {}
 
+  FILE *out = nullptr;
   std::string basedir;
-  std::vector<std::pair<std::string, std::string_view>> contents;
-  i64 size_ = BLOCK_SIZE * 2;
 };
 
 //
@@ -611,12 +622,28 @@ public:
     return std::string_view((char *)data, size);
   }
 
+  i64 get_offset() const {
+    return parent ? (data - parent->data + parent->get_offset()) : 0;
+  }
+
+  // Returns a string that uniquely identify a file that is possibly
+  // in an archive.
+  std::string get_identifier() const {
+    if (parent) {
+      // We use the file offset within an archive as an identifier
+      // because archive members may have the same name.
+      return parent->name + ":" + std::to_string(get_offset());
+    }
+    return name;
+  }
+
   std::string name;
   u8 *data = nullptr;
   i64 size = 0;
   i64 mtime = 0;
   bool given_fullpath = true;
   MappedFile *parent = nullptr;
+  int fd = -1;
 };
 
 template <typename C>
@@ -624,14 +651,14 @@ MappedFile<C> *MappedFile<C>::open(C &ctx, std::string path) {
   MappedFile *mf = new MappedFile;
   mf->name = path;
 
-  ctx.mf_pool.push_back(std::unique_ptr<MappedFile>(mf));
-
   if (path.starts_with('/') && !ctx.arg.chroot.empty())
     path = ctx.arg.chroot + "/" + path_clean(path);
 
   i64 fd = ::open(path.c_str(), O_RDONLY);
   if (fd == -1)
     return nullptr;
+
+  ctx.mf_pool.push_back(std::unique_ptr<MappedFile>(mf));
 
   struct stat st;
   if (fstat(fd, &st) == -1)
@@ -659,7 +686,7 @@ template <typename C>
 MappedFile<C> *MappedFile<C>::must_open(C &ctx, std::string path) {
   if (MappedFile *mf = MappedFile::open(ctx, path))
     return mf;
-  Fatal(ctx) << "cannot open " << path;
+  Fatal(ctx) << "cannot open " << path << ": " << errno_string();
 }
 
 template <typename C>

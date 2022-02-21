@@ -38,6 +38,7 @@ Options:
   -l LIBNAME                  Search for a given library
   -m TARGET                   Set target
   -o FILE, --output FILE      Set output filename
+  -q, --emit-relocs           Leaves relocation sections in the output
   -r, --relocatable           Generate relocatable output
   -s, --strip-all             Strip .symtab section
   -u SYMBOL, --undefined SYMBOL
@@ -112,6 +113,7 @@ Options:
   --rpath-link DIR            Ignored
   --run COMMAND ARG...        Run COMMAND with mold as /usr/bin/ld
   --shared, --Bshareable      Create a share library
+  --shuffle-sections[=SEED]   Randomize the output by shuffling input sections
   --sort-common               Ignored
   --sort-section              Ignored
   --spare-dynamic-tags NUMBER Reserve give number of tags in .dynamic section
@@ -131,6 +133,8 @@ Options:
   --version-script FILE       Read version script
   --warn-common               Warn about common symbols
     --no-warn-common
+  --warn-once                 Only warn once for each undefined symbol
+  --warn-textrel              Warn if the output file needs text relocations
   --warn-unresolved-symbols   Report unresolved symbols as warnings
     --error-unresolved-symbols
                               Report unresolved symbols as errors (default)
@@ -260,36 +264,6 @@ bool read_z_arg(Context<E> &ctx, std::span<std::string_view> &args,
 }
 
 template <typename E>
-std::string create_response_file(Context<E> &ctx) {
-  std::string buf;
-  std::stringstream out;
-
-  std::string cwd = std::filesystem::current_path();
-  out << "-C " << cwd.substr(1) << "\n";
-
-  if (cwd != "/") {
-    out << "--chroot ..";
-    i64 depth = std::count(cwd.begin(), cwd.end(), '/');
-    for (i64 i = 1; i < depth; i++)
-      out << "/..";
-    out << "\n";
-  }
-
-  for (i64 i = 1; i < ctx.cmdline_args.size(); i++) {
-    std::string_view arg = ctx.cmdline_args[i];
-
-    if (arg == "-repro" || arg == "--repro") {
-      i++;
-      continue;
-    }
-
-    out << arg << "\n";
-  }
-
-  return out.str();
-}
-
-template <typename E>
 static i64 parse_hex(Context<E> &ctx, std::string opt, std::string_view value) {
   if (!value.starts_with("0x") && !value.starts_with("0X"))
     Fatal(ctx) << "option -" << opt << ": not a hexadecimal number";
@@ -410,6 +384,8 @@ static std::pair<i64, i64> get_plt_size(Context<E> &ctx) {
     return {16, 16};
   case EM_AARCH64:
     return {32, 16};
+  case EM_RISCV:
+    return {32, 16};
   }
   unreachable();
 }
@@ -424,6 +400,11 @@ void parse_nonpositional_args(Context<E> &ctx,
   ctx.page_size = E::page_size;
 
   bool version_shown = false;
+
+  // RISC-V object files contains lots of local symbols, so by default
+  // we discard them. This is compatible with GNU ld.
+  if (E::e_machine == EM_RISCV)
+    ctx.arg.discard_locals = true;
 
   while (!args.empty()) {
     std::string_view arg;
@@ -458,6 +439,8 @@ void parse_nonpositional_args(Context<E> &ctx,
         ctx.arg.emulation = EM_386;
       } else if (arg == "aarch64linux") {
         ctx.arg.emulation = EM_AARCH64;
+      } else if (arg == "elf64lriscv") {
+        ctx.arg.emulation = EM_RISCV;
       } else {
         Fatal(ctx) << "unknown -m argument: " << arg;
       }
@@ -476,12 +459,18 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.Bsymbolic_functions = false;
     } else if (read_arg(ctx, args, arg, "exclude-libs")) {
       append(ctx.arg.exclude_libs, split_by_comma_or_colon(arg));
+    } else if (read_flag(args, "q") || read_flag(args, "emit-relocs")) {
+      ctx.arg.emit_relocs = true;
     } else if (read_arg(ctx, args, arg, "e") ||
                read_arg(ctx, args, arg, "entry")) {
       ctx.arg.entry = arg;
     } else if (read_arg(ctx, args, arg, "Map")) {
       ctx.arg.Map = arg;
       ctx.arg.print_map = true;
+    } else if (read_flag(args, "print-dependencies")) {
+      ctx.arg.print_dependencies = 1;
+    } else if (read_flag(args, "print-dependencies=full")) {
+      ctx.arg.print_dependencies = 2;
     } else if (read_flag(args, "print-map") || read_flag(args, "M")) {
       ctx.arg.print_map = true;
     } else if (read_flag(args, "static") || read_flag(args, "Bstatic")) {
@@ -501,12 +490,18 @@ void parse_nonpositional_args(Context<E> &ctx,
       if (pos == arg.npos || pos == arg.size() - 1)
         Fatal(ctx) << "-defsym: syntax error: " << arg;
       ctx.arg.defsyms.push_back({arg.substr(0, pos), arg.substr(pos + 1)});
+    } else if (read_flag(args, ":lto-pass2")) {
+      ctx.arg.lto_pass2 = true;
+    } else if (read_arg(ctx, args, arg, ":ignore-ir-file")) {
+      ctx.arg.ignore_ir_file.insert(arg);
     } else if (read_flag(args, "demangle")) {
       ctx.arg.demangle = true;
     } else if (read_flag(args, "no-demangle")) {
       ctx.arg.demangle = false;
     } else if (read_flag(args, "default-symver")) {
       ctx.arg.default_symver = true;
+    } else if (read_flag(args, "shuffle-sections")) {
+      ctx.arg.shuffle_sections = true;
     } else if (read_arg(ctx, args, arg, "y") ||
                read_arg(ctx, args, arg, "trace-symbol")) {
       ctx.arg.trace_symbol.push_back(arg);
@@ -607,6 +602,10 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.warn_common = true;
     } else if (read_flag(args, "no-warn-common")) {
       ctx.arg.warn_common = false;
+    } else if (read_flag(args, "warn-once")) {
+      ctx.arg.warn_once = true;
+    } else if (read_flag(args, "warn-textrel")) {
+      ctx.arg.warn_textrel = true;
     } else if (read_arg(ctx, args, arg, "compress-debug-sections")) {
       if (arg == "zlib" || arg == "zlib-gabi")
         ctx.arg.compress_debug_sections = COMPRESS_GABI;
@@ -641,7 +640,7 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.z_execstack = true;
     } else if (read_z_arg(ctx, args, arg, "max-page-size")) {
       ctx.page_size = parse_number(ctx, "-z max-page-size", arg);
-      if (__builtin_popcountll(ctx.page_size) != 1)
+      if (std::popcount<u64>(ctx.page_size) != 1)
         Fatal(ctx) << "-z max-page-size " << arg << ": value must be a power of 2";
     } else if (read_z_flag(args, "noexecstack")) {
       ctx.arg.z_execstack = false;
@@ -729,6 +728,10 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.quick_exit = true;
     } else if (read_flag(args, "no-quick-exit")) {
       ctx.arg.quick_exit = false;
+    } else if (read_arg(ctx, args, arg, "plugin")) {
+      ctx.arg.plugin = arg;
+    } else if (read_arg(ctx, args, arg, "plugin-opt")) {
+      ctx.arg.plugin_opt.push_back(arg);
     } else if (read_arg(ctx, args, arg, "thread-count")) {
       ctx.arg.thread_count = parse_number(ctx, "thread-count", arg);
     } else if (read_flag(args, "threads")) {
@@ -795,7 +798,7 @@ void parse_nonpositional_args(Context<E> &ctx,
       if (arg == "binary")
         Fatal(ctx)
           << "mold does not suppor `-b binary`. If you want to convert a binary"
-          " file into an object file, use `objcopy -I binary -O elf64-x86-64"
+          << " file into an object file, use `objcopy -I binary -O default"
           << " <input-file> <output-file.o>` instead.";
       Fatal(ctx) << "unknown command line option: -b " << arg;
     } else if (read_arg(ctx, args, arg, "auxiliary") ||
@@ -814,8 +817,6 @@ void parse_nonpositional_args(Context<E> &ctx,
     } else if (read_flag(args, "O1")) {
     } else if (read_flag(args, "O2")) {
     } else if (read_flag(args, "verbose")) {
-    } else if (read_arg(ctx, args, arg, "plugin")) {
-    } else if (read_arg(ctx, args, arg, "plugin-opt")) {
     } else if (read_flag(args, "color-diagnostics")) {
     } else if (read_flag(args, "gdb-index")) {
     } else if (read_flag(args, "eh-frame-hdr")) {
@@ -960,8 +961,6 @@ void parse_nonpositional_args(Context<E> &ctx,
                 std::string_view &arg,                                  \
                 std::string name);                                      \
                                                                         \
-  template std::string create_response_file(Context<E> &ctx);           \
-                                                                        \
   template                                                              \
   void parse_nonpositional_args(Context<E> &ctx,                        \
                                 std::vector<std::string_view> &remaining)
@@ -969,5 +968,6 @@ void parse_nonpositional_args(Context<E> &ctx,
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
 INSTANTIATE(ARM64);
+INSTANTIATE(RISCV64);
 
 } // namespace mold::elf

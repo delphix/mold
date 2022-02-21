@@ -1,10 +1,10 @@
 # mold: A Modern Linker
 
 mold is a faster drop-in replacement for existing Unix linkers.
-It is several times faster than LLVM lld linker, the second-fastest
+It is several times faster than the LLVM lld linker, the second-fastest
 open-source linker which I originally created a few years ago.
-mold is created for increasing developer productivity by reducing
-build time especially in rapid debug-edit-rebuild cycles.
+mold is designed to increase developer productivity by reducing
+build time, especially in rapid debug-edit-rebuild cycles.
 
 Here is a performance comparison of GNU gold, LLVM lld, and mold for
 linking final debuginfo-enabled executables of major large programs
@@ -22,7 +22,7 @@ mold is so fast that it is only 2x _slower_ than `cp` on the same
 machine. Feel free to [file a bug](https://github.com/rui314/mold/issues)
 if you find mold is not faster than other linkers.
 
-mold currently supports x86-64, i386 and ARM64.
+mold currently supports x86-64, i386, ARM64 and 64-bit RISC-V.
 
 ## Why does the speed of linking matter?
 
@@ -72,7 +72,7 @@ sudo dnf install -y git clang cmake openssl-devel xxhash-devel zlib-devel libstd
 ```shell
 git clone https://github.com/rui314/mold.git
 cd mold
-git checkout v1.0.3
+git checkout v1.1
 make -j$(nproc) CXX=clang++
 sudo make install
 ```
@@ -83,12 +83,14 @@ try a specific version of a compiler such as `g++-10` or `clang++-12`.
 
 By default, `mold` is installed to `/usr/local/bin`.
 
-If you don't use a recent enough Linux distribution, or if for any reason `make`
-in the above commands doesn't work for you, you can use Docker to build it in
-a Docker environment. To do so, just run `./build-static.sh` in this
+If you don't use a recent enough Linux distribution, or if for any reason
+`make` in the above commands doesn't work for you, you can use Docker to
+build it in a Docker environment. To do so, just run `./dist.sh` in this
 directory instead of running `make -j$(nproc)`. The shell script creates a
-Ubuntu 20.04 Docker image, installs necessary tools and libraries to it,
-and builds mold as a statically-linked executable.
+Ubuntu 18.04 Docker image, installs necessary tools and libraries to it,
+builds mold and auxiliary files, and packs them into a single tar file
+`mold-$version-$arch-linux.tar.gz`. You can extract the tar file anywhere
+and use `mold` executable in it.
 
 `make test` depends on a few more packages. To install, run the following commands:
 
@@ -142,6 +144,7 @@ rustflags = ["-C", "link-arg=-fuse-ld=/path/to/mold"]
 ```
 
 where `/path/to/mold` is an absolute path to `mold` exectuable.
+Please make sure you have installed `clang`.
 
 If you want to use mold for all projects, put the above snippet to
 `~/.cargo/config.toml`.
@@ -160,19 +163,14 @@ mold has a feature to intercept all invocations of `ld`, `ld.lld` or
 mold -run make <make-options-if-any>
 ```
 
-Here's an example showing how to link Rust code when using the
-cargo package manager:
-
-```shell
-mold -run cargo build
-```
-
 Internally, mold invokes a given command with `LD_PRELOAD` environment
 variable set to its companion shared object file. The shared object
 file intercepts all function calls to `exec(3)`-family functions to
 replace `argv[0]` with `mold` if it is `ld`, `ld.gold` or `ld.lld`.
 
 </details>
+
+<details><summary>Verify that you are using mold</summary>
 
 mold leaves its identification string in `.comment` section in an output
 file. You can print it out to verify that you are actually using mold.
@@ -186,6 +184,8 @@ String dump of section '.comment':
 ```
 
 If `mold` is in `.comment`, the file is created by mold.
+
+</details>
 
 ## Why is mold so fast?
 

@@ -3,24 +3,21 @@ export LANG=
 set -e
 CC="${CC:-cc}"
 CXX="${CXX:-c++}"
-testname=$(basename -s .sh "$0")
+testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
 mold="$(pwd)/mold"
 t=out/test/elf/$testname
 mkdir -p $t
 
-which ld.bfd >& /dev/null || { echo skipped; exit 0; }
-
-cat <<EOF | gcc -flto -c -o $t/a.o -xc -
+cat <<EOF | $CC -o $t/a.o -c -xc -
 #include <stdio.h>
 int main() {
   printf("Hello world\n");
 }
 EOF
 
-gcc -B"$(pwd)" -o $t/exe $t/a.o >& $t/log
-grep -q 'falling back' $t/log
-$t/exe | grep -q 'Hello world'
+$CC -B. -o $t/exe $t/a.o
+readelf -s $t/exe | grep -q 'SECTION LOCAL  DEFAULT'
 
 echo OK
