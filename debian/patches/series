@@ -2,3 +2,4 @@ pie.diff
 disable-test.diff
 fix-prefix.diff
 silent-test-init-array-priorities.diff
+lto-gcc.diff

@@ -1,0 +1,12 @@
+Index: mold/test/elf/lto-gcc.sh
+===================================================================
+--- mold.orig/test/elf/lto-gcc.sh
++++ mold/test/elf/lto-gcc.sh
+@@ -1,6 +1,6 @@
+ #!/bin/bash
+ export LANG=
+-set -e
++#set -e
+ CC="${CC:-cc}"
+ CXX="${CXX:-c++}"
+ testname=$(basename "$0" .sh)
