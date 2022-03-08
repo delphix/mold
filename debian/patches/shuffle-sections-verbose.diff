@@ -2,14 +2,6 @@ Index: mold/test/elf/shuffle-sections.sh
 ===================================================================
 --- mold.orig/test/elf/shuffle-sections.sh
 +++ mold/test/elf/shuffle-sections.sh
-@@ -1,6 +1,6 @@
- #!/bin/bash
- export LANG=
--set -e
-+set -e -v
- CC="${CC:-cc}"
- CXX="${CXX:-c++}"
- testname=$(basename "$0" .sh)
 @@ -26,6 +26,9 @@ $CC -B. -o $t/exe1 $t/a.o $t/b.o
  $t/exe1 | grep -q 'Hello world'
  

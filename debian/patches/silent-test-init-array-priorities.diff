@@ -2,14 +2,6 @@ Index: mold/test/elf/init-array-priorities.sh
 ===================================================================
 --- mold.orig/test/elf/init-array-priorities.sh
 +++ mold/test/elf/init-array-priorities.sh
-@@ -1,6 +1,6 @@
- #!/bin/bash
- export LANG=
--set -e
-+set -e -v
- CC="${CC:-cc}"
- CXX="${CXX:-c++}"
- testname=$(basename "$0" .sh)
 @@ -60,6 +60,8 @@ EOF
  
  $CC -B. -o $t/exe $t/a.o $t/b.o $t/c.o $t/d.o \
