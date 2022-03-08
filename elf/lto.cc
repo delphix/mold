@@ -104,7 +104,6 @@ template <typename E> static Context<E> *gctx;
 template <typename E> static std::vector<ObjectFile<E> *> lto_objects;
 
 static int phase = 0;
-static void *dlopen_handle;
 static std::vector<PluginSymbol> plugin_symbols;
 static ClaimFileHandler *claim_file_hook;
 static AllSymbolsReadHandler *all_symbols_read_hook;
@@ -116,6 +115,7 @@ static PluginStatus message(int level, const char *fmt, ...) {
   LOG << "message\n";
   va_list ap;
   va_start(ap, fmt);
+  fprintf(stderr, "mold: ");
   vfprintf(stderr, fmt, ap);
   fprintf(stderr, "\n");
   return LDPS_OK;
@@ -161,7 +161,7 @@ static PluginStatus add_input_file(const char *path) {
   MappedFile<Context<E>> *mf = MappedFile<Context<E>>::must_open(ctx, path);
 
   ObjectFile<E> *file = ObjectFile<E>::create(ctx, mf, "", false);
-  ctx.obj_pool.push_back(std::unique_ptr<ObjectFile<E>>(file));
+  ctx.obj_pool.emplace_back(file);
   lto_objects<E>.push_back(file);
 
   file->priority = file_priority++;
@@ -365,11 +365,11 @@ static void load_plugin(Context<E> &ctx) {
   phase = 1;
   gctx<E> = &ctx;
 
-  dlopen_handle = dlopen(ctx.arg.plugin.c_str(), RTLD_NOW | RTLD_GLOBAL);
-  if (!dlopen_handle)
+  void *handle = dlopen(ctx.arg.plugin.c_str(), RTLD_NOW | RTLD_GLOBAL);
+  if (!handle)
     Fatal(ctx) << "could not open plugin file: " << dlerror();
 
-  OnloadFn *onload = (OnloadFn *)dlsym(dlopen_handle, "onload");
+  OnloadFn *onload = (OnloadFn *)dlsym(handle, "onload");
   if (!onload)
     Fatal(ctx) << "failed to load plugin " << ctx.arg.plugin << ": "
                << dlerror();
@@ -477,6 +477,20 @@ static ElfSym<E> to_elf_sym(PluginSymbol &psym) {
   return esym;
 }
 
+// Returns true if a given linker plugin looks like LLVM's one.
+// Returns false if it's GCC.
+template <typename E>
+static bool is_llvm(Context<E> &ctx) {
+  return ctx.arg.plugin.ends_with("LLVMgold.so");
+}
+
+// Returns true if a given linker plugin supports the get_symbols_v3 API.
+// Currently, we simply assume that LLVM supports it and GCC does not.
+template <typename E>
+static bool suppots_v3_api(Context<E> &ctx) {
+  return is_llvm(ctx);
+}
+
 template <typename E>
 ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   LOG << "read_lto_object: " << mf->name << "\n";
@@ -491,7 +505,7 @@ ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 
   // Create mold's object instance
   ObjectFile<E> *obj = new ObjectFile<E>;
-  ctx.obj_pool.push_back(std::unique_ptr<ObjectFile<E>>(obj));
+  ctx.obj_pool.emplace_back(obj);
 
   obj->filename = mf->name;
   obj->symbols.push_back(new Symbol<E>);
@@ -500,30 +514,38 @@ ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   obj->mf = mf;
 
   // Create plugin's object instance
-  PluginInputFile *file = new PluginInputFile;
+  PluginInputFile file = {};
 
   MappedFile<Context<E>> *mf2 = mf->parent ? mf->parent : mf;
-  file->name = save_string(ctx, mf2->name).data();
+  file.name = save_string(ctx, mf2->name).data();
   if (mf2->fd == -1)
-    mf2->fd = open(file->name, O_RDONLY);
-  file->fd = mf2->fd;
-  if (file->fd == -1)
-    Fatal(ctx) << "cannot open " << file->name << ": " << errno_string();
+    mf2->fd = open(file.name, O_RDONLY);
+  file.fd = mf2->fd;
+  if (file.fd == -1)
+    Fatal(ctx) << "cannot open " << file.name << ": " << errno_string();
 
   if (mf->parent)
     obj->archive_name = mf->parent->name;
 
-  file->offset = mf->get_offset();
-  file->filesize = mf->size;
-  file->handle = (void *)obj;
+  file.offset = mf->get_offset();
+  file.filesize = mf->size;
+  file.handle = (void *)obj;
 
   LOG << "read_lto_symbols: "<< mf->name << "\n";
 
   // claim_file_hook() calls add_symbols() which initializes `plugin_symbols`
   int claimed = false;
-  claim_file_hook(file, &claimed);
+  claim_file_hook(&file, &claimed);
   if (!claimed)
     Fatal(ctx) << mf->name << ": not claimed by the LTO plugin";
+
+  // It looks like GCC doesn't need fd after claim_file_hook() while
+  // LLVM needs it and takes the ownership of fd. To prevent "too many
+  // open files" issue, we close fd only for GCC. This is ugly, though.
+  if (!is_llvm(ctx)) {
+    close(mf2->fd);
+    mf2->fd = -1;
+  }
 
   // Initialize object symbols
   std::vector<ElfSym<E>> *esyms = new std::vector<ElfSym<E>>(1);
@@ -538,13 +560,6 @@ ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   obj->symvers.resize(esyms->size());
   plugin_symbols.clear();
   return obj;
-}
-
-// Returns true if a given linker plugin supports the get_symbols_v3 API.
-// Currently, we simply assume that LLVM supports it and GCC does not.
-template <typename E>
-static bool suppots_v3_api(Context<E> &ctx) {
-  return ctx.arg.plugin.ends_with("LLVMgold.so");
 }
 
 // This function restarts mold itself with `--:lto-pass2` and

@@ -12,13 +12,13 @@ mkdir -p $t
 
 which dwarfdump >& /dev/null || { echo skipped; exit; }
 
-cat <<EOF | g++ -c -o $t/a.o -g -gz=zlib-gnu -xc++ -
+cat <<EOF | $CXX -c -o $t/a.o -g -gz=zlib-gnu -xc++ -
 int main() {
   return 0;
 }
 EOF
 
-cat <<EOF | g++ -c -o $t/b.o -g -gz=zlib -xc++ -
+cat <<EOF | $CXX -c -o $t/b.o -g -gz=zlib -xc++ -
 int foo() {
   return 0;
 }
