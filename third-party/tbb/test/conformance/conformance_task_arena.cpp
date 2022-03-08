@@ -25,6 +25,13 @@
 //! \file conformance_task_arena.cpp
 //! \brief Test for [scheduler.task_arena scheduler.task_scheduler_observer] specification
 
+// This test requires TBB in an uninitialized state
+//! Test for uninitilized arena
+//! \brief \ref requirement \ref interface
+TEST_CASE("Test current_thread_index") {
+    REQUIRE_MESSAGE((tbb::this_task_arena::current_thread_index() == tbb::task_arena::not_initialized), "TBB was initialized state");
+}
+
 //! Test task arena interfaces
 //! \brief \ref requirement \ref interface
 TEST_CASE("Arena interfaces") {
@@ -41,7 +48,7 @@ TEST_CASE("Arena interfaces") {
         //! oneapi::tbb::this_task_arena interfaces
         CHECK(oneapi::tbb::this_task_arena::current_thread_index() >= 0);
         //! Attach interface
-        oneapi::tbb::task_arena attached_arena = oneapi::tbb::task_arena(oneapi::tbb::task_arena::attach());
+        oneapi::tbb::task_arena attached_arena{oneapi::tbb::task_arena::attach()};
         CHECK(attached_arena.is_active());
     });
     while (!done) {

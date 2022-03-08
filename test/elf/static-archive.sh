@@ -1,20 +1,24 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ... "
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename "$0" .sh)
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t=out/test/elf/$testname
 mkdir -p $t
 
-cat <<EOF | cc -o $t/long-long-long-filename.o -c -xc -
+cat <<EOF | $CC -o $t/long-long-long-filename.o -c -xc -
 int three() { return 3; }
 EOF
 
-cat <<EOF | cc -o $t/b.o -c -xc -
+cat <<EOF | $CC -o $t/b.o -c -xc -
 int five() { return 5; }
 EOF
 
-cat <<EOF | cc -o $t/c.o -c -xc -
+cat <<EOF | $CC -o $t/c.o -c -xc -
 #include <stdio.h>
 
 int three();
@@ -28,7 +32,7 @@ EOF
 rm -f $t/d.a
 (cd $t; ar rcs d.a long-long-long-filename.o b.o)
 
-clang -fuse-ld=$mold -Wl,--trace -o $t/exe $t/c.o $t/d.a > $t/log
+$CC -B. -Wl,--trace -o $t/exe $t/c.o $t/d.a > $t/log
 
 fgrep -q 'static-archive/d.a(long-long-long-filename.o)' $t/log
 fgrep -q 'static-archive/d.a(b.o)' $t/log

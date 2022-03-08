@@ -1,12 +1,16 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ... "
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename "$0" .sh)
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t=out/test/elf/$testname
 mkdir -p $t
 
-cat <<EOF | clang -c -xc -o $t/a.o -
+cat <<EOF | $CC -c -xc -o $t/a.o -
 #include <stdio.h>
 
 int main() {
@@ -14,6 +18,6 @@ int main() {
 }
 EOF
 
-clang -fuse-ld=$mold -Wl,--verbose -o $t/exe $t/a.o > /dev/null
+$CC -B. -Wl,--verbose -o $t/exe $t/a.o > /dev/null
 
 echo OK

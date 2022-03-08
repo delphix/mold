@@ -1,17 +1,21 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ... "
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename "$0" .sh)
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t=out/test/elf/$testname
 mkdir -p $t
 
-cat <<EOF | cc -shared -o $t/a.so -xc -
+cat <<EOF | $CC -shared -o $t/a.so -xc -
 int foo = 3;
 int bar = 5;
 EOF
 
-cat <<EOF | cc -fno-PIC -c -o $t/b.o -xc -
+cat <<EOF | $CC -fno-PIC -c -o $t/b.o -xc -
 #include <stdio.h>
 
 extern int foo;
@@ -23,10 +27,10 @@ int main() {
 }
 EOF
 
-clang -fuse-ld=$mold -no-pie -o $t/exe $t/a.so $t/b.o
+$CC -B. -no-pie -o $t/exe $t/a.so $t/b.o
 $t/exe | grep -q '3 5'
 
-! clang -fuse-ld=$mold -o $t/exe $t/a.so $t/b.o \
+! $CC -B. -o $t/exe $t/a.so $t/b.o \
   -Wl,-z,nocopyreloc 2> $t/log || false
 
 grep -q 'recompile with -fPIC' $t/log

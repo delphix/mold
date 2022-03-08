@@ -16,37 +16,52 @@
 
 namespace mold::elf {
 
-std::regex glob_to_regex(std::string_view pattern) {
-  std::stringstream ss;
-  for (u8 c : pattern) {
-    if (c == '*')
-      ss << ".*";
-    else
-      ss << "\\x" << std::hex << std::setw(2) << std::setfill('0') << (int)c;
-  }
-  return std::regex(ss.str(), std::regex::optimize);
-}
-
 template <typename E>
 static ObjectFile<E> *new_object_file(Context<E> &ctx, MappedFile<Context<E>> *mf,
                                       std::string archive_name) {
+  if (i64 type = ((ElfEhdr<E> *)mf->data)->e_machine; type != E::e_machine)
+    Fatal(ctx) << mf->name << ": incompatible file type: " << type;
+
   static Counter count("parsed_objs");
   count++;
 
   bool in_lib = ctx.in_lib || (!archive_name.empty() && !ctx.whole_archive);
   ObjectFile<E> *file = ObjectFile<E>::create(ctx, mf, archive_name, in_lib);
   file->priority = ctx.file_priority++;
-  ctx.tg.run([file, &ctx]() { file->parse(ctx); });
+  ctx.tg.run([file, &ctx] { file->parse(ctx); });
   if (ctx.arg.trace)
     SyncOut(ctx) << "trace: " << *file;
   return file;
 }
 
 template <typename E>
-static SharedFile<E> *new_shared_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
+static ObjectFile<E> *new_lto_obj(Context<E> &ctx, MappedFile<Context<E>> *mf,
+                                  std::string archive_name) {
+  static Counter count("parsed_lto_objs");
+  count++;
+
+  if (ctx.arg.ignore_ir_file.count(mf->get_identifier()))
+    return new ObjectFile<E>;
+
+  ObjectFile<E> *file = read_lto_object(ctx, mf);
+  file->priority = ctx.file_priority++;
+  file->is_in_lib = ctx.in_lib || (!archive_name.empty() && !ctx.whole_archive);
+  file->is_alive = !file->is_in_lib;
+  ctx.has_lto_object = true;
+  if (ctx.arg.trace)
+    SyncOut(ctx) << "trace: " << *file;
+  return file;
+}
+
+template <typename E>
+static SharedFile<E> *
+new_shared_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
+  if (i64 type = ((ElfEhdr<E> *)mf->data)->e_machine; type != E::e_machine)
+    Fatal(ctx) << mf->name << ": incompatible file type: " << type;
+
   SharedFile<E> *file = SharedFile<E>::create(ctx, mf);
   file->priority = ctx.file_priority++;
-  ctx.tg.run([file, &ctx]() { file->parse(ctx); });
+  ctx.tg.run([file, &ctx] { file->parse(ctx); });
   if (ctx.arg.trace)
     SyncOut(ctx) << "trace: " << *file;
   return file;
@@ -57,7 +72,8 @@ void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   if (ctx.visited.contains(mf->name))
     return;
 
-  switch (get_file_type(mf)) {
+  FileType type = get_file_type(mf);
+  switch (type) {
   case FileType::ELF_OBJ:
     ctx.objs.push_back(new_object_file(ctx, mf, ""));
     return;
@@ -67,19 +83,30 @@ void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
     return;
   case FileType::AR:
   case FileType::THIN_AR:
-    for (MappedFile<Context<E>> *child : read_archive_members(ctx, mf))
-      if (get_file_type(child) == FileType::ELF_OBJ)
+    for (MappedFile<Context<E>> *child : read_archive_members(ctx, mf)) {
+      switch (get_file_type(child)) {
+      case FileType::ELF_OBJ:
         ctx.objs.push_back(new_object_file(ctx, child, mf->name));
+        break;
+      case FileType::GCC_LTO_OBJ:
+      case FileType::LLVM_BITCODE:
+        ctx.objs.push_back(new_lto_obj(ctx, child, mf->name));
+        break;
+      default:
+        break;
+      }
+    }
     ctx.visited.insert(mf->name);
     return;
   case FileType::TEXT:
     parse_linker_script(ctx, mf);
     return;
+  case FileType::GCC_LTO_OBJ:
   case FileType::LLVM_BITCODE:
-    Fatal(ctx) << mf->name << ": looks like this is an LLVM bitcode, "
-               << "but mold does not support LTO";
+    ctx.objs.push_back(new_lto_obj(ctx, mf, ""));
+    return;
   default:
-    Fatal(ctx) << mf->name << ": unknown file type";
+    Fatal(ctx) << mf->name << ": unknown file type: " << type;
   }
 }
 
@@ -88,7 +115,9 @@ void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 template <typename E>
 static i64 get_machine_type(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   switch (get_file_type(mf)) {
+  case FileType::ELF_OBJ:
   case FileType::ELF_DSO:
+  case FileType::GCC_LTO_OBJ:
     return ((ElfEhdr<E> *)mf->data)->e_machine;
   case FileType::AR:
     for (MappedFile<Context<E>> *child : read_fat_archive_members(ctx, mf))
@@ -108,7 +137,18 @@ static i64 get_machine_type(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 }
 
 template <typename E>
-static MappedFile<Context<E>> *open_library(Context<E> &ctx, std::string path) {
+static i64
+deduce_machine_type(Context<E> &ctx, std::span<std::string_view> args) {
+  for (std::string_view arg : args)
+    if (!arg.starts_with('-'))
+      if (auto *mf = MappedFile<Context<E>>::open(ctx, std::string(arg)))
+        if (i64 type = get_machine_type(ctx, mf); type != -1)
+          return type;
+  Fatal(ctx) << "-m option is missing";
+}
+
+template <typename E>
+MappedFile<Context<E>> *open_library(Context<E> &ctx, std::string path) {
   MappedFile<Context<E>> *mf = MappedFile<Context<E>>::open(ctx, path);
   if (!mf)
     return nullptr;
@@ -116,8 +156,8 @@ static MappedFile<Context<E>> *open_library(Context<E> &ctx, std::string path) {
   i64 type = get_machine_type(ctx, mf);
   if (type == -1 || type == E::e_machine)
     return mf;
-  Warn(ctx) << path << ": skipping incompatible file"
-            << " " << (int)type << " " << (int)E::e_machine;
+  Warn(ctx) << path << ": skipping incompatible file " << (int)type
+            << " " << (int)E::e_machine;
   return nullptr;
 }
 
@@ -234,9 +274,6 @@ static bool reload_input_files(Context<E> &ctx) {
 
   // Reload updated .so files
   for (SharedFile<E> *file : ctx.dsos) {
-    MappedFile<Context<E>> *mf =
-      MappedFile<Context<E>>::must_open(ctx, file->mf->name);
-
     if (get_mtime(ctx, file->mf->name) == file->mf->mtime) {
       dsos.push_back(file);
     } else {
@@ -267,7 +304,7 @@ static void show_stats(Context<E> &ctx) {
       static Counter alloc("reloc_alloc");
       static Counter nonalloc("reloc_nonalloc");
 
-      if (sec->shdr.sh_flags & SHF_ALLOC)
+      if (sec->shdr().sh_flags & SHF_ALLOC)
         alloc += sec->get_rels(ctx).size();
       else
         nonalloc += sec->get_rels(ctx).size();
@@ -305,11 +342,21 @@ static void show_stats(Context<E> &ctx) {
   static Counter num_objs("num_objs", ctx.objs.size());
   static Counter num_dsos("num_dsos", ctx.dsos.size());
 
+  if constexpr (E::e_machine == EM_AARCH64) {
+    static Counter num_thunks("num_thunks");
+    for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections)
+      for (std::unique_ptr<RangeExtensionThunk<E>> &thunk : osec->thunks)
+        num_thunks += thunk->symbols.size();
+  }
+
   Counter::print();
+
+  for (std::unique_ptr<MergedSection<E>> &sec : ctx.merged_sections)
+    sec->print_stats(ctx);
 }
 
 static i64 get_default_thread_count() {
-  // mold doesn't scale above 32 threads.
+  // mold doesn't scale well above 32 threads.
   int n = tbb::global_control::active_value(
     tbb::global_control::max_allowed_parallelism);
   return std::min(n, 32);
@@ -329,6 +376,10 @@ static int elf_main(int argc, char **argv) {
   std::vector<std::string_view> file_args;
   parse_nonpositional_args(ctx, file_args);
 
+  // If no -m option is given, deduce it from input files.
+  if (ctx.arg.emulation == -1)
+    ctx.arg.emulation = deduce_machine_type(ctx, file_args);
+
   // Redo if -m is not x86-64.
   if (ctx.arg.emulation != E::e_machine) {
     switch (ctx.arg.emulation) {
@@ -336,6 +387,8 @@ static int elf_main(int argc, char **argv) {
       return elf_main<I386>(argc, argv);
     case EM_AARCH64:
       return elf_main<ARM64>(argc, argv);
+    case EM_RISCV:
+      return elf_main<RISCV64>(argc, argv);
     }
     unreachable();
   }
@@ -358,18 +411,19 @@ static int elf_main(int argc, char **argv) {
 
   install_signal_handler();
 
-  if (!ctx.arg.directory.empty() && chdir(ctx.arg.directory.c_str()) == -1)
-    Fatal(ctx) << "chdir failed: " << ctx.arg.directory
-               << ": " << errno_string();
+  if (!ctx.arg.directory.empty())
+    if (chdir(ctx.arg.directory.c_str()) == -1)
+      Fatal(ctx) << "chdir failed: " << ctx.arg.directory
+                 << ": " << errno_string();
 
   // Handle --wrap options if any.
   for (std::string_view name : ctx.arg.wrap)
-    intern(ctx, name)->wrap = true;
+    get_symbol(ctx, name)->wrap = true;
 
   // Handle --retain-symbols-file options if any.
   if (ctx.arg.retain_symbols_file)
     for (std::string_view name : *ctx.arg.retain_symbols_file)
-      intern(ctx, name)->write_to_symtab = true;
+      get_symbol(ctx, name)->write_to_symtab = true;
 
   // Preload input files
   std::function<void()> on_complete;
@@ -381,7 +435,7 @@ static int elf_main(int argc, char **argv) {
     on_complete = fork_child();
 
   for (std::string_view arg : ctx.arg.trace_symbol)
-    intern(ctx, arg)->traced = true;
+    get_symbol(ctx, arg)->traced = true;
 
   // Parse input files
   read_input_files(ctx, file_args);
@@ -396,17 +450,10 @@ static int elf_main(int argc, char **argv) {
     }
   }
 
-  {
-    Timer t(ctx, "register_section_pieces");
-    tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-      file->register_section_pieces(ctx);
-    });
-  }
-
   // Uniquify shared object files by soname
   {
     std::unordered_set<std::string_view> seen;
-    erase(ctx.dsos, [&](SharedFile<E> *file) {
+    std::erase_if(ctx.dsos, [&](SharedFile<E> *file) {
       return !seen.insert(file->soname).second;
     });
   }
@@ -424,6 +471,9 @@ static int elf_main(int argc, char **argv) {
   // Resolve symbols and fix the set of object files that are
   // included to the final output.
   resolve_symbols(ctx);
+
+  // Resolve mergeable section pieces to merge them.
+  register_section_pieces(ctx);
 
   // Remove redundant comdat sections (e.g. duplicate inline functions).
   eliminate_comdats(ctx);
@@ -451,7 +501,7 @@ static int elf_main(int argc, char **argv) {
   // Compute sizes of sections containing mergeable strings.
   compute_merged_section_sizes(ctx);
 
-  // ctx input sections into output sections
+  // Bin input sections into output sections.
   bin_sections(ctx);
 
   // Get a list of output sections.
@@ -460,11 +510,14 @@ static int elf_main(int argc, char **argv) {
   // Create a dummy file containing linker-synthesized symbols
   // (e.g. `__bss_start`).
   ctx.internal_obj = create_internal_file(ctx);
-  ctx.internal_obj->resolve_regular_symbols(ctx);
   ctx.objs.push_back(ctx.internal_obj);
 
   // Beyond this point, no new files will be added to ctx.objs
   // or ctx.dsos.
+
+  // Handle `-z cet-report`.
+  if (ctx.arg.z_cet_report != CET_REPORT_NONE)
+    check_cet_errors(ctx);
 
   // If we are linking a .so file, remaining undefined symbols does
   // not cause a linker error. Instead, they are treated as if they
@@ -477,17 +530,26 @@ static int elf_main(int argc, char **argv) {
 
   // Beyond this point, no new symbols will be added to the result.
 
+  // Handle -repro
+  if (ctx.arg.repro)
+    write_repro_file(ctx);
+
   // Make sure that all symbols have been resolved.
   if (!ctx.arg.allow_multiple_definition)
     check_duplicate_symbols(ctx);
 
+  // Handle --require-defined
   for (std::string_view name : ctx.arg.require_defined)
-    if (!intern(ctx, name)->file)
+    if (!get_symbol(ctx, name)->file)
       Error(ctx) << "--require-defined: undefined symbol: " << name;
 
   // .init_array and .fini_array contents have to be sorted by
   // a special rule. Sort them.
   sort_init_fini(ctx);
+
+  // Handle --shuffle-sections
+  if (ctx.arg.shuffle_sections != SHUFFLE_SECTIONS_NONE)
+    shuffle_sections(ctx);
 
   // Compute sizes of output sections while assigning offsets
   // within an output section to input sections.
@@ -506,14 +568,18 @@ static int elf_main(int argc, char **argv) {
     ctx.dynstr->add_string(str);
   for (std::string_view str : ctx.arg.filter)
     ctx.dynstr->add_string(str);
-  if (!ctx.arg.rpaths.empty())
-    ctx.dynstr->add_string(ctx.arg.rpaths);
-  if (!ctx.arg.soname.empty())
-    ctx.dynstr->add_string(ctx.arg.soname);
+  ctx.dynstr->add_string(ctx.arg.rpaths);
+  ctx.dynstr->add_string(ctx.arg.soname);
 
   // Scan relocations to find symbols that need entries in .got, .plt,
   // .got.plt, .dynsym, .dynstr, etc.
   scan_rels(ctx);
+
+  // If --packed_dyn_relocs=relr was given, base relocations are stored
+  // to a .relr.dyn section in a compressed form. Construct a compressed
+  // relocations now so that we can fix section sizes and file layout.
+  if (ctx.arg.pack_dyn_relocs_relr)
+    construct_relr(ctx);
 
   // Reserve a space for dynamic symbol strings in .dynstr and sort
   // .dynsym contents if necessary. Beyond this point, no symbol will
@@ -527,12 +593,7 @@ static int elf_main(int argc, char **argv) {
   ctx.verneed->construct(ctx);
 
   // Compute .symtab and .strtab sizes for each file.
-  {
-    Timer t(ctx, "compute_symtab");
-    tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-      file->compute_symtab(ctx);
-    });
-  }
+  create_output_symtab(ctx);
 
   // .eh_frame is a special section from the linker's point of view,
   // as its contents are parsed and reconstructed by the linker,
@@ -541,52 +602,66 @@ static int elf_main(int argc, char **argv) {
   // section to the special EHFrameSection.
   {
     Timer t(ctx, "eh_frame");
-    erase(ctx.chunks, [](Chunk<E> *chunk) {
-      return chunk->kind == Chunk<E>::REGULAR &&
-             chunk->name == ".eh_frame";
+    std::erase_if(ctx.chunks, [](Chunk<E> *chunk) {
+      return chunk->is_output_section() && chunk->name == ".eh_frame";
     });
     ctx.eh_frame->construct(ctx);
   }
 
-  // Now that we have computed sizes for all sections and assigned
-  // section indices to them, so we can fix section header contents
-  // for all output sections.
+  // If --emit-relocs is given, we'll copy relocation sections from input
+  // files to an output file.
+  if (ctx.arg.emit_relocs)
+    create_reloc_sections(ctx);
+
+  // Update sh_size for each chunk and remove empty ones.
   for (Chunk<E> *chunk : ctx.chunks)
     chunk->update_shdr(ctx);
 
-  erase(ctx.chunks, [](Chunk<E> *chunk) {
-    return chunk->kind == Chunk<E>::SYNTHETIC &&
-           chunk->shdr.sh_size == 0;
+  std::erase_if(ctx.chunks, [](Chunk<E> *chunk) {
+    return !chunk->is_output_section() && chunk->shdr.sh_size == 0;
   });
 
   // Set section indices.
   for (i64 i = 0, shndx = 1; i < ctx.chunks.size(); i++)
-    if (ctx.chunks[i]->kind != Chunk<E>::HEADER)
+    if (!ctx.chunks[i]->is_header())
       ctx.chunks[i]->shndx = shndx++;
 
+  // Some types of section header refer other section by index.
+  // Recompute the section header to fill such fields with correct values.
   for (Chunk<E> *chunk : ctx.chunks)
     chunk->update_shdr(ctx);
 
   // Assign offsets to output sections
   i64 filesize = set_osec_offsets(ctx);
 
+  // On ARM64, we may need to create so-called "range extension thunks"
+  // to extend branch instructions reach, as they can jump only to
+  // ±128 MiB.
+  if constexpr (E::e_machine == EM_AARCH64)
+    filesize = create_range_extension_thunks(ctx);
+
+  // On RISC-V, branches are encode using multiple instructions so
+  // that they can jump to anywhere in ±2 GiB by default. They may
+  // be replaced with shorter instruction sequences if destinations
+  // are close enough. Do this optimization.
+  if constexpr (E::e_machine == EM_RISCV)
+    filesize = riscv_resize_sections(ctx);
+
   // Fix linker-synthesized symbol addresses.
   fix_synthetic_symbols(ctx);
-
-  // If --compress-debug-sections is given, compress .debug_* sections
-  // using zlib.
-  if (ctx.arg.compress_debug_sections != COMPRESS_NONE) {
-    compress_debug_sections(ctx);
-    filesize = set_osec_offsets(ctx);
-  }
-
-  // At this point, file layout is fixed.
 
   // Beyond this, you can assume that symbol addresses including their
   // GOT or PLT addresses have a correct final value.
 
-  // Some types of relocations for TLS symbols need the TLS segment
-  // address. Find it out now.
+  // If --compress-debug-sections is given, compress .debug_* sections
+  // using zlib.
+  if (ctx.arg.compress_debug_sections != COMPRESS_NONE)
+    filesize = compress_debug_sections(ctx);
+
+  // At this point, file layout is fixed.
+
+  // Some types of TLS relocations are defined relative to the beginning
+  // or the end of the TLS segment address. Find these addresses now.
   for (ElfPhdr<E> phdr : create_phdr(ctx)) {
     if (phdr.p_type == PT_TLS) {
       ctx.tls_begin = phdr.p_vaddr;
@@ -608,16 +683,17 @@ static int elf_main(int argc, char **argv) {
     Timer t(ctx, "copy_buf");
 
     tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
-      std::string name(chunk->name);
-      if (name.empty())
-        name = "(header)";
+      std::string name =
+        chunk->name.empty() ? "(header)" : std::string(chunk->name);
       Timer t2(ctx, name, &t);
-
       chunk->copy_buf(ctx);
     });
 
     ctx.checkpoint();
   }
+
+  if constexpr (E::e_machine == EM_AARCH64)
+    write_thunks(ctx);
 
   // Dynamic linker works better with sorted .rela.dyn section,
   // so we sort them.
@@ -633,8 +709,21 @@ static int elf_main(int argc, char **argv) {
 
   t_copy.stop();
 
-  // Commit
+  // Close the output file. This is the end of the linker's main job.
   ctx.output_file->close(ctx);
+
+  // Handle --dependency-file
+  if (!ctx.arg.dependency_file.empty())
+    write_dependency_file(ctx);
+
+  // Handle --print-dependencies
+  if (ctx.arg.print_dependencies == 1)
+    print_dependencies(ctx);
+  else if (ctx.arg.print_dependencies == 2)
+    print_dependencies_full(ctx);
+
+  if (ctx.has_lto_object)
+    lto_cleanup(ctx);
 
   t_total.stop();
   t_all.stop();
@@ -672,5 +761,6 @@ int main(int argc, char **argv) {
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
 INSTANTIATE(ARM64);
+INSTANTIATE(RISCV64);
 
 } // namespace mold::elf

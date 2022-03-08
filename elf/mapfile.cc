@@ -28,12 +28,13 @@ static Map<E> get_map(Context<E> &ctx) {
 
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     for (Symbol<E> *sym : file->symbols) {
-      if (sym->file == file && sym->input_section &&
-          sym->get_type() != STT_SECTION) {
-        assert(file == &sym->input_section->file);
+      if (sym->file != file || sym->get_type() == STT_SECTION)
+        continue;
 
+      if (InputSection<E> *isec = sym->get_input_section()) {
+        assert(file == &isec->file);
         typename Map<E>::accessor acc;
-        map.insert(acc, {sym->input_section, {}});
+        map.insert(acc, {isec, {}});
         acc->second.push_back(sym);
       }
     }
@@ -70,7 +71,7 @@ void print_map(Context<E> &ctx) {
          << std::setw(6) << (u64)osec->shdr.sh_addralign
          << " " << osec->name << "\n";
 
-    if (osec->kind != Chunk<E>::REGULAR)
+    if (!osec->is_output_section())
       continue;
 
     std::span<InputSection<E> *> members = ((OutputSection<E> *)osec)->members;
@@ -82,8 +83,8 @@ void print_map(Context<E> &ctx) {
       opt_demangle = ctx.arg.demangle;
 
       ss << std::setw(16) << (osec->shdr.sh_addr + mem->offset)
-         << std::setw(11) << (u64)mem->shdr.sh_size
-         << std::setw(6) << (u64)mem->shdr.sh_addralign
+         << std::setw(11) << (u64)mem->sh_size
+         << std::setw(6) << (1 << (u64)mem->p2align)
          << "         " << *mem << "\n";
 
       typename Map<E>::const_accessor acc;
@@ -93,7 +94,7 @@ void print_map(Context<E> &ctx) {
              << "          0     0                 "
              << *sym << "\n";
 
-      bufs[i] = std::move(ss.str());
+      bufs[i] = ss.str();
     });
 
     for (std::string &str : bufs)
@@ -107,5 +108,6 @@ void print_map(Context<E> &ctx) {
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
 INSTANTIATE(ARM64);
+INSTANTIATE(RISCV64);
 
 } // namespace mold::elf

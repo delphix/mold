@@ -1,18 +1,22 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ... "
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename "$0" .sh)
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t=out/test/elf/$testname
 mkdir -p $t
 
-cat <<EOF | cc -o $t/a.o -c -x assembler -
+cat <<EOF | $CC -o $t/a.o -c -x assembler -
   .text
   .globl _start, foo
 _start:
   nop
 EOF
 
-$mold -o $t/exe $t/a.o
+"$mold" -o $t/exe $t/a.o
 
 echo OK

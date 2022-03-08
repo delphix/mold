@@ -1,12 +1,16 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ... "
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename "$0" .sh)
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t=out/test/elf/$testname
 mkdir -p $t
 
-ldd $mold-wrapper.so | grep -q libasan && { echo skipped; exit; }
+ldd "$mold"-wrapper.so | grep -q libasan && { echo skipped; exit; }
 
 cat <<'EOF' > $t/a.sh
 #!/bin/bash
@@ -15,7 +19,7 @@ EOF
 
 chmod 755 $t/a.sh
 
-cat <<'EOF' | cc -xc -o $t/exe -
+cat <<'EOF' | $CC -xc -o $t/exe -
 #define _GNU_SOURCE 1
 
 #include <assert.h>
