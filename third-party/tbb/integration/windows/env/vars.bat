@@ -48,16 +48,19 @@ if /i "%1"=="all"          (set TBB_TARGET_VS=vc_mt)      & shift & goto ParseAr
 
 :SetEnv
 if exist "%TBBROOT%\redist\%TBB_TARGET_ARCH%\%TBB_TARGET_VS%\tbb12.dll" (
-    set "PATH=%TBBROOT%\redist\%TBB_TARGET_ARCH%\%TBB_TARGET_VS%;%PATH%"
+    set "TBB_DLL_PATH=%TBBROOT%\redist\%TBB_TARGET_ARCH%\%TBB_TARGET_VS%"
 )
 if exist "%TBBROOT%\..\redist\%TBB_TARGET_ARCH%\tbb\%TBB_TARGET_VS%\tbb12.dll" (
-    set "PATH=%TBBROOT%\..\redist\%TBB_TARGET_ARCH%\tbb\%TBB_TARGET_VS%;%PATH%"
+    set "TBB_DLL_PATH=%TBBROOT%\..\redist\%TBB_TARGET_ARCH%\tbb\%TBB_TARGET_VS%"
 )
+
+set "PATH=%TBB_DLL_PATH%;%PATH%"
 
 set "LIB=%TBBROOT%\lib\%TBB_TARGET_ARCH%\%TBB_TARGET_VS%;%LIB%"
 set "INCLUDE=%TBBROOT%\include;%INCLUDE%"
 set "CPATH=%TBBROOT%\include;%CPATH%"
 set "CMAKE_PREFIX_PATH=%TBBROOT%;%CMAKE_PREFIX_PATH%"
+set "PKG_CONFIG_PATH=%TBBROOT%\lib\pkgconfig;%PKG_CONFIG_PATH%"
 
 :End
 exit /B 0

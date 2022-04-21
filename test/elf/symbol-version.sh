@@ -1,12 +1,20 @@
 #!/bin/bash
+export LC_ALL=C
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ... "
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+GCC="${GCC:-gcc}"
+GXX="${GXX:-g++}"
+OBJDUMP="${OBJDUMP:-objdump}"
+MACHINE="${MACHINE:-$(uname -m)}"
+testname=$(basename "$0" .sh)
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t=out/test/elf/$testname
 mkdir -p $t
 
-cat <<EOF | clang -fPIC -c -o $t/a.o -xc -
+cat <<EOF | $CC -fPIC -c -o $t/a.o -xc -
 void foo1() {}
 void foo2() {}
 void foo3() {}
@@ -23,7 +31,7 @@ void bar() {
 EOF
 
 echo 'VER1 { local: *; }; VER2 { local: *; }; VER3 { local: *; };' > $t/b.ver
-clang -fuse-ld=$mold -shared -o $t/c.so $t/a.o -Wl,--version-script=$t/b.ver
+$CC -B. -shared -o $t/c.so $t/a.o -Wl,--version-script=$t/b.ver
 readelf --symbols $t/c.so > $t/log
 
 fgrep -q 'foo@VER1' $t/log
