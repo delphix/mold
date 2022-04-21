@@ -573,13 +573,12 @@ void icf_sections(Context<E> &ctx) {
     Timer t(ctx, "reassign");
     tbb::parallel_for_each(ctx.objs, [](ObjectFile<E> *file) {
       for (Symbol<E> *sym : file->symbols) {
-        if (sym->file != file)
-          continue;
-        InputSection<E> *isec = sym->get_input_section();
-        if (isec && isec->extra().leader && isec->extra().leader != isec) {
-          sym->file = &isec->extra().leader->file;
-          sym->shndx = isec->extra().leader->shndx;
-          isec->kill();
+        if (sym->file == file) {
+          InputSection<E> *isec = sym->get_input_section();
+          if (isec && isec->extra().leader && isec->extra().leader != isec) {
+            isec->kill();
+            isec->killed_by_icf = true;
+          }
         }
       }
     });
@@ -592,6 +591,7 @@ void icf_sections(Context<E> &ctx) {
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
 INSTANTIATE(ARM64);
+INSTANTIATE(ARM32);
 INSTANTIATE(RISCV64);
 
 } // namespace mold::elf
