@@ -1,3 +1,10 @@
+mold (1.2.0+dfsg-1) unstable; urgency=medium
+
+  * New upstream release
+    - Add dwarfdump as build dep
+
+ -- Sylvestre Ledru <sylvestre@debian.org>  Thu, 21 Apr 2022 09:43:55 +0200
+
 mold (1.1.1+dfsg-1) unstable; urgency=medium
 
   * New upstream release

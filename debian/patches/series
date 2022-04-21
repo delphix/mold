@@ -1,7 +1,6 @@
 pie.diff
-disable-test.diff
 fix-prefix.diff
-silent-test-init-array-priorities.diff
-lto-gcc.diff
 shuffle-sections-verbose.diff
+disable-gdb-index.diff
+disable-large-ali.diff
 silent-test-static-pie.diff
