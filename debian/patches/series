@@ -1,6 +1,4 @@
 pie.diff
 fix-prefix.diff
-shuffle-sections-verbose.diff
-disable-gdb-index.diff
 disable-large-ali.diff
-silent-test-static-pie.diff
+disable-gdb-index.diff
