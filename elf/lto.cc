@@ -86,6 +86,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <sstream>
+#include <tbb/parallel_for_each.h>
 #include <unistd.h>
 
 #if 0
@@ -614,21 +615,21 @@ std::vector<ObjectFile<E> *> do_lto(Context<E> &ctx) {
   phase = 2;
 
   // Set `referenced_by_regular_obj` bit.
-  for (ObjectFile<E> *file : ctx.objs) {
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     if (file->is_lto_obj)
-      continue;
+      return;
 
     for (i64 i = file->first_global; i < file->symbols.size(); i++) {
       ElfSym<E> &esym = file->elf_syms[i];
       Symbol<E> &sym = *file->symbols[i];
 
-      if (esym.is_undef() && sym.file && sym.file != file &&
-          !sym.file->is_dso && ((ObjectFile<E> *)sym.file)->is_lto_obj) {
+      if (sym.file && !sym.file->is_dso &&
+          ((ObjectFile<E> *)sym.file)->is_lto_obj) {
         std::scoped_lock lock(sym.mu);
         sym.referenced_by_regular_obj = true;
       }
     }
-  }
+  });
 
   // all_symbols_read_hook() calls add_input_file() and add_input_library()
   LOG << "all symbols read\n";
@@ -652,10 +653,6 @@ void lto_cleanup(Context<E> &ctx) {
   template std::vector<ObjectFile<E> *> do_lto(Context<E> &);           \
   template void lto_cleanup(Context<E> &)
 
-INSTANTIATE(X86_64);
-INSTANTIATE(I386);
-INSTANTIATE(ARM64);
-INSTANTIATE(ARM32);
-INSTANTIATE(RISCV64);
+INSTANTIATE_ALL;
 
 } // namespace mold::elf
