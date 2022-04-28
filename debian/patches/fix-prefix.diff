@@ -4,7 +4,7 @@ Index: mold/Makefile
 +++ mold/Makefile
 @@ -4,7 +4,7 @@
  
- VERSION = 1.2.0
+ VERSION = 1.2.1
  
 -PREFIX = /usr/local
 +PREFIX = /usr
