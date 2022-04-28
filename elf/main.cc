@@ -382,6 +382,7 @@ static int elf_main(int argc, char **argv) {
 
   // Redo if -m is not x86-64.
   if (ctx.arg.emulation != E::e_machine) {
+#if !MOLD_DEBUG_X86_64_ONLY && !MOLD_DEBUG_ARM64_ONLY
     switch (ctx.arg.emulation) {
     case EM_386:
       return elf_main<I386>(argc, argv);
@@ -392,7 +393,8 @@ static int elf_main(int argc, char **argv) {
     case EM_RISCV:
       return elf_main<RISCV64>(argc, argv);
     }
-    unreachable();
+#endif
+    Fatal(ctx) << "unknown emulation: " << ctx.arg.emulation;
   }
 
   Timer t_all(ctx, "all");
@@ -521,6 +523,12 @@ static int elf_main(int argc, char **argv) {
   if (ctx.arg.z_cet_report != CET_REPORT_NONE)
     check_cet_errors(ctx);
 
+  // Handle `-z execstack-if-needed`.
+  if (ctx.arg.z_execstack_if_needed)
+    for (ObjectFile<E> *file : ctx.objs)
+      if (file->needs_executable_stack)
+        ctx.arg.z_execstack = true;
+
   // If we are linking a .so file, remaining undefined symbols does
   // not cause a linker error. Instead, they are treated as if they
   // were imported symbols.
@@ -531,6 +539,12 @@ static int elf_main(int argc, char **argv) {
   claim_unresolved_symbols(ctx);
 
   // Beyond this point, no new symbols will be added to the result.
+
+  // Handle --print-dependencies
+  if (ctx.arg.print_dependencies == 1)
+    print_dependencies(ctx);
+  else if (ctx.arg.print_dependencies == 2)
+    print_dependencies_full(ctx);
 
   // Handle -repro
   if (ctx.arg.repro)
@@ -707,12 +721,11 @@ static int elf_main(int argc, char **argv) {
   // Zero-clear paddings between sections
   clear_padding(ctx);
 
-  if (ctx.buildid) {
-    Timer t(ctx, "build_id");
+  if (ctx.buildid)
     ctx.buildid->write_buildid(ctx);
-  }
 
   t_copy.stop();
+  ctx.checkpoint();
 
   // Close the output file. This is the end of the linker's main job.
   ctx.output_file->close(ctx);
@@ -720,12 +733,6 @@ static int elf_main(int argc, char **argv) {
   // Handle --dependency-file
   if (!ctx.arg.dependency_file.empty())
     write_dependency_file(ctx);
-
-  // Handle --print-dependencies
-  if (ctx.arg.print_dependencies == 1)
-    print_dependencies(ctx);
-  else if (ctx.arg.print_dependencies == 2)
-    print_dependencies_full(ctx);
 
   if (ctx.has_lto_object)
     lto_cleanup(ctx);
@@ -753,20 +760,21 @@ static int elf_main(int argc, char **argv) {
 
   for (std::function<void()> &fn : ctx.on_exit)
     fn();
+  ctx.checkpoint();
   return 0;
 }
 
 int main(int argc, char **argv) {
+#if MOLD_DEBUG_ARM64_ONLY
+  return elf_main<ARM64>(argc, argv);
+#else
   return elf_main<X86_64>(argc, argv);
+#endif
 }
 
 #define INSTANTIATE(E)                                                  \
   template void read_file(Context<E> &, MappedFile<Context<E>> *);
 
-INSTANTIATE(X86_64);
-INSTANTIATE(I386);
-INSTANTIATE(ARM64);
-INSTANTIATE(ARM32);
-INSTANTIATE(RISCV64);
+INSTANTIATE_ALL;
 
 } // namespace mold::elf

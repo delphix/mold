@@ -133,6 +133,11 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
       const ElfSym<E> &sym = this->elf_syms[shdr.sh_info];
       std::string_view signature = symbol_strtab.data() + sym.st_name;
 
+      // Ignore a broken comdat group GCC emits for .debug_macros.
+      // https://github.com/rui314/mold/issues/438
+      if (signature.starts_with("wm4."))
+        continue;
+
       // Get comdat group members.
       std::span<u32> entries = this->template get_data<u32>(ctx, shdr);
 
@@ -167,11 +172,14 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
       // making the stack area executable is too dangerous. Tell our
       // users about the difference if that matters.
       if (name == ".note.GNU-stack") {
-        if (shdr.sh_flags & SHF_EXECINSTR)
-          Warn(ctx) << *this << ": this file may cause a segmentation"
-            " fault because it requires an executable stack. See"
-            " https://github.com/rui314/mold/tree/main/docs/execstack.md"
-            " for more info.";
+        if (shdr.sh_flags & SHF_EXECINSTR) {
+          if (!ctx.arg.z_execstack && !ctx.arg.z_execstack_if_needed)
+            Warn(ctx) << *this << ": this file may cause a segmentation"
+              " fault because it requires an executable stack. See"
+              " https://github.com/rui314/mold/tree/main/docs/execstack.md"
+              " for more info.";
+          needs_executable_stack = true;
+        }
         continue;
       }
 
@@ -205,10 +213,10 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
 
         if (name == ".debug_info")
           debug_info = isec;
-        if (name == ".debug_abbrev")
-          debug_abbrev = isec;
         if (name == ".debug_ranges")
           debug_ranges = isec;
+        if (name == ".debug_rnglists")
+          debug_rnglists = isec;
 
         // If --gdb-index is given, contents of .debug_gnu_pubnames and
         // .debug_gnu_pubtypes are copied to .gdb_index, so keeping them
@@ -222,6 +230,16 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
           debug_pubtypes = isec;
           isec->is_alive = false;
         }
+
+        // .debug_types is similar to .debug_info but contains type info
+        // only. It exists only in DWARF 4, has been removed in DWARF 5 and
+        // neither GCC nor Clang generate it by default
+        // (-fdebug-types-section is needed). As such there is probably
+        // little need to support it.
+        if (name == ".debug_types")
+          Fatal(ctx) << *this << ": mold's --gdb-index is not compatible"
+            " with .debug_types; to fix this error, remove"
+            " -fdebug-types-section and recompile";
       }
 
       static Counter counter("regular_sections");
@@ -524,16 +542,10 @@ split_section(Context<E> &ctx, InputSection<E> &sec) {
                                                sec.shdr().sh_flags);
   rec->p2align = sec.p2align;
 
-  std::string_view data = sec.contents;
-
   // If thes section contents are compressed, uncompress them.
-  if (sec.is_compressed()) {
-    u8 *buf = new u8[sec.sh_size];
-    sec.uncompress(ctx, buf);
-    data = {(char *)buf, sec.sh_size};
-    ctx.string_pool.emplace_back(buf);
-  }
+  sec.uncompress(ctx);
 
+  std::string_view data = sec.contents;
   const char *begin = data.data();
   u64 entsize = sec.shdr().sh_entsize;
   HyperLogLog estimator;
@@ -734,6 +746,8 @@ void ObjectFile<E>::parse(Context<E> &ctx) {
   symtab_sec = this->find_section(SHT_SYMTAB);
 
   if (symtab_sec) {
+    // In ELF, all local symbols precede global symbols in the symbol table.
+    // sh_info has an index of the first global symbol.
     this->first_global = symtab_sec->sh_info;
     this->elf_syms = this->template get_data<ElfSym<E>>(ctx, *symtab_sec);
     symbol_strtab = this->get_string(ctx, symtab_sec->sh_link);
@@ -1063,9 +1077,13 @@ void ObjectFile<E>::convert_common_symbols(Context<E> &ctx) {
   if (!has_common_symbol)
     return;
 
-  OutputSection<E> *osec =
+  OutputSection<E> *common =
     OutputSection<E>::get_instance(ctx, ".common", SHT_NOBITS,
                                    SHF_WRITE | SHF_ALLOC);
+
+  OutputSection<E> *tls_common =
+    OutputSection<E>::get_instance(ctx, ".tls_common", SHT_NOBITS,
+                                   SHF_WRITE | SHF_ALLOC | SHF_TLS);
 
   for (i64 i = this->first_global; i < this->elf_syms.size(); i++) {
     if (!this->elf_syms[i].is_common())
@@ -1082,17 +1100,20 @@ void ObjectFile<E>::convert_common_symbols(Context<E> &ctx) {
 
     elf_sections2.push_back({});
     ElfShdr<E> &shdr = elf_sections2.back();
-
     memset(&shdr, 0, sizeof(shdr));
-    shdr.sh_flags = SHF_ALLOC;
+
+    bool is_tls = (sym.get_type() == STT_TLS);
+    shdr.sh_flags = is_tls ? (SHF_ALLOC | SHF_TLS) : SHF_ALLOC;
     shdr.sh_type = SHT_NOBITS;
     shdr.sh_size = this->elf_syms[i].st_size;
     shdr.sh_addralign = this->elf_syms[i].st_value;
 
     i64 idx = this->elf_sections.size() + elf_sections2.size() - 1;
     std::unique_ptr<InputSection<E>> isec =
-      std::make_unique<InputSection<E>>(ctx, *this, ".common", idx);
-    isec->output_section = osec;
+      std::make_unique<InputSection<E>>(ctx, *this,
+                                        is_tls ? ".tls_common" : ".common",
+                                        idx);
+    isec->output_section = is_tls ? tls_common : common;
 
     sym.file = this;
     sym.shndx = idx;
@@ -1187,9 +1208,9 @@ void ObjectFile<E>::write_symtab(Context<E> &ctx) {
     esym.st_name = strtab_off;
 
     if (sym.get_type() == STT_TLS)
-      esym.st_value = sym.get_addr(ctx) - ctx.tls_begin;
+      esym.st_value = sym.get_addr(ctx, false) - ctx.tls_begin;
     else
-      esym.st_value = sym.get_addr(ctx);
+      esym.st_value = sym.get_addr(ctx, false);
 
     if (InputSection<E> *isec = sym.get_input_section())
       esym.st_shndx = isec->output_section->shndx;
@@ -1251,6 +1272,7 @@ SharedFile<E>::create(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 template <typename E>
 SharedFile<E>::SharedFile(Context<E> &ctx, MappedFile<Context<E>> *mf)
   : InputFile<E>(ctx, mf) {
+  this->is_needed = ctx.as_needed;
   this->is_alive = !ctx.as_needed;
 }
 
@@ -1460,10 +1482,6 @@ void SharedFile<E>::write_symtab(Context<E> &ctx) {
   template class SharedFile<E>;                                         \
   template std::ostream &operator<<(std::ostream &, const InputFile<E> &)
 
-INSTANTIATE(X86_64);
-INSTANTIATE(I386);
-INSTANTIATE(ARM64);
-INSTANTIATE(ARM32);
-INSTANTIATE(RISCV64);
+INSTANTIATE_ALL;
 
 } // namespace mold::elf

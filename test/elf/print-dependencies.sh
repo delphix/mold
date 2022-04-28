@@ -14,18 +14,18 @@ mold="$(pwd)/mold"
 t=out/test/elf/$testname
 mkdir -p $t
 
-[ $MACHINE = $(uname -m) ] || { echo skipped; exit; }
-
-which clang >& /dev/null || { echo skipped; exit; }
-
-cat <<EOF | clang -flto -c -o $t/a.o -xc -
-#include <stdio.h>
-int main() {
-  printf("Hello world\n");
-}
+cat <<EOF | $CC -o $t/a.o -c -xc -
+void foo() {}
 EOF
 
-clang -B. -o $t/exe -flto $t/a.o
-$t/exe | grep -q 'Hello world'
+cat <<EOF | $CC -o $t/b.o -c -xc -
+void foo();
+int main() { foo(); }
+EOF
+
+! $CC -B. -o $t/exe $t/a.o $t/b.o \
+  -Wl,--print-dependencies=full > $t/log 2> /dev/null
+
+grep -q 'b\.o.*a\.o.*foo$' $t/log
 
 echo OK

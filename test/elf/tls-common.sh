@@ -14,18 +14,22 @@ mold="$(pwd)/mold"
 t=out/test/elf/$testname
 mkdir -p $t
 
-cat <<EOF | $CC -o $t/a.o -c -xc -
+cat <<EOF | $GCC -o $t/a.o -c -xassembler -
+.globl foo
+.tls_common foo,4,4
+EOF
+
+cat <<EOF | $CC -o $t/b.o -c -xc -std=c11 -
 #include <stdio.h>
+
+extern _Thread_local int foo;
+
 int main() {
-  printf("Hello world\n");
+  printf("foo=%d\n", foo);
 }
 EOF
 
-rm -f $t/exe
-
-$CC -B. -o $t/exe $t/a.o -Wl,-preload 2> /dev/null
-! test -e $t/exe || false
-$CC -B. -o $t/exe $t/a.o 2> /dev/null
-$QEMU $t/exe | grep -q 'Hello world'
+$CC -B. -o $t/exe $t/a.o $t/b.o
+$QEMU $t/exe | grep -q '^foo=0$'
 
 echo OK
