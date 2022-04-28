@@ -128,8 +128,6 @@ static void mark_live_objects(Context<E> &ctx) {
 
 template <typename E>
 void do_resolve_symbols(Context<E> &ctx) {
-  Timer t(ctx, "do_resolve_symbols");
-
   auto for_each_file = [&](std::function<void(InputFile<E> *)> fn) {
     tbb::parallel_for_each(ctx.objs, fn);
     tbb::parallel_for_each(ctx.dsos, fn);
@@ -163,7 +161,7 @@ void do_resolve_symbols(Context<E> &ctx) {
 
 template <typename E>
 void resolve_symbols(Context<E> &ctx) {
-  Timer t(ctx, "do_resolve_symbols");
+  Timer t(ctx, "resolve_symbols");
 
   std::vector<ObjectFile<E> *> objs = ctx.objs;
   std::vector<SharedFile<E> *> dsos = ctx.dsos;
@@ -207,7 +205,7 @@ void resolve_symbols(Context<E> &ctx) {
 
     tbb::parallel_for_each(ctx.dsos, [&](SharedFile<E> *file) {
       file->clear_symbols();
-      file->is_alive = true;
+      file->is_alive = !file->is_needed;
     });
 
     do_resolve_symbols(ctx);
@@ -1093,6 +1091,8 @@ void parse_symbol_version(Context<E> &ctx) {
 
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     for (i64 i = 0; i < file->symbols.size() - file->first_global; i++) {
+      // Match VERSION part of symbol foo@VERSION with version definitions.
+      // The symbols' VERSION parts are in file->symvers.
       if (!file->symvers[i])
         continue;
 
@@ -1118,6 +1118,16 @@ void parse_symbol_version(Context<E> &ctx) {
       sym->ver_idx = it->second;
       if (!is_default)
         sym->ver_idx |= VERSYM_HIDDEN;
+
+      // If both symbol `foo` and `foo@VERSION` are defined, `foo@VERSION`
+      // hides `foo` so that all references to `foo` are resolved to a
+      // versioned symbol. Likewise, if `foo@VERSION` and `foo@@VERSION` are
+      // defined, the default one takes precedence.
+      Symbol<E> *sym2 = get_symbol(ctx, sym->name());
+      if (sym2->file == file && !file->symvers[sym2->sym_idx - file->first_global])
+        if (sym2->ver_idx == ctx.default_version ||
+            (sym2->ver_idx & ~VERSYM_HIDDEN) == (sym->ver_idx & ~VERSYM_HIDDEN))
+          sym2->ver_idx = VER_NDX_LOCAL;
     }
   });
 }
@@ -1144,12 +1154,14 @@ void compute_import_export(Context<E> &ctx) {
           sym->ver_idx == VER_NDX_LOCAL)
         continue;
 
+      // If we are using a symbol in a DSO, we need to import it at runtime.
       if (sym->file != file && sym->file->is_dso) {
         std::scoped_lock lock(sym->mu);
         sym->is_imported = true;
         continue;
       }
 
+      // If we are creating a DSO, all global symbols are exported by default.
       if (sym->file == file) {
         std::scoped_lock lock(sym->mu);
         sym->is_exported = true;
@@ -1672,10 +1684,6 @@ void write_dependency_file(Context<E> &ctx) {
   template i64 compress_debug_sections(Context<E> &);                   \
   template void write_dependency_file(Context<E> &);
 
-INSTANTIATE(X86_64);
-INSTANTIATE(I386);
-INSTANTIATE(ARM64);
-INSTANTIATE(ARM32);
-INSTANTIATE(RISCV64);
+INSTANTIATE_ALL;
 
 } // namespace mold::elf

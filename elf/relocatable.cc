@@ -298,7 +298,7 @@ void ROutputEhdr<E>::write_to(Context<E> &ctx) {
   ElfEhdr<E> &hdr = *(ElfEhdr<E> *)(ctx.buf + this->out_shdr.sh_offset);
   memcpy(&hdr.e_ident, "\177ELF", 4);
   hdr.e_ident[EI_CLASS] = (E::word_size == 8) ? ELFCLASS64 : ELFCLASS32;
-  hdr.e_ident[EI_DATA] = E::is_le ? ELFDATA2LSB : ELFDATA2MSB;
+  hdr.e_ident[EI_DATA] = ELFDATA2LSB;
   hdr.e_ident[EI_VERSION] = EV_CURRENT;
   hdr.e_type = ET_REL;
   hdr.e_machine = E::e_machine;
@@ -588,10 +588,6 @@ void combine_objects(Context<E> &ctx, std::span<std::string_view> file_args) {
 #define INSTANTIATE(E)                                                  \
   template void combine_objects(Context<E> &, std::span<std::string_view>);
 
-INSTANTIATE(X86_64);
-INSTANTIATE(I386);
-INSTANTIATE(ARM64);
-INSTANTIATE(ARM32);
-INSTANTIATE(RISCV64);
+INSTANTIATE_ALL;
 
 } // namespace mold::elf

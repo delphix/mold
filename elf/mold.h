@@ -33,6 +33,29 @@
 #define XXH_INLINE_ALL 1
 #include <xxhash.h>
 
+// MOLD_DEBUG_{X86_64,ARM64}_ONLY are macros to speed up builds.
+// This should be used only for debugging. When you use this flag,
+// you need to compile mold C++ files with `-ffunction-sections
+// -fdata-sections` and link them with -Wl,-gc-sections.
+#if MOLD_DEBUG_X86_64_ONLY
+# ifdef __OPTIMIZE__
+#  error "MOLD_DEBUG_X86_64_ONLY is for debugging only"
+# endif
+# define INSTANTIATE_ALL INSTANTIATE(X86_64)
+#elif MOLD_DEBUG_ARM64_ONLY
+# ifdef __OPTIMIZE__
+#  error "MOLD_DEBUG_ARM64_ONLY is for debugging only"
+# endif
+# define INSTANTIATE_ALL INSTANTIATE(ARM64)
+#else
+# define INSTANTIATE_ALL                       \
+  INSTANTIATE(X86_64);                          \
+  INSTANTIATE(I386);                            \
+  INSTANTIATE(ARM64);                           \
+  INSTANTIATE(ARM32);                           \
+  INSTANTIATE(RISCV64)
+#endif
+
 namespace mold::elf {
 
 static constexpr i32 SHA256_SIZE = 32;
@@ -266,8 +289,8 @@ public:
   InputSection(Context<E> &ctx, ObjectFile<E> &file, std::string_view name,
                i64 shndx);
 
-  bool is_compressed();
-  void uncompress(Context<E> &ctx, u8 *buf);
+  void uncompress(Context<E> &ctx);
+  void uncompress_to(Context<E> &ctx, u8 *buf);
   void scan_relocations(Context<E> &ctx);
   void write_to(Context<E> &ctx, u8 *buf);
   void apply_reloc_alloc(Context<E> &ctx, u8 *base);
@@ -307,9 +330,11 @@ public:
 
   // For COMDAT de-duplication and garbage collection
   std::atomic_bool is_alive = true;
-  bool killed_by_icf = false;
-
   u8 p2align = 0;
+
+  u8 compressed : 1 = false;
+  u8 uncompressed : 1 = false;
+  u8 killed_by_icf : 1 = false;
 
 private:
   typedef enum : u8 { NONE, ERROR, COPYREL, PLT, CPLT, DYNREL, BASEREL } Action;
@@ -348,6 +373,9 @@ public:
   virtual void copy_buf(Context<E> &ctx) {}
   virtual void write_to(Context<E> &ctx, u8 *buf);
   virtual void update_shdr(Context<E> &ctx) {}
+
+  // For --gdb-index
+  virtual u8 *get_uncompressed_data() { return nullptr; }
 
   std::string_view name;
   ElfShdr<E> shdr = {};
@@ -868,7 +896,6 @@ public:
 struct GdbIndexName {
   std::string_view name;
   u32 hash = 0;
-  u32 offset = 0;
   u32 attr = 0;
   u32 entry_idx = 0;
 };
@@ -879,6 +906,7 @@ public:
   GdbIndexSection() {
     this->name = ".gdb_index";
     this->shdr.sh_type = SHT_PROGBITS;
+    this->shdr.sh_addralign = 4;
   }
 
   void construct(Context<E> &ctx);
@@ -896,33 +924,21 @@ private:
   };
 
   struct MapEntry {
-    MapEntry(u32 hash) : hash(hash) {}
+    MapEntry(ObjectFile<E> *owner, u32 hash) : owner(owner), hash(hash) {}
 
-    MapEntry(const MapEntry &other) {
-      hash = other.hash;
-      name_offset = other.name_offset;
-      attr_offset = other.attr_offset;
-      num_attrs = other.num_attrs.load();
-    }
+    MapEntry(const MapEntry &other)
+      : owner(other.owner.load()), num_attrs(other.num_attrs.load()),
+        hash(other.hash), name_offset(other.name_offset),
+        attr_offset(other.attr_offset) {}
 
-    u32 hash = 0;
-    u32 name_offset = 0;
-    u32 attr_offset = 0;
+    std::atomic<ObjectFile<E> *> owner;
     std::atomic_uint32_t num_attrs = 0;
+    u32 hash = 0;
+    u32 name_offset = -1;
+    u32 attr_offset = -1;
   };
 
   SectionHeader header;
-  i64 num_symtab_entries = 0;
-  i64 attrs_size = 0;
-
-  std::vector<std::string_view>
-  read_compunits(Context<E> &ctx, ObjectFile<E> &file);
-
-  std::vector<GdbIndexName> read_pubnames(Context<E> &ctx, ObjectFile<E> &file);
-
-  std::vector<u64> read_address_areas(Context<E> &ctx, ObjectFile<E> &file,
-                                      i64 offset);
-
   ConcurrentMap<MapEntry> map;
 };
 
@@ -931,10 +947,12 @@ class GabiCompressedSection : public Chunk<E> {
 public:
   GabiCompressedSection(Context<E> &ctx, Chunk<E> &chunk);
   void copy_buf(Context<E> &ctx) override;
+  u8 *get_uncompressed_data() override { return uncompressed.get(); }
 
 private:
   ElfChdr<E> chdr = {};
-  std::unique_ptr<ZlibCompressor> contents;
+  std::unique_ptr<ZlibCompressor> compressed;
+  std::unique_ptr<u8[]> uncompressed;
 };
 
 template <typename E>
@@ -942,11 +960,13 @@ class GnuCompressedSection : public Chunk<E> {
 public:
   GnuCompressedSection(Context<E> &ctx, Chunk<E> &chunk);
   void copy_buf(Context<E> &ctx) override;
+  u8 *get_uncompressed_data() override { return uncompressed.get(); }
 
 private:
   static constexpr i64 HEADER_SIZE = 12;
   i64 original_size = 0;
-  std::unique_ptr<ZlibCompressor> contents;
+  std::unique_ptr<ZlibCompressor> compressed;
+  std::unique_ptr<u8[]> uncompressed;
 };
 
 template <typename E>
@@ -965,6 +985,24 @@ private:
 };
 
 bool is_c_identifier(std::string_view name);
+
+//
+// dwarf.cc
+//
+
+template <typename E>
+std::vector<std::string_view>
+read_compunits(Context<E> &ctx, ObjectFile<E> &file);
+
+template <typename E>
+std::vector<GdbIndexName> read_pubnames(Context<E> &ctx, ObjectFile<E> &file);
+
+template <typename E>
+i64 estimate_address_areas(Context<E> &ctx, ObjectFile<E> &file);
+
+template <typename E>
+std::vector<u64>
+read_address_areas(Context<E> &ctx, ObjectFile<E> &file, i64 offset);
 
 //
 // input-files.cc
@@ -1099,6 +1137,7 @@ public:
   bool exclude_libs = false;
   u32 features = 0;
   bool is_lto_obj = false;
+  bool needs_executable_stack = false;
 
   u64 num_dynrel = 0;
   u64 reldyn_offset = 0;
@@ -1117,15 +1156,19 @@ public:
 
   // For .gdb_index
   InputSection<E> *debug_info = nullptr;
-  InputSection<E> *debug_abbrev = nullptr;
   InputSection<E> *debug_ranges = nullptr;
+  InputSection<E> *debug_rnglists = nullptr;
   InputSection<E> *debug_pubnames = nullptr;
   InputSection<E> *debug_pubtypes = nullptr;
   std::vector<std::string_view> compunits;
+  std::vector<GdbIndexName> gdb_names;
+  i64 compunits_idx = 0;
+  i64 attrs_size = 0;
+  i64 attrs_offset = 0;
+  i64 names_size = 0;
+  i64 names_offset = 0;
   i64 num_areas = 0;
   i64 area_offset = 0;
-  i64 compunits_idx = 0;
-  std::vector<GdbIndexName> pubnames;
 
 private:
   ObjectFile(Context<E> &ctx, MappedFile<Context<E>> *mf,
@@ -1141,10 +1184,6 @@ private:
   void override_symbol(Context<E> &ctx, Symbol<E> &sym,
                        const ElfSym<E> &esym, i64 symidx);
   void merge_visibility(Context<E> &ctx, Symbol<E> &sym, u8 visibility);
-
-  std::pair<std::string_view, const ElfShdr<E> *>
-  uncompress_contents(Context<E> &ctx, const ElfShdr<E> &shdr,
-                      std::string_view name);
 
   bool has_common_symbol = false;
 
@@ -1170,6 +1209,7 @@ public:
   void compute_symtab(Context<E> &ctx);
   void write_symtab(Context<E> &ctx);
 
+  bool is_needed = false;
   std::string soname;
   std::vector<std::string_view> version_strings;
   std::vector<ElfSym<E>> elf_syms2;
@@ -1588,6 +1628,7 @@ struct Context {
     bool z_dlopen = true;
     bool z_dump = true;
     bool z_execstack = false;
+    bool z_execstack_if_needed = false;
     bool z_ibt = false;
     bool z_ibtplt = false;
     bool z_initfirst = false;
@@ -1728,6 +1769,13 @@ struct Context {
   std::unique_ptr<ThumbToArmSection> thumb_to_arm;
   std::unique_ptr<TlsTrampolineSection> tls_trampoline;
 
+  // For --gdb-index
+  Chunk<E> *debug_info = nullptr;
+  Chunk<E> *debug_abbrev = nullptr;
+  Chunk<E> *debug_ranges = nullptr;
+  Chunk<E> *debug_addr = nullptr;
+  Chunk<E> *debug_rnglists = nullptr;
+
   // For --relocatable
   std::vector<RChunk<E> *> r_chunks;
   ROutputEhdr<E> *r_ehdr = nullptr;
@@ -1736,8 +1784,8 @@ struct Context {
   RStrtabSection<E> *r_strtab = nullptr;
   RSymtabSection<E> *r_symtab = nullptr;
 
-  u64 tls_begin = -1;
-  u64 tls_end = -1;
+  u64 tls_begin = 0;
+  u64 tls_end = 0;
   bool relax_tlsdesc = false;
 
   // Linker-synthesized symbols
@@ -1871,15 +1919,15 @@ public:
   u64 value = 0;
 
   const char *nameptr = nullptr;
-  u64 namelen : 20 = 0;
+  i32 namelen = 0;
 
   // Index into the symbol table of the owner file.
-  i64 sym_idx : 20 = -1;
+  i32 sym_idx = -1;
 
   // shndx > 0  : symbol is in file's shndx'th section
   // shndx == 0 : absolute symbol
   // shndx < 0  : symbol is in the -shndx'th output section
-  i64 shndx : 20 = 0;
+  i32 shndx = 0;
 
   i32 aux_idx = -1;
   u16 ver_idx = 0;

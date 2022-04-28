@@ -31,12 +31,24 @@ static void debug_print(char *fmt, ...) {
   va_end(ap);
 }
 
-static void get_args(va_list *ap, int argc, char **argv) {
-  for (int i = 1; i < argc - 1; i++) {
+static int count_args(va_list *ap) {
+  va_list aq;
+  va_copy(aq, *ap);
+
+  int i = 0;
+  while (va_arg(aq, char *))
+    i++;
+  va_end(aq);
+  return i;
+}
+
+static void copy_args(va_list *ap, char **argv) {
+  int i = 1;
+  for (;;) {
     char *arg = va_arg(*ap, char *);
     if (!arg)
       break;
-    argv[i] = arg;
+    argv[i++] = arg;
   }
 }
 
@@ -52,10 +64,8 @@ static bool is_ld(const char *path) {
 int execvpe(const char *file, char *const *argv, char *const *envp) {
   debug_print("execvpe %s\n", file);
 
-  if (!strcmp(file, "ld") || is_ld(file)) {
+  if (!strcmp(file, "ld") || is_ld(file))
     file = get_mold_path();
-    ((const char **)argv)[0] = file;
-  }
 
   for (int i = 0; envp[i]; i++)
     putenv(envp[i]);
@@ -66,12 +76,8 @@ int execvpe(const char *file, char *const *argv, char *const *envp) {
 
 int execve(const char *path, char *const *argv, char *const *envp) {
   debug_print("execve %s\n", path);
-
-  if (is_ld(path)) {
+  if (is_ld(path))
     path = get_mold_path();
-    ((const char **)argv)[0] = path;
-  }
-
   typeof(execve) *real = dlsym(RTLD_NEXT, "execve");
   return real(path, argv, envp);
 }
@@ -79,8 +85,9 @@ int execve(const char *path, char *const *argv, char *const *envp) {
 int execl(const char *path, const char *arg0, ...) {
   va_list ap;
   va_start(ap, arg0);
-  char *argv[4096] = {(char *)arg0};
-  get_args(&ap, 4096, argv);
+  char **argv = calloc(sizeof(char *), count_args(&ap) + 1);
+  ((const char **)argv)[0] = arg0;
+  copy_args(&ap, argv);
   va_end(ap);
   return execve(path, argv, environ);
 }
@@ -88,8 +95,9 @@ int execl(const char *path, const char *arg0, ...) {
 int execlp(const char *file, const char *arg0, ...) {
   va_list ap;
   va_start(ap, arg0);
-  char *argv[4096] = {(char *)arg0};
-  get_args(&ap, 4096, argv);
+  char **argv = calloc(sizeof(char *), count_args(&ap) + 1);
+  ((const char **)argv)[0] = arg0;
+  copy_args(&ap, argv);
   va_end(ap);
   return execvpe(file, argv, environ);
 }
@@ -97,8 +105,9 @@ int execlp(const char *file, const char *arg0, ...) {
 int execle(const char *path, const char *arg0, ...) {
   va_list ap;
   va_start(ap, arg0);
-  char *argv[4096] = {(char *)arg0};
-  get_args(&ap, 4096, argv);
+  char **argv = calloc(sizeof(char *), count_args(&ap) + 1);
+  ((const char **)argv)[0] = arg0;
+  copy_args(&ap, argv);
   char **env = va_arg(ap, char **);
   va_end(ap);
   return execve(path, argv, env);
@@ -117,12 +126,8 @@ int posix_spawn(pid_t *pid, const char *path,
                 const posix_spawnattr_t *attrp,
                 char *const *argv, char *const *envp) {
   debug_print("posix_spawn %s\n", path);
-
-  if (is_ld(path)) {
+  if (is_ld(path))
     path = get_mold_path();
-    ((const char **)argv)[0] = path;
-  }
-
   typeof(posix_spawn) *real = dlsym(RTLD_NEXT, "posix_spawn");
   return real(pid, path, file_actions, attrp, argv, envp);
 }

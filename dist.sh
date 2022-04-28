@@ -9,18 +9,18 @@
 
 set -e
 
-version=$(grep '^VERSION =' $(dirname $0)/Makefile | sed 's/.* = //')
+# Unlike Linux, macOS's uname returns arm64 for aarch64.
 arch=$(uname -m)
-dest=mold-$version-$arch-linux
+[ $arch = arm64 ] && arch=aarch64
 
-if [ $arch = x86_64 ]; then
-  image=rui314/mold-builder:v1-x86_64
-elif [ $arch = aarch64 -o $arch = arm64 ]; then
-  image=rui314/mold-builder:v1-aarch64
-else
+if [ $arch != x86_64 -a $arch != aarch64 ]; then
   echo "Error: no docker image for $arch"
   exit 1
 fi
+
+version=$(grep '^VERSION =' $(dirname $0)/Makefile | sed 's/.* = //')
+dest=mold-$version-$arch-linux
+image=rui314/mold-builder:v1-$arch
 
 docker images -q $image 2> /dev/null || docker pull $image
 
@@ -30,6 +30,5 @@ cd /tmp/mold &&
 make clean &&
 make -j\$(nproc) CXX=clang++-14 CXXFLAGS='-I/openssl/include -O2 $CXXFLAGS' LDFLAGS='-static-libstdc++ /openssl/libcrypto.a' NEEDS_LIBCRYPTO=0 LTO=${LTO:-0} &&
 make install PREFIX=/ DESTDIR=$dest &&
-ln -sfr $dest/bin/mold $dest/libexec/mold/ld &&
 tar czf /mold/$dest.tar.gz $dest &&
 cp mold /mold"

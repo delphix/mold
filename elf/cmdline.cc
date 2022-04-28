@@ -77,8 +77,8 @@ Options:
     --no-eh-frame-hdr
   --enable-new-dtags          Ignored
   --exclude-libs LIB,LIB,..   Mark all symbols in given libraries hidden
-  --fatal-warnings            Ignored
-    --no-fatal-warnings       Ignored
+  --fatal-warnings            Treat warnings as errors
+    --no-fatal-warnings       Do not treat warnings as errors (default)
   --fini SYMBOL               Call SYMBOL at unload-time
   --fork                      Spawn a child process (default)
     --no-fork
@@ -153,6 +153,7 @@ Options:
   -z common-page-size=VALUE   Ignored
   -z execstack                Require executable stack
     -z noexecstack
+  -z execstack-if-needed      Make the stack area execuable if an input file explicitly requests it
   -z initfirst                Mark DSO to be initialized first at runtime
   -z interpose                Mark object to interpose all DSOs but executable
   -z keep-text-section-prefix Keep .text.{hot,unknown,unlikely,startup,exit} as separate sections in the final binary
@@ -722,6 +723,8 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.z_cet_report = CET_REPORT_ERROR;
     } else if (read_z_flag(args, "execstack")) {
       ctx.arg.z_execstack = true;
+    } else if (read_z_flag(args, "execstack-if-needed")) {
+      ctx.arg.z_execstack_if_needed = true;
     } else if (read_z_arg(ctx, args, arg, "max-page-size")) {
       ctx.page_size = parse_number(ctx, "-z max-page-size", arg);
       if (std::popcount<u64>(ctx.page_size) != 1)
@@ -868,6 +871,10 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.plugin_opt.push_back("thinlto-object-suffix-replace=" + std::string(arg));
     } else if (read_arg(ctx, args, arg, "thinlto-prefix-replace")) {
       ctx.arg.plugin_opt.push_back("thinlto-prefix-replace=" + std::string(arg));
+    } else if (read_arg(ctx, args, arg, "thinlto-cache-dir")) {
+      ctx.arg.plugin_opt.push_back("cache-dir=" + std::string(arg));
+    } else if (read_arg(ctx, args, arg, "thinlto-cache-policy")) {
+      ctx.arg.plugin_opt.push_back("cache-policy=" + std::string(arg));
     } else if (read_arg(ctx, args, arg, "thinlto-jobs")) {
       ctx.arg.plugin_opt.push_back("jobs=" + std::string(arg));
     } else if (read_arg(ctx, args, arg, "thread-count")) {
@@ -1105,10 +1112,6 @@ void parse_nonpositional_args(Context<E> &ctx,
   void parse_nonpositional_args(Context<E> &ctx,                        \
                                 std::vector<std::string_view> &remaining)
 
-INSTANTIATE(X86_64);
-INSTANTIATE(I386);
-INSTANTIATE(ARM64);
-INSTANTIATE(ARM32);
-INSTANTIATE(RISCV64);
+INSTANTIATE_ALL;
 
 } // namespace mold::elf
