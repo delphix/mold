@@ -1,8 +1,4 @@
-# If you want to enable ASAN, run `make` with the following options:
-#
-# make CXXFLAGS='-fsanitize=address -g' LDFLAGS=-fsanitize=address USE_MIMALLOC=0
-
-VERSION = 1.2.1
+VERSION = 1.3.0
 
 PREFIX = /usr/local
 BINDIR = $(PREFIX)/bin
@@ -21,9 +17,6 @@ D = $(DESTDIR)
 ifeq ($(origin CXX), default)
   CXX = c++
 endif
-
-# Allow overriding pkg-config binary
-PKG_CONFIG = pkg-config
 
 # If you want to keep symbols in the installed binary, run make with
 # `STRIP=true` to run /bin/true instead of the strip command.
@@ -51,7 +44,11 @@ MOLD_CXXFLAGS := -std=c++20 -fno-exceptions -fno-unwind-tables \
 
 MOLD_LDFLAGS := -pthread -lz -lm -ldl
 
-GIT_HASH := $(shell [ -d .git ] && git rev-parse HEAD)
+# Get a hash of the current git head. We don't want to use the git
+# command because the command prints out a warning if running under
+# sudo.
+GIT_HASH := $(shell [ -f .git/HEAD ] && if grep -q '^ref:' .git/HEAD; then cat .git/`sed 's/^ref: //' .git/HEAD`; else cat .git/HEAD; fi)
+
 ifneq ($(GIT_HASH),)
   MOLD_CXXFLAGS += -DGIT_HASH=\"$(GIT_HASH)\"
 endif
@@ -97,19 +94,17 @@ ifeq ($(OS), Linux)
   endif
 endif
 
-NEEDS_LIBCRYPTO = 0
-ifneq ($(OS), Darwin)
-  NEEDS_LIBCRYPTO = 1
+NEEDS_LIBCRYPTO = 1
+ifeq ($(OS), Darwin)
+  NEEDS_LIBCRYPTO = 0
 endif
 
 ifeq ($(NEEDS_LIBCRYPTO), 1)
-  MOLD_CXXFLAGS += $(shell $(PKG_CONFIG) --cflags-only-I openssl)
-  MOLD_LDFLAGS += $(shell $(PKG_CONFIG) --libs-only-L openssl) -lcrypto
+  MOLD_LDFLAGS += -lcrypto
 endif
 
-# '-latomic' flag is needed building on riscv64 system
-# RV32 system doesn't tested yet
-# seems like '-atomic' would be better but not working.
+# '-latomic' flag is needed building on riscv64 system.
+# Seems like '-atomic' would be better but not working.
 ifeq ($(ARCH), riscv64)
   MOLD_LDFLAGS += -latomic
 endif
@@ -132,7 +127,7 @@ all: mold mold-wrapper.so
 mold: $(OBJS) $(MIMALLOC_LIB) $(TBB_LIB)
 	$(CXX) $(OBJS) -o $@ $(MOLD_LDFLAGS) $(LDFLAGS)
 	ln -sf mold ld
-	ln -sf mold ld64.mold
+	ln -sf mold ld64
 
 mold-wrapper.so: elf/mold-wrapper.c
 	$(CC) $(DEPFLAGS) $(CFLAGS) -fPIC -shared -o $@ $< $(MOLD_WRAPPER_LDFLAGS) $(LDFLAGS)
@@ -167,32 +162,22 @@ endif
 	  echo 'Passed all tests'; \
 	fi
 
-test-x86-64: all
-	@echo x86_64
-	CC=x86_64-linux-gnu-gcc CXX=x86_64-linux-gnu-g++ GCC=x86_64-linux-gnu-gcc GXX=x86_64-linux-gnu-g++ OBJDUMP=x86_64-linux-gnu-objdump MACHINE=x86_64 QEMU='qemu-x86_64 -L /usr/x86_64-linux-gnu' $(MAKE) test
+test-arch:
+	TEST_CC=${TRIPLE}-gcc \
+	TEST_CXX=${TRIPLE}-g++ \
+	TEST_GCC=${TRIPLE}-gcc \
+	TEST_GXX=${TRIPLE}-g++ \
+	OBJDUMP=${TRIPLE}-objdump \
+	MACHINE=${MACHINE} \
+	QEMU="qemu-${MACHINE} -L /usr/${TRIPLE}" \
+	$(MAKE) test
 
-test-i386: all
-	@echo i386
-	CC=i686-linux-gnu-gcc CXX=i686-linux-gnu-g++ GCC=i686-linux-gnu-gcc GXX=i686-linux-gnu-g++ OBJDUMP=x86_64-linux-gnu-objdump MACHINE=i386 QEMU='qemu-i386 -L /usr/i686-linux-gnu' $(MAKE) test
-
-test-arm64: all
-	@echo arm64
-	CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ GCC=aarch64-linux-gnu-gcc GXX=aarch64-linux-gnu-g++ OBJDUMP=aarch64-linux-gnu-objdump MACHINE=aarch64 QEMU='qemu-aarch64 -L /usr/aarch64-linux-gnu' $(MAKE) test
-
-test-arm32: all
-	@echo arm
-	CC=arm-linux-gnueabihf-gcc CXX=arm-linux-gnueabihf-g++ GCC=arm-linux-gnueabihf-gcc GXX=arm-linux-gnueabihf-g++ OBJDUMP=arm-linux-gnueabihf-objdump MACHINE=arm QEMU='qemu-arm -L /usr/arm-linux-gnueabihf' $(MAKE) test
-
-test-riscv64: all
-	@echo riscv64
-	CC=riscv64-linux-gnu-gcc CXX=riscv64-linux-gnu-g++ GCC=riscv64-linux-gnu-gcc GXX=riscv64-linux-gnu-g++ OBJDUMP=riscv64-linux-gnu-objdump MACHINE=riscv64 QEMU='qemu-riscv64 -L /usr/riscv64-linux-gnu' $(MAKE) test
-
-test-all:
-	$(MAKE) test-x86-64
-	$(MAKE) test-i386
-	$(MAKE) test-arm64
-	$(MAKE) test-arm32
-	$(MAKE) test-riscv64
+test-all: all
+	$(MAKE) test-arch TRIPLE=x86_64-linux-gnu MACHINE=x86_64
+	$(MAKE) test-arch TRIPLE=i686-linux-gnu MACHINE=i386
+	$(MAKE) test-arch TRIPLE=aarch64-linux-gnu MACHINE=aarch64
+	$(MAKE) test-arch TRIPLE=arm-linux-gnueabihf MACHINE=arm
+	$(MAKE) test-arch TRIPLE=riscv64-linux-gnu MACHINE=riscv64
 
 install: all
 	$(INSTALL) -d $D$(BINDIR)
@@ -222,7 +207,13 @@ uninstall:
 	rm -f $D$(MANDIR)/man1/mold.1
 	rm -rf $D$(LIBDIR)/mold
 
-clean:
-	rm -rf *~ mold mold-wrapper.so out ld ld64.mold mold-*-linux.tar.gz
+test-asan test-ubsan:
+	$(MAKE) USE_MIMALLOC=0 CXXFLAGS='-fsanitize=address -fsanitize=undefined -O0 -g' LDFLAGS='-fsanitize=address -fsanitize=undefined' test
 
-.PHONY: all test tests check clean test-x86-64 test-i386 test-arm64 test-arm32 test-riscv64 test-all
+test-tsan:
+	$(MAKE) USE_MIMALLOC=0 CXXFLAGS='-fsanitize=thread -O0 -g' LDFLAGS=-fsanitize=thread test
+
+clean:
+	rm -rf *~ mold mold-wrapper.so out ld ld64 mold-*-linux.tar.gz
+
+.PHONY: all test tests check clean test-arch test-all test-asan test-ubsan test-tsan

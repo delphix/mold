@@ -1,6 +1,7 @@
 #include "mold.h"
 #include "../archive-file.h"
 #include "../cmdline.h"
+#include "../output-file.h"
 
 #include <cstring>
 #include <functional>
@@ -41,10 +42,11 @@ static ObjectFile<E> *new_lto_obj(Context<E> &ctx, MappedFile<Context<E>> *mf,
   count++;
 
   if (ctx.arg.ignore_ir_file.count(mf->get_identifier()))
-    return new ObjectFile<E>;
+    return nullptr;
 
   ObjectFile<E> *file = read_lto_object(ctx, mf);
   file->priority = ctx.file_priority++;
+  file->archive_name = archive_name;
   file->is_in_lib = ctx.in_lib || (!archive_name.empty() && !ctx.whole_archive);
   file->is_alive = !file->is_in_lib;
   ctx.has_lto_object = true;
@@ -90,7 +92,8 @@ void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
         break;
       case FileType::GCC_LTO_OBJ:
       case FileType::LLVM_BITCODE:
-        ctx.objs.push_back(new_lto_obj(ctx, child, mf->name));
+        if (ObjectFile<E> *file = new_lto_obj(ctx, child, mf->name))
+          ctx.objs.push_back(file);
         break;
       default:
         break;
@@ -103,7 +106,8 @@ void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
     return;
   case FileType::GCC_LTO_OBJ:
   case FileType::LLVM_BITCODE:
-    ctx.objs.push_back(new_lto_obj(ctx, mf, ""));
+    if (ObjectFile<E> *file = new_lto_obj(ctx, mf, ""))
+      ctx.objs.push_back(file);
     return;
   default:
     Fatal(ctx) << mf->name << ": unknown file type: " << type;
@@ -138,7 +142,7 @@ static i64 get_machine_type(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 
 template <typename E>
 static i64
-deduce_machine_type(Context<E> &ctx, std::span<std::string_view> args) {
+deduce_machine_type(Context<E> &ctx, std::span<std::string> args) {
   for (std::string_view arg : args)
     if (!arg.starts_with('-'))
       if (auto *mf = MappedFile<Context<E>>::open(ctx, std::string(arg)))
@@ -184,51 +188,51 @@ MappedFile<Context<E>> *find_library(Context<E> &ctx, std::string name) {
 }
 
 template <typename E>
-static void read_input_files(Context<E> &ctx, std::span<std::string_view> args) {
+static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
   Timer t(ctx, "read_input_files");
 
   std::vector<std::tuple<bool, bool, bool, bool>> state;
   ctx.is_static = ctx.arg.is_static;
 
   while (!args.empty()) {
-    std::string_view arg;
+    const std::string &arg = args[0];
+    args = args.subspan(1);
 
-    if (read_flag(args, "as-needed")) {
+    if (arg == "--as-needed") {
       ctx.as_needed = true;
-    } else if (read_flag(args, "no-as-needed")) {
+    } else if (arg == "--no-as-needed") {
       ctx.as_needed = false;
-    } else if (read_flag(args, "whole-archive")) {
+    } else if (arg == "--whole-archive") {
       ctx.whole_archive = true;
-    } else if (read_flag(args, "no-whole-archive")) {
+    } else if (arg == "--no-whole-archive") {
       ctx.whole_archive = false;
-    } else if (read_flag(args, "Bstatic")) {
+    } else if (arg == "--Bstatic") {
       ctx.is_static = true;
-    } else if (read_flag(args, "Bdynamic")) {
+    } else if (arg == "--Bdynamic") {
       ctx.is_static = false;
-    } else if (read_flag(args, "start-lib")) {
+    } else if (arg == "--start-lib") {
       ctx.in_lib = true;
-    } else if (read_flag(args, "end-lib")) {
+    } else if (arg == "--end-lib") {
       ctx.in_lib = false;
-    } else if (read_arg(ctx, args, arg, "version-script")) {
-      parse_version_script(ctx, std::string(arg));
-    } else if (read_arg(ctx, args, arg, "dynamic-list")) {
-      parse_dynamic_list(ctx, std::string(arg));
-    } else if (read_flag(args, "push-state")) {
+    } else if (arg.starts_with("--version-script=")) {
+      parse_version_script(ctx, arg.substr(strlen("--version-script=")));
+    } else if (arg.starts_with("--dynamic-list=")) {
+      parse_dynamic_list(ctx, arg.substr(strlen("--dynamic-list=")));
+    } else if (arg == "--push-state") {
       state.push_back({ctx.as_needed, ctx.whole_archive, ctx.is_static,
                        ctx.in_lib});
-    } else if (read_flag(args, "pop-state")) {
+    } else if (arg == "--pop-state") {
       if (state.empty())
         Fatal(ctx) << "no state pushed before popping";
       std::tie(ctx.as_needed, ctx.whole_archive, ctx.is_static, ctx.in_lib) =
         state.back();
       state.pop_back();
-    } else if (read_arg(ctx, args, arg, "l")) {
-      MappedFile<Context<E>> *mf = find_library(ctx, std::string(arg));
+    } else if (arg.starts_with("-l")) {
+      MappedFile<Context<E>> *mf = find_library(ctx, arg.substr(2));
       mf->given_fullpath = false;
       read_file(ctx, mf);
     } else {
-      read_file(ctx, MappedFile<Context<E>>::must_open(ctx, std::string(args[0])));
-      args = args.subspan(1);
+      read_file(ctx, MappedFile<Context<E>>::must_open(ctx, std::string(arg)));
     }
   }
 
@@ -355,13 +359,6 @@ static void show_stats(Context<E> &ctx) {
     sec->print_stats(ctx);
 }
 
-static i64 get_default_thread_count() {
-  // mold doesn't scale well above 32 threads.
-  int n = tbb::global_control::active_value(
-    tbb::global_control::max_allowed_parallelism);
-  return std::min(n, 32);
-}
-
 template <typename E>
 static int elf_main(int argc, char **argv) {
   Context<E> ctx;
@@ -373,8 +370,7 @@ static int elf_main(int argc, char **argv) {
 
   // Parse non-positional command line options
   ctx.cmdline_args = expand_response_files(ctx, argv);
-  std::vector<std::string_view> file_args;
-  parse_nonpositional_args(ctx, file_args);
+  std::vector<std::string> file_args = parse_nonpositional_args(ctx);
 
   // If no -m option is given, deduce it from input files.
   if (ctx.arg.emulation == -1)
@@ -399,26 +395,25 @@ static int elf_main(int argc, char **argv) {
 
   Timer t_all(ctx, "all");
 
-  if (ctx.arg.relocatable) {
-    combine_objects(ctx, file_args);
-    return 0;
-  }
-
-  if (!ctx.arg.preload)
-    try_resume_daemon(ctx);
-
-  i64 thread_count = ctx.arg.thread_count;
-  if (thread_count == 0)
-    thread_count = get_default_thread_count();
-  tbb::global_control tbb_cont(tbb::global_control::max_allowed_parallelism,
-                               thread_count);
-
   install_signal_handler();
 
   if (!ctx.arg.directory.empty())
     if (chdir(ctx.arg.directory.c_str()) == -1)
       Fatal(ctx) << "chdir failed: " << ctx.arg.directory
                  << ": " << errno_string();
+
+  if (ctx.arg.relocatable) {
+    combine_objects(ctx, file_args);
+    return 0;
+  }
+
+  // Fork a subprocess unless --no-fork is given.
+  std::function<void()> on_complete;
+  if (ctx.arg.fork)
+    on_complete = fork_child();
+
+  tbb::global_control tbb_cont(tbb::global_control::max_allowed_parallelism,
+                               ctx.arg.thread_count);
 
   // Handle --wrap options if any.
   for (std::string_view name : ctx.arg.wrap)
@@ -429,30 +424,11 @@ static int elf_main(int argc, char **argv) {
     for (std::string_view name : *ctx.arg.retain_symbols_file)
       get_symbol(ctx, name)->write_to_symtab = true;
 
-  // Preload input files
-  std::function<void()> on_complete;
-  std::function<void()> wait_for_client;
-
-  if (ctx.arg.preload)
-    daemonize(ctx, &wait_for_client, &on_complete);
-  else if (ctx.arg.fork)
-    on_complete = fork_child();
-
   for (std::string_view arg : ctx.arg.trace_symbol)
     get_symbol(ctx, arg)->traced = true;
 
   // Parse input files
   read_input_files(ctx, file_args);
-
-  if (ctx.arg.preload) {
-    wait_for_client();
-    if (!reload_input_files(ctx)) {
-      std::vector<char *> args(argv, argv + argc);
-      args.push_back((char *)"--no-preload");
-      args.push_back(nullptr);
-      return elf_main<E>(argc + 1, args.data());
-    }
-  }
 
   // Uniquify shared object files by soname
   {
@@ -489,6 +465,10 @@ static int elf_main(int argc, char **argv) {
 
   // Set is_import and is_export bits for each symbol.
   compute_import_export(ctx);
+
+  // Read address-significant section information.
+  if (ctx.arg.icf && !ctx.arg.icf_all)
+    mark_addrsig(ctx);
 
   // Garbage-collect unreachable sections.
   if (ctx.arg.gc_sections)
@@ -571,16 +551,6 @@ static int elf_main(int argc, char **argv) {
   if (ctx.arg.shuffle_sections != SHUFFLE_SECTIONS_NONE)
     shuffle_sections(ctx);
 
-  // Compute sizes of output sections while assigning offsets
-  // within an output section to input sections.
-  compute_section_sizes(ctx);
-
-  // Sort sections by section attributes so that we'll have to
-  // create as few segments as possible.
-  sort(ctx.chunks, [&](Chunk<E> *a, Chunk<E> *b) {
-    return get_section_rank(ctx, a) < get_section_rank(ctx, b);
-  });
-
   // Copy string referred by .dynamic to .dynstr.
   for (SharedFile<E> *file : ctx.dsos)
     ctx.dynstr->add_string(file->soname);
@@ -597,6 +567,16 @@ static int elf_main(int argc, char **argv) {
   // .got.plt, .dynsym, .dynstr, etc.
   scan_rels(ctx);
 
+  // Compute sizes of output sections while assigning offsets
+  // within an output section to input sections.
+  compute_section_sizes(ctx);
+
+  // Sort sections by section attributes so that we'll have to
+  // create as few segments as possible.
+  sort(ctx.chunks, [&](Chunk<E> *a, Chunk<E> *b) {
+    return get_section_rank(ctx, a) < get_section_rank(ctx, b);
+  });
+
   // If --packed_dyn_relocs=relr was given, base relocations are stored
   // to a .relr.dyn section in a compressed form. Construct a compressed
   // relocations now so that we can fix section sizes and file layout.
@@ -607,6 +587,10 @@ static int elf_main(int argc, char **argv) {
   // .dynsym contents if necessary. Beyond this point, no symbol will
   // be added to .dynsym.
   ctx.dynsym->finalize(ctx);
+
+  // Print reports about undefined symbols, if needed.
+  if (ctx.arg.unresolved_symbols == UNRESOLVED_ERROR)
+    report_undef_errors(ctx);
 
   // Fill .gnu.version_d section contents.
   if (ctx.verdef)
@@ -638,12 +622,12 @@ static int elf_main(int argc, char **argv) {
     chunk->update_shdr(ctx);
 
   std::erase_if(ctx.chunks, [](Chunk<E> *chunk) {
-    return !chunk->is_output_section() && chunk->shdr.sh_size == 0;
+    return chunk->kind() != OUTPUT_SECTION && chunk->shdr.sh_size == 0;
   });
 
   // Set section indices.
   for (i64 i = 0, shndx = 1; i < ctx.chunks.size(); i++)
-    if (!ctx.chunks[i]->is_header())
+    if (ctx.chunks[i]->kind() != HEADER)
       ctx.chunks[i]->shndx = shndx++;
 
   // Some types of section header refer other section by index.
@@ -653,12 +637,6 @@ static int elf_main(int argc, char **argv) {
 
   // Assign offsets to output sections
   i64 filesize = set_osec_offsets(ctx);
-
-  // On ARM64, we may need to create so-called "range extension thunks"
-  // to extend branch instructions reach, as they can jump only to
-  // ±128 MiB.
-  if constexpr (std::is_same_v<E, ARM64>)
-    filesize = create_range_extension_thunks(ctx);
 
   // On RISC-V, branches are encode using multiple instructions so
   // that they can jump to anywhere in ±2 GiB by default. They may
@@ -683,7 +661,8 @@ static int elf_main(int argc, char **argv) {
   t_before_copy.stop();
 
   // Create an output file
-  ctx.output_file = OutputFile<E>::open(ctx, ctx.arg.output, filesize, 0777);
+  ctx.output_file =
+    OutputFile<Context<E>>::open(ctx, ctx.arg.output, filesize, 0777);
   ctx.buf = ctx.output_file->buf;
 
   Timer t_copy(ctx, "copy");
@@ -699,11 +678,8 @@ static int elf_main(int argc, char **argv) {
       chunk->copy_buf(ctx);
     });
 
-    ctx.checkpoint();
+    report_undef_errors(ctx);
   }
-
-  if constexpr (std::is_same_v<E, ARM64>)
-    write_thunks(ctx);
 
   if constexpr (std::is_same_v<E, ARM32>)
     sort_arm_exidx(ctx);

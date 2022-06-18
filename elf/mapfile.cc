@@ -40,6 +40,9 @@ static Map<E> get_map(Context<E> &ctx) {
     }
   });
 
+  if (map.size() <= 1)
+    return map;
+
   tbb::parallel_for(map.range(), [](const typename Map<E>::range_type &range) {
     for (auto it = range.begin(); it != range.end(); it++) {
       std::vector<Symbol<E> *> &vec = it->second;
@@ -72,7 +75,7 @@ void print_map(Context<E> &ctx) {
          << std::setw(6) << (u64)osec->shdr.sh_addralign
          << " " << osec->name << "\n";
 
-    if (!osec->is_output_section())
+    if (osec->kind() != OUTPUT_SECTION)
       continue;
 
     std::span<InputSection<E> *> members = ((OutputSection<E> *)osec)->members;

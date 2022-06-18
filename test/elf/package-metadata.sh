@@ -10,14 +10,17 @@ MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
-mold="$(pwd)/ld64.mold"
-t=out/test/macho/$testname
+t=out/test/elf/$testname
 mkdir -p $t
 
-echo 'int main() {}' | $CC -o $t/exe -xc -
-"$mold" -dump $t/exe > $t/log
+cat <<EOF | $CC -o $t/a.o -c -xc -
+#include <stdio.h>
+int main() {
+  printf("Hello world\n");
+}
+EOF
 
-grep -q 'magic: 0xfeedfacf' $t/log
-grep -q 'segname: __PAGEZERO' $t/log
+$CC -B. -o $t/exe $t/a.o -Wl,-package-metadata='{"foo":"bar"}'
+readelf -x .note.package $t/exe | fgrep -q '{"foo":"bar"}'
 
 echo OK

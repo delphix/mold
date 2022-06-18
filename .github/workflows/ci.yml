@@ -4,22 +4,28 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+env:
+  UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+  MOLD_SUPPRESS_MACHO_WARNING: 1
 jobs:
   build-clang:
+    strategy:
+      matrix:
+        target:
+        - test
+        - test-asan
+        - test-tsan
     runs-on: ubuntu-20.04
     steps:
     - uses: actions/checkout@v2
-    - uses: rui314/setup-mold@v1
-      with:
-        make-default: false
+    - uses: rui314/setup-mold@staging
     - name: apt-get
-      run: sudo dpkg --add-architecture i386 && sudo apt-get update && sudo apt-get install git build-essential libstdc++-10-dev cmake clang libssl-dev zlib1g-dev libtbb-dev git bsdmainutils dwarfdump pkg-config
+      run: sudo apt-get update && sudo apt-get install git build-essential libstdc++-10-dev cmake clang libssl-dev zlib1g-dev libtbb-dev git bsdmainutils dwarfdump
     - name: ccache
       uses: hendrikmuhs/ccache-action@v1
-    - name: make
-      run: PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH" make CC=clang CXX=clang++ LDFLAGS=-fuse-ld=mold -j$(nproc)
     - name: make test
-      run: make -j$(nproc) test
+      run: PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH" make -j$(nproc) CC=clang CXX=clang++ ${{ matrix.target }}
+
   build-gcc:
     runs-on: ubuntu-20.04
     container: gcc:11.1.0
@@ -38,17 +44,20 @@ jobs:
         ln -sf /usr/bin/riscv64-linux-gnu-g++-10 /usr/bin/riscv64-linux-gnu-g++
     - name: ccache
       uses: hendrikmuhs/ccache-action@v1
-    - name: make
-      run: PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH" make CC=gcc CXX=g++ -j$(nproc)
-    - name: make test
-      run: make -j$(nproc) test-all
+    - name: make test-all
+      run: PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH" make -j$(nproc) CC=gcc CXX=g++ test-all
+
   build-macos:
+    strategy:
+      matrix:
+        target:
+        - test
+        - test-asan
     runs-on: macos-11
     steps:
     - uses: actions/checkout@v2
+    - uses: rui314/setup-mold@staging
     - name: ccache
       uses: hendrikmuhs/ccache-action@v1
-    - name: make
-      run: PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH" make -j$(sysctl -n hw.logicalcpu)
     - name: make test
-      run: PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH" make -j$(sysctl -n hw.logicalcpu) test
+      run: PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH" make -j$(sysctl -n hw.logicalcpu) ${{ matrix.target }}

@@ -1,16 +1,15 @@
 #!/bin/bash
 export LC_ALL=C
 set -e
-CC="${CC:-cc}"
-CXX="${CXX:-c++}"
-GCC="${GCC:-gcc}"
-GXX="${GXX:-g++}"
+CC="${TEST_CC:-cc}"
+CXX="${TEST_CXX:-c++}"
+GCC="${TEST_GCC:-gcc}"
+GXX="${TEST_GXX:-g++}"
 OBJDUMP="${OBJDUMP:-objdump}"
 MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
-mold="$(pwd)/mold"
 t=out/test/elf/$testname
 mkdir -p $t
 
@@ -38,7 +37,7 @@ cat <<EOF | $CC -o $t/d.o -c -xc -
 int main() {}
 EOF
 
-"$mold" -static -o $t/exe $t/a.o $t/b.o $t/c.o $t/d.o
+./mold -static -o $t/exe $t/a.o $t/b.o $t/c.o $t/d.o
 
 readelf --segments $t/exe > $t/log
 fgrep -q '01     .note.b' $t/log

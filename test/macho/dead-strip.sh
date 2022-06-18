@@ -1,16 +1,15 @@
 #!/bin/bash
 export LC_ALL=C
 set -e
-CC="${CC:-cc}"
-CXX="${CXX:-c++}"
-GCC="${GCC:-gcc}"
-GXX="${GXX:-g++}"
+CC="${TEST_CC:-cc}"
+CXX="${TEST_CXX:-c++}"
+GCC="${TEST_GCC:-gcc}"
+GXX="${TEST_GXX:-g++}"
 OBJDUMP="${OBJDUMP:-objdump}"
 MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
-mold="$(pwd)/ld64.mold"
 t=out/test/macho/$testname
 mkdir -p $t
 
@@ -33,8 +32,8 @@ int main() {
 }
 EOF
 
-clang -fuse-ld="$mold" -o $t/exe $t/a.o -Wl,-dead_strip
-$QEMU $t/exe | grep -q 'Hello world'
+clang --ld-path=./ld64 -o $t/exe $t/a.o -Wl,-dead_strip
+$t/exe | grep -q 'Hello world'
 otool -tVj $t/exe > $t/log
 grep -q 'hello:' $t/log
 ! grep -q 'howdy:' $t/log || false

@@ -39,7 +39,7 @@ most noticeable when you are in rapid debug-edit-rebuild cycles.
 
 ## Install
 
-Binary packages for the following distros are currently available.
+Binary packages for the following systems are currently available.
 
 [![Packaging status](https://repology.org/badge/vertical-allrepos/mold.svg)](https://repology.org/project/mold/versions)
 
@@ -61,7 +61,7 @@ necessary packages. You may want to run it as root.
 ```shell
 git clone https://github.com/rui314/mold.git
 cd mold
-git checkout v1.2.1
+git checkout v1.3.0
 make -j$(nproc) CXX=clang++
 sudo make install
 ```
@@ -80,14 +80,6 @@ Docker image, builds mold and auxiliary files inside it, and packs
 them into a single tar file `mold-$version-$arch-linux.tar.gz`.
 You can extract the tar file anywhere and use `mold` executable in it.
 
-`make test` depends on a few more packages. To install, run the following commands:
-
-```shell
-sudo dpkg --add-architecture i386
-sudo apt update
-sudo apt-get install bsdmainutils dwarfdump libc6-dev:i386 lib32gcc-10-dev libstdc++-10-dev-arm64-cross gcc-10-aarch64-linux-gnu g++-10-aarch64-linux-gnu
-```
-
 ## How to use
 
 <details><summary>A classic way to use mold</summary>
@@ -103,7 +95,7 @@ following flags to use `mold` instead of `/usr/bin/ld`:
 
 - Clang: pass `-fuse-ld=mold`
 
-- GCC 12.1.0 (upcoming version) or later: pass `-fuse-ld=mold`
+- GCC 12.1.0 or later: pass `-fuse-ld=mold`
 
 - GCC before 12.1.0: `-fuse-ld` does not accept `mold` as a valid
   argument, so you need to use `-B` option instead. `-B` is an option
@@ -158,12 +150,14 @@ replace `argv[0]` with `mold` if it is `ld`, `ld.gold` or `ld.lld`.
 
 </details>
 
-<details><summary>GitHub Action</summary>
-If you want to use mold in your GitHub-hosted CI to speed up continuous
-build, you can use <a href=https://github.com/rui314/setup-mold>setup-mold</a>
-GitHub Action. GitHub runs a CI on a two-core machine, but mold is
-still significantly faster than the default GNU linker there
-especially when a program being linked is large.
+<details><summary>GitHub Actions</summary>
+
+You can use our <a href=https://github.com/rui314/setup-mold>setup-mold</a>
+GitHub Action to speed up GitHub-hosted continuous build. GitHub Actions
+runs on a two-core machine, but mold is still significantly faster than
+the default GNU linker there especially when a program being linked is
+large.
+
 </details>
 
 <details><summary>Verify that you are using mold</summary>
@@ -201,3 +195,22 @@ cores most of the time. In this demo, the maximum parallelism is
 artificially capped to 16 so that the bars fit in the GIF.
 
 For details, please read [design notes](docs/design.md).
+
+## License
+
+mold is available under AGPL. Note that that does not mean that you
+have to license your program under AGPL if you use mold to link your
+program. An output of the mold linker is a derived work of the object
+files and libraries you pass to the linker but not a derived work of
+the mold linker itself.
+
+Besides that, you can also buy a commercial, non-AGPL license with
+technical support from our company, Blue Whale Systems PTE LTD. If you
+are a big company, please consider obtaining it before making hundreds
+or thousands of developers of your company to depend on mold. mold is
+mostly a single-person open-source project, and just like other
+open-source projects, we are not legally obligated to keep maintaining
+it. A legally-binding commercial license contract addresses the
+concern. By purchasing a license, you are guaranteed that mold will be
+maintained for you. Please [contact us](mailto:contact@bluewhale.systems)
+for a commercial license inquiry.

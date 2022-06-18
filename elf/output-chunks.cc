@@ -32,11 +32,6 @@ static u32 djb_hash(std::string_view name) {
 }
 
 template <typename E>
-void Chunk<E>::write_to(Context<E> &ctx, u8 *buf) {
-  Fatal(ctx) << name << ": write_to is called on an invalid section";
-}
-
-template <typename E>
 u64 get_entry_addr(Context<E> &ctx) {
   if (!ctx.arg.entry.empty())
     if (Symbol<E> *sym = get_symbol(ctx, ctx.arg.entry);
@@ -116,11 +111,16 @@ void OutputShdr<E>::copy_buf(Context<E> &ctx) {
 
 template <typename E>
 static i64 to_phdr_flags(Context<E> &ctx, Chunk<E> *chunk) {
+  if (ctx.arg.omagic)
+    return PF_R | PF_W | PF_X;
+
   i64 ret = PF_R;
-  if (chunk->shdr.sh_flags & SHF_WRITE)
+  bool write = (chunk->shdr.sh_flags & SHF_WRITE);
+  if (write)
     ret |= PF_W;
-  if ((chunk->shdr.sh_flags & SHF_EXECINSTR) ||
-      (ctx.arg.z_separate_code == NOSEPARATE_CODE))
+  if ((ctx.arg.z_separate_code == NOSEPARATE_CODE) ||
+      (!ctx.arg.rosegment && !write) ||
+      (chunk->shdr.sh_flags & SHF_EXECINSTR))
     ret |= PF_X;
   return ret;
 }
@@ -145,36 +145,19 @@ bool is_relro(Context<E> &ctx, Chunk<E> *chunk) {
   u64 type = chunk->shdr.sh_type;
 
   if (flags & SHF_WRITE)
-    if ((flags & SHF_TLS) || type == SHT_INIT_ARRAY ||
-        type == SHT_FINI_ARRAY || type == SHT_PREINIT_ARRAY ||
-        chunk == ctx.got.get() || chunk == ctx.dynamic.get() ||
-        (ctx.arg.z_now && chunk == ctx.gotplt.get()) ||
-        chunk->name.ends_with(".rel.ro"))
-      return true;
+    return (flags & SHF_TLS) || type == SHT_INIT_ARRAY ||
+           type == SHT_FINI_ARRAY || type == SHT_PREINIT_ARRAY ||
+           chunk == ctx.got.get() || chunk == ctx.dynamic.get() ||
+           (ctx.arg.z_now && chunk == ctx.gotplt.get()) ||
+           chunk->name.ends_with(".rel.ro");
   return false;
-}
-
-template <typename E>
-static bool separate_page(Context<E> &ctx, Chunk<E> *x, Chunk<E> *y) {
-  if (ctx.arg.z_relro && is_relro(ctx, x) != is_relro(ctx, y))
-    return true;
-
-  switch (ctx.arg.z_separate_code) {
-  case SEPARATE_LOADABLE_SEGMENTS:
-    return to_phdr_flags(ctx, x) != to_phdr_flags(ctx, y);
-  case SEPARATE_CODE:
-    return (x->shdr.sh_flags & SHF_EXECINSTR) != (y->shdr.sh_flags & SHF_EXECINSTR);
-  case NOSEPARATE_CODE:
-    return false;
-  }
-  unreachable();
 }
 
 template <typename E>
 static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
   std::vector<ElfPhdr<E>> vec;
 
-  auto define = [&](u64 type, u64 flags, i64 min_align, auto &chunk) {
+  auto define = [&](u64 type, u64 flags, i64 min_align, Chunk<E> *chunk) {
     vec.push_back({});
     ElfPhdr<E> &phdr = vec.back();
     phdr.p_type = type;
@@ -182,7 +165,7 @@ static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
     phdr.p_align = std::max<u64>(min_align, chunk->shdr.sh_addralign);
     phdr.p_offset = chunk->shdr.sh_offset;
     phdr.p_filesz =
-      (chunk->shdr.sh_type == SHT_NOBITS) ? 0 : chunk->shdr.sh_size;
+      (chunk->shdr.sh_type == SHT_NOBITS) ? 0 : (u64)chunk->shdr.sh_size;
     phdr.p_vaddr = chunk->shdr.sh_addr;
     phdr.p_paddr = chunk->shdr.sh_addr;
     phdr.p_memsz = chunk->shdr.sh_size;
@@ -217,11 +200,11 @@ static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
 
   // Create a PT_PHDR for the program header itself.
   if (ctx.phdr)
-    define(PT_PHDR, PF_R, E::word_size, ctx.phdr);
+    define(PT_PHDR, PF_R, E::word_size, ctx.phdr.get());
 
   // Create a PT_INTERP.
   if (ctx.interp)
-    define(PT_INTERP, PF_R, 1, ctx.interp);
+    define(PT_INTERP, PF_R, 1, ctx.interp.get());
 
   // Create a PT_NOTE for each group of SHF_NOTE sections with the same
   // alignment requirement.
@@ -285,11 +268,11 @@ static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
 
   // Add PT_DYNAMIC
   if (ctx.dynamic && ctx.dynamic->shdr.sh_size)
-    define(PT_DYNAMIC, PF_R | PF_W, 1, ctx.dynamic);
+    define(PT_DYNAMIC, PF_R | PF_W, 1, ctx.dynamic.get());
 
   // Add PT_GNU_EH_FRAME
   if (ctx.eh_frame_hdr)
-    define(PT_GNU_EH_FRAME, PF_R, 1, ctx.eh_frame_hdr);
+    define(PT_GNU_EH_FRAME, PF_R, 1, ctx.eh_frame_hdr.get());
 
   // Add PT_GNU_STACK, which is a marker segment that doesn't really
   // contain any segments. It controls executable bit of stack area.
@@ -334,14 +317,13 @@ static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
 
 template <typename E>
 void OutputPhdr<E>::update_shdr(Context<E> &ctx) {
-  this->shdr.sh_size = create_phdr(ctx).size() * sizeof(ElfPhdr<E>);
+  phdrs = create_phdr(ctx);
+  this->shdr.sh_size = phdrs.size() * sizeof(ElfPhdr<E>);
 }
 
 template <typename E>
 void OutputPhdr<E>::copy_buf(Context<E> &ctx) {
-  std::vector<ElfPhdr<E>> vec = create_phdr(ctx);
-  assert(this->shdr.sh_size == vec.size() * sizeof(ElfPhdr<E>));
-  write_vector(ctx.buf + this->shdr.sh_offset, vec);
+  write_vector(ctx.buf + this->shdr.sh_offset, phdrs);
 }
 
 template <typename E>
@@ -375,7 +357,7 @@ void RelDynSection<E>::update_shdr(Context<E> &ctx) {
 template <typename E>
 static ElfRel<E> reloc(u64 offset, u32 type, u32 sym, i64 addend = 0) {
   if constexpr (std::is_same_v<E, I386> || std::is_same_v<E, ARM32>)
-    return {(u32)offset, type, sym};
+    return {(u32)offset, (u8)type, sym};
   else
     return {offset, type, sym, addend};
 }
@@ -764,28 +746,27 @@ static std::string_view get_output_name(Context<E> &ctx, std::string_view name) 
   if (ctx.arg.unique && ctx.arg.unique->match(name))
     return name;
 
+  if (name.starts_with(".rodata.cst"))
+    return ".rodata.cst";
+  if (name.starts_with(".rodata.str"))
+    return ".rodata.str";
+  if (name.starts_with(".ARM.exidx"))
+    return ".ARM.exidx";
+  if (name.starts_with(".ARM.extab"))
+    return ".ARM.extab";
+
   if (ctx.arg.z_keep_text_section_prefix) {
-    static std::string_view text_prefixes[] = {
+    static std::string_view prefixes[] = {
       ".text.hot.", ".text.unknown.", ".text.unlikely.", ".text.startup.",
       ".text.exit."
     };
 
-    for (std::string_view prefix : text_prefixes) {
+    for (std::string_view prefix : prefixes) {
       std::string_view stem = prefix.substr(0, prefix.size() - 1);
       if (name == stem || name.starts_with(prefix))
         return stem;
     }
   }
-
-  if (name.starts_with( ".rodata.cst"))
-    return ".rodata.cst";
-  if (name.starts_with( ".rodata.str"))
-    return ".rodata.str";
-
-  if (name.starts_with(".ARM.exidx"))
-    return ".ARM.exidx";
-  if (name.starts_with(".ARM.extab"))
-    return ".ARM.extab";
 
   static std::string_view prefixes[] = {
     ".text.", ".data.rel.ro.", ".data.", ".rodata.", ".bss.rel.ro.", ".bss.",
@@ -827,7 +808,8 @@ OutputSection<E>::get_instance(Context<E> &ctx, std::string_view name,
                                u64 type, u64 flags) {
   name = get_output_name(ctx, name);
   type = canonicalize_type<E>(name, type);
-  flags = flags & ~(u64)SHF_GROUP & ~(u64)SHF_COMPRESSED & ~(u64)SHF_LINK_ORDER;
+  flags = flags & ~(u64)SHF_GROUP & ~(u64)SHF_COMPRESSED & ~(u64)SHF_LINK_ORDER &
+          ~(u64)SHF_GNU_RETAIN;
 
   // .init_array is usually writable. We don't want to create multiple
   // .init_array output sections, so make it always writable.
@@ -879,9 +861,16 @@ void OutputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
     // Zero-clear trailing padding
     u64 this_end = isec.offset + isec.sh_size;
     u64 next_start = (i == members.size() - 1) ?
-      this->shdr.sh_size : members[i + 1]->offset;
+      (u64)this->shdr.sh_size : members[i + 1]->offset;
     memset(buf + this_end, 0, next_start - this_end);
   });
+
+  if constexpr (std::is_same_v<E, ARM64>) {
+    tbb::parallel_for_each(thunks,
+                           [&](std::unique_ptr<RangeExtensionThunk<E>> &thunk) {
+      thunk->copy_buf(ctx);
+    });
+  }
 }
 
 // .relr.dyn contains base relocations encoded in a space-efficient form.
@@ -951,7 +940,7 @@ void OutputSection<E>::construct_relr(Context<E> &ctx) {
     if ((1 << isec.p2align) < E::word_size)
       return;
 
-    for (ElfRel<E> &r : isec.get_rels(ctx))
+    for (const ElfRel<E> &r : isec.get_rels(ctx))
       if (r.r_type == E::R_ABS && (r.r_offset % E::word_size) == 0)
         if (Symbol<E> &sym = *isec.file.symbols[r.r_sym];
             !sym.is_absolute() && !sym.is_imported)
@@ -1137,7 +1126,7 @@ void GotPltSection<E>::copy_buf(Context<E> &ctx) {
 
   // The first slot of .got.plt points to _DYNAMIC, as requested by
   // the psABI. The second and the third slots are reserved by the psABI.
-  buf[0] = ctx.dynamic ? ctx.dynamic->shdr.sh_addr : 0;
+  buf[0] = ctx.dynamic ? (u64)ctx.dynamic->shdr.sh_addr : 0;
   buf[1] = 0;
   buf[2] = 0;
 
@@ -1218,6 +1207,8 @@ void DynsymSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
 template <typename E>
 void DynsymSection<E>::finalize(Context<E> &ctx) {
   Timer t(ctx, "DynsymSection::finalize");
+  if (symbols.empty())
+    return;
 
   // We need a stable sort for build reproducibility, but parallel_sort
   // isn't stable, so we use this struct to make it stable.
@@ -1385,7 +1376,7 @@ void GnuHashSection<E>::update_shdr(Context<E> &ctx) {
   if (num_exported) {
     // We allocate 12 bits for each symbol in the bloom filter.
     i64 num_bits = num_exported * 12;
-    num_bloom = next_power_of_two(num_bits / ELFCLASS_BITS);
+    num_bloom = bit_ceil(num_bits / ELFCLASS_BITS);
   }
 
   this->shdr.sh_size = HEADER_SIZE;               // Header
@@ -1402,10 +1393,10 @@ void GnuHashSection<E>::copy_buf(Context<E> &ctx) {
   std::span<Symbol<E> *> syms = get_exported_symbols(ctx);
   i64 exported_offset = ctx.dynsym->symbols.size() - syms.size();
 
-  *(u32 *)base = num_buckets;
-  *(u32 *)(base + 4) = exported_offset;
-  *(u32 *)(base + 8) = num_bloom;
-  *(u32 *)(base + 12) = BLOOM_SHIFT;
+  *(ul32 *)base = num_buckets;
+  *(ul32 *)(base + 4) = exported_offset;
+  *(ul32 *)(base + 8) = num_bloom;
+  *(ul32 *)(base + 12) = BLOOM_SHIFT;
 
   std::vector<u32> hashes(syms.size());
   for (i64 i = 0; i < syms.size(); i++)
@@ -1655,8 +1646,8 @@ void EhFrameSection<E>::copy_buf(Context<E> &ctx) {
   u8 *base = ctx.buf + this->shdr.sh_offset;
 
   struct HdrEntry {
-    i32 init_addr;
-    i32 fde_addr;
+    il32 init_addr;
+    il32 fde_addr;
   };
 
   HdrEntry *eh_hdr_begin =
@@ -1672,7 +1663,7 @@ void EhFrameSection<E>::copy_buf(Context<E> &ctx) {
       std::string_view contents = cie.get_contents();
       memcpy(base + cie.output_offset, contents.data(), contents.size());
 
-      for (ElfRel<E> &rel : cie.get_rels()) {
+      for (const ElfRel<E> &rel : cie.get_rels()) {
         if (rel.r_type == E::R_NONE)
           continue;
         assert(rel.r_offset - cie.input_offset < contents.size());
@@ -1692,10 +1683,10 @@ void EhFrameSection<E>::copy_buf(Context<E> &ctx) {
       memcpy(base + offset, contents.data(), contents.size());
 
       CieRecord<E> &cie = file->cies[fde.cie_idx];
-      *(u32 *)(base + offset + 4) = offset + 4 - cie.output_offset;
+      *(ul32 *)(base + offset + 4) = offset + 4 - cie.output_offset;
       bool is_first = true;
 
-      for (ElfRel<E> &rel : fde.get_rels(*file)) {
+      for (const ElfRel<E> &rel : fde.get_rels(*file)) {
         if (rel.r_type == E::R_NONE)
           continue;
 
@@ -1718,7 +1709,7 @@ void EhFrameSection<E>::copy_buf(Context<E> &ctx) {
   });
 
   // Write a terminator.
-  *(u32 *)(base + this->shdr.sh_size - 4) = 0;
+  *(ul32 *)(base + this->shdr.sh_size - 4) = 0;
 
   // Sort .eh_frame_hdr contents.
   tbb::parallel_sort(eh_hdr_begin, eh_hdr_begin + ctx.eh_frame_hdr->num_fdes,
@@ -1745,8 +1736,8 @@ void EhFrameHdrSection<E>::copy_buf(Context<E> &ctx) {
   base[2] = DW_EH_PE_udata4;
   base[3] = DW_EH_PE_datarel | DW_EH_PE_sdata4;
 
-  *(u32 *)(base + 4) = ctx.eh_frame->shdr.sh_addr - this->shdr.sh_addr - 4;
-  *(u32 *)(base + 8) = num_fdes;
+  *(ul32 *)(base + 4) = ctx.eh_frame->shdr.sh_addr - this->shdr.sh_addr - 4;
+  *(ul32 *)(base + 8) = num_fdes;
 }
 
 template <typename E>
@@ -1946,8 +1937,7 @@ void VerdefSection<E>::copy_buf(Context<E> &ctx) {
   write_vector(ctx.buf + this->shdr.sh_offset, contents);
 }
 
-template <typename E>
-i64 BuildId::size(Context<E> &ctx) const {
+i64 BuildId::size() const {
   switch (kind) {
   case HEX:
     return value.size();
@@ -1962,7 +1952,7 @@ i64 BuildId::size(Context<E> &ctx) const {
 
 template <typename E>
 void BuildIdSection<E>::update_shdr(Context<E> &ctx) {
-  this->shdr.sh_size = HEADER_SIZE + ctx.arg.build_id.size(ctx);
+  this->shdr.sh_size = HEADER_SIZE + ctx.arg.build_id.size();
 }
 
 template <typename E>
@@ -1970,7 +1960,7 @@ void BuildIdSection<E>::copy_buf(Context<E> &ctx) {
   u32 *base = (u32 *)(ctx.buf + this->shdr.sh_offset);
   memset(base, 0, this->shdr.sh_size);
   base[0] = 4;                          // Name size
-  base[1] = ctx.arg.build_id.size(ctx); // Hash size
+  base[1] = ctx.arg.build_id.size();    // Hash size
   base[2] = NT_GNU_BUILD_ID;            // Type
   memcpy(base + 3, "GNU", 4);           // Name string
 }
@@ -1997,37 +1987,16 @@ static void compute_sha256(Context<E> &ctx, i64 offset) {
       munmap(begin, sz);
   });
 
-  assert(ctx.arg.build_id.size(ctx) <= SHA256_SIZE);
+  assert(ctx.arg.build_id.size() <= SHA256_SIZE);
 
   u8 digest[SHA256_SIZE];
   SHA256(shards.data(), shards.size(), digest);
-  memcpy(buf + offset, digest, ctx.arg.build_id.size(ctx));
+  memcpy(buf + offset, digest, ctx.arg.build_id.size());
 
   if (ctx.output_file->is_mmapped) {
     munmap(buf, std::min(bufsize, shard_size));
     ctx.output_file->is_unmapped = true;
   }
-}
-
-template <typename E>
-static std::vector<u8> get_uuid_v4(Context<E> &ctx) {
-  std::vector<u8> buf(16);
-
-  FILE *fp = fopen("/dev/urandom", "r");
-  if (!fp)
-    Fatal(ctx) << "cannot open /dev/urandom: " << errno_string();
-  if (fread(buf.data(), buf.size(), 1, fp) != 1)
-    Fatal(ctx) << "fread on /dev/urandom: short read";
-  fclose(fp);
-
-  // Indicate that this is UUIDv4.
-  buf[6] &= 0b00001111;
-  buf[6] |= 0b01000000;
-
-  // Indicates that this is an RFC4122 variant.
-  buf[8] &= 0b00111111;
-  buf[8] |= 0b10000000;
-  return buf;
 }
 
 template <typename E>
@@ -2046,13 +2015,34 @@ void BuildIdSection<E>::write_buildid(Context<E> &ctx) {
     // requested.
     compute_sha256(ctx, this->shdr.sh_offset + HEADER_SIZE);
     return;
-  case BuildId::UUID:
-    write_vector(ctx.buf + this->shdr.sh_offset + HEADER_SIZE,
-                 get_uuid_v4(ctx));
+  case BuildId::UUID: {
+    std::array<u8, 16> uuid = get_uuid_v4();
+    memcpy(ctx.buf + this->shdr.sh_offset + HEADER_SIZE, uuid.data(), 16);
     return;
+  }
   default:
     unreachable();
   }
+}
+
+template <typename E>
+void NotePackageSection<E>::update_shdr(Context<E> &ctx) {
+  if (!ctx.arg.package_metadata.empty()) {
+    // +17 is for the header and the NUL terminator
+    this->shdr.sh_size = align_to(ctx.arg.package_metadata.size() + 17, 4);
+  }
+}
+
+template <typename E>
+void NotePackageSection<E>::copy_buf(Context<E> &ctx) {
+  u32 *buf = (u32 *)(ctx.buf + this->shdr.sh_offset);
+  memset(buf, 0, this->shdr.sh_size);
+
+  buf[0] = 4;                                      // Name size
+  buf[1] = this->shdr.sh_size - 16;                // Content size
+  buf[2] = NT_FDO_PACKAGING_METADATA;              // Type
+  memcpy(buf + 3, "FDO", 4);                       // Name
+  write_string(buf + 4, ctx.arg.package_metadata); // Content
 }
 
 template <typename E>
@@ -2137,6 +2127,8 @@ template <typename E>
 void GdbIndexSection<E>::construct(Context<E> &ctx) {
   Timer t(ctx, "GdbIndexSection::construct");
 
+  std::atomic_bool has_debug_info = false;
+
   // Read debug sections
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     if (file->debug_info) {
@@ -2145,8 +2137,12 @@ void GdbIndexSection<E>::construct(Context<E> &ctx) {
 
       // Count the number of address areas contained in this file.
       file->num_areas = estimate_address_areas(ctx, *file);
+      has_debug_info = true;
     }
   });
+
+  if (!has_debug_info)
+    return;
 
   // Initialize `area_offset` and `compunits_idx`.
   for (i64 i = 0; i < ctx.objs.size() - 1; i++) {
@@ -2221,7 +2217,7 @@ void GdbIndexSection<E>::construct(Context<E> &ctx) {
   // pubtypes. We aim 75% utilization. As per the format specification,
   // It must be a power of two.
   i64 num_symtab_entries =
-    std::max<i64>(next_power_of_two(num_names.combine(std::plus()) * 4 / 3), 16);
+    std::max<i64>(bit_ceil(num_names.combine(std::plus()) * 4 / 3), 16);
 
   // Now that we can compute the size of this section.
   ObjectFile<E> &last = *ctx.objs.back();
@@ -2258,8 +2254,8 @@ void GdbIndexSection<E>::copy_buf(Context<E> &ctx) {
     if (file->debug_info) {
       u64 offset = file->debug_info->offset;
       for (std::string_view cu : file->compunits) {
-        *(u64 *)buf = offset;
-        *(u64 *)(buf + 8) = cu.size();
+        *(ul64 *)buf = offset;
+        *(ul64 *)(buf + 8) = cu.size();
         buf += 16;
         offset += cu.size();
       }
@@ -2273,7 +2269,7 @@ void GdbIndexSection<E>::copy_buf(Context<E> &ctx) {
   u32 symtab_size = header.const_pool_offset - header.symtab_offset;
   memset(buf, 0, symtab_size);
 
-  assert(std::popcount(symtab_size / 8) == 1);
+  assert(has_single_bit(symtab_size / 8));
   u32 mask = symtab_size / 8 - 1;
 
   for (i64 i = 0; i < map.nbuckets; i++) {
@@ -2282,12 +2278,12 @@ void GdbIndexSection<E>::copy_buf(Context<E> &ctx) {
       u32 step = (hash & mask) | 1;
       u32 j = hash & mask;
 
-      while (*(u32 *)(buf + j * 8))
+      while (*(ul32 *)(buf + j * 8))
         j = (j + step) & mask;
 
       ObjectFile<E> &file = *map.values[i].owner;
-      *(u32 *)(buf + j * 8) = file.names_offset + map.values[i].name_offset;
-      *(u32 *)(buf + j * 8 + 4) = file.attrs_offset + map.values[i].attr_offset;
+      *(ul32 *)(buf + j * 8) = file.names_offset + map.values[i].name_offset;
+      *(ul32 *)(buf + j * 8 + 4) = file.attrs_offset + map.values[i].attr_offset;
     }
   }
 
@@ -2337,6 +2333,10 @@ void GdbIndexSection<E>::copy_buf(Context<E> &ctx) {
 template <typename E>
 void GdbIndexSection<E>::write_address_areas(Context<E> &ctx) {
   Timer t(ctx, "GdbIndexSection::write_address_areas");
+
+  if (this->shdr.sh_size == 0)
+    return;
+
   u8 *base = ctx.buf + this->shdr.sh_offset;
 
   for (Chunk<E> *chunk : ctx.chunks) {
@@ -2356,10 +2356,10 @@ void GdbIndexSection<E>::write_address_areas(Context<E> &ctx) {
   assert(ctx.debug_info);
   assert(ctx.debug_abbrev);
 
-  struct __attribute__((packed)) Entry {
-    u64 start;
-    u64 end;
-    u32 attr;
+  struct Entry {
+    ul64 start;
+    ul64 end;
+    ul32 attr;
   };
 
   // Read address ranges from debug sections and copy them to .gdb_index.
@@ -2394,9 +2394,15 @@ void GdbIndexSection<E>::write_address_areas(Context<E> &ctx) {
 
     // Fill trailing null entries with dummy values because gdb
     // crashes if there are entries with address 0.
-    u64 filler = (e == begin) ? ctx.etext->get_addr(ctx) - 1 : e[-1].start;
+    u64 filler;
+    if (e == begin)
+      filler = ctx.etext->get_addr(ctx) - 1;
+    else
+      filler = e[-1].start;
+
     for (; e < begin + file->num_areas; e++) {
-      e->start = e->end = filler;
+      e->start = filler;
+      e->end = filler;
       e->attr = file->compunits_idx;
     }
   });
@@ -2460,7 +2466,7 @@ template <typename E>
 void GnuCompressedSection<E>::copy_buf(Context<E> &ctx) {
   u8 *base = ctx.buf + this->shdr.sh_offset;
   memcpy(base, "ZLIB", 4);
-  *(ubig64 *)(base + 4) = this->original_size;
+  *(ub64 *)(base + 4) = this->original_size;
   compressed->write_to(base + 12);
 }
 
@@ -2513,10 +2519,10 @@ void RelocSection<E>::copy_buf(Context<E> &ctx) {
     RelaTy *buf = (RelaTy *)(ctx.buf + this->shdr.sh_offset) + offsets[i];
 
     InputSection<E> &isec = *output_section.members[i];
-    std::span<ElfRel<E>> rels = isec.get_rels(ctx);
+    std::span<const ElfRel<E>> rels = isec.get_rels(ctx);
 
     for (i64 j = 0; j < rels.size(); j++) {
-      ElfRel<E> &r = rels[j];
+      const ElfRel<E> &r = rels[j];
       Symbol<E> &sym = *isec.file.symbols[r.r_sym];
       memset(buf + j, 0, sizeof(RelaTy));
 
@@ -2571,12 +2577,12 @@ void RelocSection<E>::copy_buf(Context<E> &ctx) {
   template class VerneedSection<E>;                                     \
   template class VerdefSection<E>;                                      \
   template class BuildIdSection<E>;                                     \
+  template class NotePackageSection<E>;                                 \
   template class NotePropertySection<E>;                                \
   template class GdbIndexSection<E>;                                    \
   template class GabiCompressedSection<E>;                              \
   template class GnuCompressedSection<E>;                               \
   template class RelocSection<E>;                                       \
-  template i64 BuildId::size(Context<E> &) const;                       \
   template bool is_relro(Context<E> &, Chunk<E> *);
 
 INSTANTIATE_ALL;

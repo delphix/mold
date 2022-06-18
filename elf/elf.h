@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../inttypes.h"
+
 #include <cstdint>
 #include <ostream>
 #include <string>
@@ -62,6 +64,7 @@ static constexpr u32 SHT_PREINIT_ARRAY = 16;
 static constexpr u32 SHT_GROUP = 17;
 static constexpr u32 SHT_SYMTAB_SHNDX = 18;
 static constexpr u32 SHT_RELR = 19;
+static constexpr u32 SHT_LLVM_ADDRSIG = 0x6fff4c03;
 static constexpr u32 SHT_GNU_HASH = 0x6ffffff6;
 static constexpr u32 SHT_GNU_VERDEF = 0x6ffffffd;
 static constexpr u32 SHT_GNU_VERNEED = 0x6ffffffe;
@@ -80,6 +83,7 @@ static constexpr u32 SHF_LINK_ORDER = 0x80;
 static constexpr u32 SHF_GROUP = 0x200;
 static constexpr u32 SHF_TLS = 0x400;
 static constexpr u32 SHF_COMPRESSED = 0x800;
+static constexpr u32 SHF_GNU_RETAIN = 0x200000;
 static constexpr u32 SHF_EXCLUDE = 0x80000000;
 
 static constexpr u32 GRP_COMDAT = 1;
@@ -225,6 +229,7 @@ static constexpr u32 NT_GNU_HWCAP = 2;
 static constexpr u32 NT_GNU_BUILD_ID = 3;
 static constexpr u32 NT_GNU_GOLD_VERSION = 4;
 static constexpr u32 NT_GNU_PROPERTY_TYPE_0 = 5;
+static constexpr u32 NT_FDO_PACKAGING_METADATA = 0xcafe1a7e;
 
 static constexpr u32 GNU_PROPERTY_AARCH64_FEATURE_1_AND = 0xc0000000;
 static constexpr u32 GNU_PROPERTY_X86_FEATURE_1_AND = 0xc0000002;
@@ -1133,13 +1138,13 @@ struct Elf64Sym {
     return st_shndx == SHN_UNDEF && st_bind == STB_WEAK;
   }
 
-  u32 st_name;
+  ul32 st_name;
   u8 st_type : 4;
   u8 st_bind : 4;
   u8 st_visibility : 2;
-  u16 st_shndx;
-  u64 st_value;
-  u64 st_size;
+  ul16 st_shndx;
+  ul64 st_value;
+  ul64 st_size;
 };
 
 struct Elf32Sym {
@@ -1157,185 +1162,185 @@ struct Elf32Sym {
     return st_shndx == SHN_UNDEF && st_bind == STB_WEAK;
   }
 
-  u32 st_name;
-  u32 st_value;
-  u32 st_size;
+  ul32 st_name;
+  ul32 st_value;
+  ul32 st_size;
   u8 st_type : 4;
   u8 st_bind : 4;
   u8 st_visibility : 2;
-  u16 st_shndx;
+  ul16 st_shndx;
 };
 
 struct Elf64Shdr {
-  u32 sh_name;
-  u32 sh_type;
-  u64 sh_flags;
-  u64 sh_addr;
-  u64 sh_offset;
-  u64 sh_size;
-  u32 sh_link;
-  u32 sh_info;
-  u64 sh_addralign;
-  u64 sh_entsize;
+  ul32 sh_name;
+  ul32 sh_type;
+  ul64 sh_flags;
+  ul64 sh_addr;
+  ul64 sh_offset;
+  ul64 sh_size;
+  ul32 sh_link;
+  ul32 sh_info;
+  ul64 sh_addralign;
+  ul64 sh_entsize;
 };
 
 struct Elf32Shdr {
-  u32 sh_name;
-  u32 sh_type;
-  u32 sh_flags;
-  u32 sh_addr;
-  u32 sh_offset;
-  u32 sh_size;
-  u32 sh_link;
-  u32 sh_info;
-  u32 sh_addralign;
-  u32 sh_entsize;
+  ul32 sh_name;
+  ul32 sh_type;
+  ul32 sh_flags;
+  ul32 sh_addr;
+  ul32 sh_offset;
+  ul32 sh_size;
+  ul32 sh_link;
+  ul32 sh_info;
+  ul32 sh_addralign;
+  ul32 sh_entsize;
 };
 
 struct Elf64Ehdr {
   u8 e_ident[16];
-  u16 e_type;
-  u16 e_machine;
-  u32 e_version;
-  u64 e_entry;
-  u64 e_phoff;
-  u64 e_shoff;
-  u32 e_flags;
-  u16 e_ehsize;
-  u16 e_phentsize;
-  u16 e_phnum;
-  u16 e_shentsize;
-  u16 e_shnum;
-  u16 e_shstrndx;
+  ul16 e_type;
+  ul16 e_machine;
+  ul32 e_version;
+  ul64 e_entry;
+  ul64 e_phoff;
+  ul64 e_shoff;
+  ul32 e_flags;
+  ul16 e_ehsize;
+  ul16 e_phentsize;
+  ul16 e_phnum;
+  ul16 e_shentsize;
+  ul16 e_shnum;
+  ul16 e_shstrndx;
 };
 
 struct Elf32Ehdr {
   u8 e_ident[16];
-  u16 e_type;
-  u16 e_machine;
-  u32 e_version;
-  u32 e_entry;
-  u32 e_phoff;
-  u32 e_shoff;
-  u32 e_flags;
-  u16 e_ehsize;
-  u16 e_phentsize;
-  u16 e_phnum;
-  u16 e_shentsize;
-  u16 e_shnum;
-  u16 e_shstrndx;
+  ul16 e_type;
+  ul16 e_machine;
+  ul32 e_version;
+  ul32 e_entry;
+  ul32 e_phoff;
+  ul32 e_shoff;
+  ul32 e_flags;
+  ul16 e_ehsize;
+  ul16 e_phentsize;
+  ul16 e_phnum;
+  ul16 e_shentsize;
+  ul16 e_shnum;
+  ul16 e_shstrndx;
 };
 
 struct Elf64Phdr {
-  u32 p_type;
-  u32 p_flags;
-  u64 p_offset;
-  u64 p_vaddr;
-  u64 p_paddr;
-  u64 p_filesz;
-  u64 p_memsz;
-  u64 p_align;
+  ul32 p_type;
+  ul32 p_flags;
+  ul64 p_offset;
+  ul64 p_vaddr;
+  ul64 p_paddr;
+  ul64 p_filesz;
+  ul64 p_memsz;
+  ul64 p_align;
 };
 
 struct Elf32Phdr {
-  u32 p_type;
-  u32 p_offset;
-  u32 p_vaddr;
-  u32 p_paddr;
-  u32 p_filesz;
-  u32 p_memsz;
-  u32 p_flags;
-  u32 p_align;
+  ul32 p_type;
+  ul32 p_offset;
+  ul32 p_vaddr;
+  ul32 p_paddr;
+  ul32 p_filesz;
+  ul32 p_memsz;
+  ul32 p_flags;
+  ul32 p_align;
 };
 
 struct Elf64Rel {
-  u64 r_offset;
-  u32 r_type;
-  u32 r_sym;
+  ul64 r_offset;
+  ul32 r_type;
+  ul32 r_sym;
 };
 
 struct Elf32Rel {
-  u32 r_offset;
-  u32 r_type : 8;
-  u32 r_sym : 24;
+  ul32 r_offset;
+  u8 r_type;
+  ul24 r_sym;
 };
 
 struct Elf64Rela {
-  u64 r_offset;
-  u32 r_type;
-  u32 r_sym;
-  i64 r_addend;
+  ul64 r_offset;
+  ul32 r_type;
+  ul32 r_sym;
+  il64 r_addend;
 };
 
 struct Elf32Rela {
-  u32 r_offset;
-  u32 r_type : 8;
-  u32 r_sym : 24;
-  i32 r_addend;
+  ul32 r_offset;
+  u8 r_type;
+  ul24 r_sym;
+  il32 r_addend;
 };
 
 struct Elf64Dyn {
-  u64 d_tag;
-  u64 d_val;
+  ul64 d_tag;
+  ul64 d_val;
 };
 
 struct Elf32Dyn {
-  u32 d_tag;
-  u32 d_val;
+  ul32 d_tag;
+  ul32 d_val;
 };
 
 struct ElfVerneed {
-  u16 vn_version;
-  u16 vn_cnt;
-  u32 vn_file;
-  u32 vn_aux;
-  u32 vn_next;
+  ul16 vn_version;
+  ul16 vn_cnt;
+  ul32 vn_file;
+  ul32 vn_aux;
+  ul32 vn_next;
 };
 
 struct ElfVernaux {
-  u32 vna_hash;
-  u16 vna_flags;
-  u16 vna_other;
-  u32 vna_name;
-  u32 vna_next;
+  ul32 vna_hash;
+  ul16 vna_flags;
+  ul16 vna_other;
+  ul32 vna_name;
+  ul32 vna_next;
 };
 
 struct ElfVerdef {
-  u16 vd_version;
-  u16 vd_flags;
-  u16 vd_ndx;
-  u16 vd_cnt;
-  u32 vd_hash;
-  u32 vd_aux;
-  u32 vd_next;
+  ul16 vd_version;
+  ul16 vd_flags;
+  ul16 vd_ndx;
+  ul16 vd_cnt;
+  ul32 vd_hash;
+  ul32 vd_aux;
+  ul32 vd_next;
 };
 
 struct ElfVerdaux {
-  u32 vda_name;
-  u32 vda_next;
+  ul32 vda_name;
+  ul32 vda_next;
 };
 
 struct Elf64Chdr {
-  u32 ch_type;
-  u32 ch_reserved;
-  u64 ch_size;
-  u64 ch_addralign;
+  ul32 ch_type;
+  ul32 ch_reserved;
+  ul64 ch_size;
+  ul64 ch_addralign;
 };
 
 struct Elf32Chdr {
-  u32 ch_type;
-  u32 ch_size;
-  u32 ch_addralign;
+  ul32 ch_type;
+  ul32 ch_size;
+  ul32 ch_addralign;
 };
 
 struct ElfNhdr {
-  u32 n_namesz;
-  u32 n_descsz;
-  u32 n_type;
+  ul32 n_namesz;
+  ul32 n_descsz;
+  ul32 n_type;
 };
 
 struct X86_64 {
-  using WordTy = u64;
+  using WordTy = ul64;
 
   static constexpr u32 R_NONE = R_X86_64_NONE;
   static constexpr u32 R_COPY = R_X86_64_COPY;
@@ -1366,7 +1371,7 @@ template <> struct ElfDyn<X86_64> : public Elf64Dyn {};
 template <> struct ElfChdr<X86_64> : public Elf64Chdr {};
 
 struct I386 {
-  using WordTy = u32;
+  using WordTy = ul32;
 
   static constexpr u32 R_NONE = R_386_NONE;
   static constexpr u32 R_COPY = R_386_COPY;
@@ -1397,7 +1402,7 @@ template <> struct ElfDyn<I386> : public Elf32Dyn {};
 template <> struct ElfChdr<I386> : public Elf32Chdr {};
 
 struct ARM64 {
-  using WordTy = u64;
+  using WordTy = ul64;
 
   static constexpr u32 R_NONE = R_AARCH64_NONE;
   static constexpr u32 R_COPY = R_AARCH64_COPY;
@@ -1428,7 +1433,7 @@ template <> struct ElfDyn<ARM64> : public Elf64Dyn {};
 template <> struct ElfChdr<ARM64> : public Elf64Chdr {};
 
 struct ARM32 {
-  using WordTy = u32;
+  using WordTy = ul32;
 
   static constexpr u32 R_NONE = R_ARM_NONE;
   static constexpr u32 R_COPY = R_ARM_COPY;
@@ -1459,7 +1464,7 @@ template <> struct ElfDyn<ARM32> : public Elf32Dyn {};
 template <> struct ElfChdr<ARM32> : public Elf32Chdr {};
 
 struct RISCV64 {
-  using WordTy = u64;
+  using WordTy = ul64;
 
   static constexpr u32 R_NONE = R_RISCV_NONE;
   static constexpr u32 R_COPY = R_RISCV_COPY;
