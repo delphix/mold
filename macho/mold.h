@@ -1,15 +1,29 @@
 #pragma once
 
 #include "macho.h"
+#include "lto.h"
 #include "../mold.h"
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <tbb/concurrent_hash_map.h>
 #include <tbb/spin_mutex.h>
+#include <tbb/task_group.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
+
+#if MOLD_DEBUG_X86_64_ONLY
+# define INSTANTIATE_ALL INSTANTIATE(X86_64)
+#elif MOLD_DEBUG_ARM64_ONLY
+# define INSTANTIATE_ALL INSTANTIATE(ARM64)
+#else
+# define INSTANTIATE_ALL                        \
+  INSTANTIATE(X86_64);                          \
+  INSTANTIATE(ARM64);
+#endif
 
 namespace mold::macho {
 
@@ -24,7 +38,7 @@ template <typename E> struct Context;
 template <typename E> struct Symbol;
 
 //
-// object-file.cc
+// input-files.cc
 //
 
 template <typename E>
@@ -32,108 +46,133 @@ struct Relocation {
   u32 offset = 0;
   u8 type = -1;
   u8 p2size = 0;
-  bool is_pcrel = false;
+  bool is_pcrel : 1 = false;
+  bool needs_dynrel : 1 = false;
   i64 addend = 0;
   Symbol<E> *sym = nullptr;
   Subsection<E> *subsec = nullptr;
+
+  // For range extension thunks
+  i32 thunk_idx = -1;
+  i32 thunk_sym_idx = -1;
 };
+
+template <typename E>
+std::ostream &operator<<(std::ostream &out, const Relocation<E> &rel) {
+  out << rel_to_string<E>(rel.type);
+  return out;
+}
 
 template <typename E>
 struct UnwindRecord {
   UnwindRecord(u32 len, u32 enc) : code_len(len), encoding(enc) {}
 
-  inline u64 get_func_raddr(Context<E> &ctx) const;
+  u64 get_func_addr(Context<E> &ctx) const {
+    return subsec->get_addr(ctx) + offset;
+  }
 
   Subsection<E> *subsec = nullptr;
-  u32 offset = 0;
-  u32 code_len;
-  u32 encoding;
   Symbol<E> *personality = nullptr;
   Subsection<E> *lsda = nullptr;
+  u32 offset = 0;
+  u32 code_len = 0;
+  u32 encoding = 0;
   u32 lsda_offset = 0;
-  bool is_alive = false;
 };
 
 template <typename E>
 class InputFile {
 public:
   virtual ~InputFile() = default;
+  virtual void resolve_symbols(Context<E> &ctx) = 0;
+
+  void clear_symbols();
 
   MappedFile<Context<E>> *mf = nullptr;
+  std::string_view filename;
   std::vector<Symbol<E> *> syms;
   i64 priority = 0;
   std::atomic_bool is_alive = false;
+  bool is_dylib = false;
+  bool is_hidden = false;
+  bool is_weak = false;
   std::string archive_name;
 
-  virtual bool is_dylib() const = 0;
-
 protected:
-  InputFile() = default;
+  InputFile(MappedFile<Context<E>> *mf) : mf(mf), filename(mf->name) {}
+  InputFile() : filename("<internal>") {}
 };
 
 template <typename E>
 class ObjectFile : public InputFile<E> {
 public:
   ObjectFile() = default;
+  ObjectFile(MappedFile<Context<E>> *mf) : InputFile<E>(mf) {}
 
   static ObjectFile *create(Context<E> &ctx, MappedFile<Context<E>> *mf,
                             std::string archive_name);
-  bool is_dylib() const override { return false; }
   void parse(Context<E> &ctx);
   Subsection<E> *find_subsection(Context<E> &ctx, u32 addr);
+  Symbol<E> *find_symbol(Context<E> &ctx, u32 addr);
+  std::vector<std::string> get_linker_options(Context<E> &ctx);
   void parse_compact_unwind(Context<E> &ctx, MachSection &hdr);
-  void resolve_regular_symbols(Context<E> &ctx);
-  void resolve_lazy_symbols(Context<E> &ctx);
+  void resolve_symbols(Context<E> &ctx) override;
   bool is_objc_object(Context<E> &ctx);
-  std::vector<ObjectFile *> mark_live_objects(Context<E> &ctx);
+  void mark_live_objects(Context<E> &ctx,
+                         std::function<void(ObjectFile<E> *)> feeder);
   void convert_common_symbols(Context<E> &ctx);
   void check_duplicate_symbols(Context<E> &ctx);
 
   Relocation<E> read_reloc(Context<E> &ctx, const MachSection &hdr, MachRel r);
 
   std::vector<std::unique_ptr<InputSection<E>>> sections;
-  std::vector<std::unique_ptr<Subsection<E>>> subsections;
-  std::vector<u32> sym_to_subsec;
+  std::vector<Subsection<E> *> subsections;
+  std::vector<Subsection<E> *> sym_to_subsec;
   std::span<MachSym> mach_syms;
   std::vector<Symbol<E>> local_syms;
   std::vector<UnwindRecord<E>> unwind_records;
   std::span<DataInCodeEntry> data_in_code_entries;
+  LTOModule *lto_module = nullptr;
+
+  // For the internal file and LTO object files
+  std::vector<MachSym> mach_syms2;
 
 private:
   void parse_sections(Context<E> &ctx);
-  void parse_symtab(Context<E> &ctx);
-  void split_subsections(Context<E> &ctx);
+  void parse_symbols(Context<E> &ctx);
+  void split_subsections_via_symbols(Context<E> &ctx);
+  void init_subsections(Context<E> &ctx);
+  void fix_subsec_members(Context<E> &ctx);
   void parse_data_in_code(Context<E> &ctx);
   LoadCommand *find_load_command(Context<E> &ctx, u32 type);
-  i64 find_subsection_idx(Context<E> &ctx, u32 addr);
-  void override_symbol(Context<E> &ctx, i64 symidx);
   InputSection<E> *get_common_sec(Context<E> &ctx);
+  void parse_lto_symbols(Context<E> &ctx);
 
   MachSection *unwind_sec = nullptr;
   std::unique_ptr<MachSection> common_hdr;
   InputSection<E> *common_sec = nullptr;
+  std::vector<Subsection<E> *> subsec_pool;
 };
 
 template <typename E>
 class DylibFile : public InputFile<E> {
 public:
   static DylibFile *create(Context<E> &ctx, MappedFile<Context<E>> *mf);
-  void parse(Context<E> &ctx);
-  void resolve_symbols(Context<E> &ctx);
+
+  void parse_tapi(Context<E> &ctx);
+  void parse_dylib(Context<E> &ctx);
+  void resolve_symbols(Context<E> &ctx) override;
 
   std::string_view install_name;
   i64 dylib_idx = 0;
-  std::atomic_bool is_needed = false;
-
-  bool is_dylib() const override { return true; }
+  std::vector<std::string_view> reexported_libs;
 
 private:
-  void parse_dylib(Context<E> &ctx);
   void read_trie(Context<E> &ctx, u8 *start, i64 offset = 0,
                  const std::string &prefix = "");
 
-  DylibFile() {
-    this->is_alive = true;
+  DylibFile(MappedFile<Context<E>> *mf) : InputFile<E>(mf) {
+    this->is_dylib = true;
   }
 };
 
@@ -187,13 +226,17 @@ public:
   u32 input_offset = 0;
   u32 input_size = 0;
   u32 input_addr = 0;
+  u32 output_offset = -1;
   u32 rel_offset = 0;
   u32 nrels = 0;
   u32 unwind_offset = 0;
   u32 nunwind = 0;
-  u32 raddr = -1;
-  u16 p2align = 0;
-  std::atomic_bool is_alive = false;
+  Subsection<E> *replacer; // Used if is_coalesced is true
+
+  std::atomic_uint8_t p2align = 0;
+  std::atomic_bool is_alive = true;
+  bool is_coalesced : 1 = false;
+  bool added_to_osec : 1 = false;
 };
 
 template <typename E>
@@ -205,9 +248,16 @@ read_relocations(Context<E> &ctx, ObjectFile<E> &file, const MachSection &hdr);
 //
 
 enum {
-  NEEDS_GOT        = 1 << 0,
-  NEEDS_STUB       = 1 << 1,
-  NEEDS_THREAD_PTR = 1 << 2,
+  NEEDS_GOT              = 1 << 0,
+  NEEDS_STUB             = 1 << 1,
+  NEEDS_THREAD_PTR       = 1 << 2,
+  NEEDS_RANGE_EXTN_THUNK = 1 << 3,
+};
+
+enum {
+  SCOPE_LOCAL,          // input file scope
+  SCOPE_PRIVATE_EXTERN, // output file scope (non-exported symbol)
+  SCOPE_EXTERN,         // global scope (exported symbol)
 };
 
 template <typename E>
@@ -229,10 +279,15 @@ struct Symbol {
 
   std::atomic_uint8_t flags = 0;
 
-  u8 is_extern : 1 = false;
-  u8 is_lazy : 1 = false;
-  u8 is_common : 1 = false;
-  u8 referenced_dynamically : 1 = false;
+  u8 scope : 2 = SCOPE_LOCAL;
+  bool is_common : 1 = false;
+  bool is_weak_def : 1 = false;
+  bool is_imported : 1 = false;
+  bool referenced_dynamically : 1 = false;
+
+  // For range extension thunks
+  i32 thunk_idx = -1;
+  i32 thunk_sym_idx = -1;
 
   inline u64 get_addr(Context<E> &ctx) const;
   inline u64 get_got_addr(Context<E> &ctx) const;
@@ -241,6 +296,14 @@ struct Symbol {
 
 template <typename E>
 std::ostream &operator<<(std::ostream &out, const Symbol<E> &sym);
+
+// This operator defines a total order over symbols. This is used to
+// make the output deterministic.
+template <typename E>
+inline bool operator<(const Symbol<E> &a, const Symbol<E> &b) {
+  return std::tuple{a.file->priority, a.value} <
+         std::tuple{b.file->priority, b.value};
+}
 
 //
 // output-chunks.cc
@@ -253,14 +316,15 @@ public:
   get_instance(Context<E> &ctx, std::string_view name);
 
   void set_offset(Context<E> &ctx, i64 fileoff, u64 vmaddr);
-  void copy_buf(Context<E> &ctx);
 
-  std::string_view name;
   SegmentCommand cmd = {};
   i32 seg_idx = -1;
   std::vector<Chunk<E> *> chunks;
 
 private:
+  void set_offset_regular(Context<E> &ctx, i64 fileoff, u64 vmaddr);
+  void set_offset_linkedit(Context<E> &ctx, i64 fileoff, u64 vmaddr);
+
   OutputSegment(std::string_view name);
 };
 
@@ -277,7 +341,7 @@ public:
   MachSection hdr = {};
   u32 sect_idx = 0;
   bool is_hidden = false;
-  bool is_regular = false;
+  bool is_output_section = false;
 };
 
 template <typename E>
@@ -296,6 +360,28 @@ public:
 };
 
 template <typename E>
+class RangeExtensionThunk {};
+
+template <>
+class RangeExtensionThunk<ARM64> {
+public:
+  RangeExtensionThunk(OutputSection<ARM64> &osec)
+    : output_section(osec) {}
+
+  i64 size() const { return symbols.size() * ENTRY_SIZE; }
+  u64 get_addr(i64 idx) const;
+  void copy_buf(Context<ARM64> &ctx);
+
+  static constexpr i64 ENTRY_SIZE = 12;
+
+  OutputSection<ARM64> &output_section;
+  i32 thunk_idx = -1;
+  i64 offset = -1;
+  std::mutex mu;
+  std::vector<Symbol<ARM64> *> symbols;
+};
+
+template <typename E>
 class OutputSection : public Chunk<E> {
 public:
   static OutputSection<E> *
@@ -305,7 +391,7 @@ public:
   OutputSection(Context<E> &ctx, std::string_view segname,
                 std::string_view sectname)
     : Chunk<E>(ctx, segname, sectname) {
-    this->is_regular = true;
+    this->is_output_section = true;
   }
 
   void compute_size(Context<E> &ctx) override;
@@ -316,9 +402,13 @@ public:
     this->hdr.p2align = std::max<u32>(this->hdr.p2align, subsec->p2align);
     this->hdr.attr |= subsec->isec.hdr.attr;
     this->hdr.type = subsec->isec.hdr.type;
+
+    assert(!subsec->added_to_osec);
+    subsec->added_to_osec = true;
   }
 
   std::vector<Subsection<E> *> members;
+  std::vector<std::unique_ptr<RangeExtensionThunk<E>>> thunks;
 };
 
 class RebaseEncoder {
@@ -337,9 +427,9 @@ private:
 };
 
 template <typename E>
-class OutputRebaseSection : public Chunk<E> {
+class RebaseSection : public Chunk<E> {
 public:
-  OutputRebaseSection(Context<E> &ctx)
+  RebaseSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__LINKEDIT", "__rebase") {
     this->is_hidden = true;
   }
@@ -353,14 +443,14 @@ public:
 class BindEncoder {
 public:
   BindEncoder();
-  void add(i64 dylib_idx, std::string_view sym, i64 flags, i64 seg_idx,
-           i64 offset);
+
+  template <typename E> void add(Symbol<E> &sym, i64 seg_idx, i64 offset);
   void finish();
 
   std::vector<u8> buf;
 
 private:
-  std::string_view last_sym;
+  std::string_view last_name;
   i64 last_flags = -1;
   i64 last_dylib = -1;
   i64 last_seg = -1;
@@ -368,9 +458,9 @@ private:
 };
 
 template <typename E>
-class OutputBindSection : public Chunk<E> {
+class BindSection : public Chunk<E> {
 public:
-  OutputBindSection(Context<E> &ctx)
+  BindSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__LINKEDIT", "__binding") {
     this->is_hidden = true;
   }
@@ -382,15 +472,15 @@ public:
 };
 
 template <typename E>
-class OutputLazyBindSection : public Chunk<E> {
+class LazyBindSection : public Chunk<E> {
 public:
-  OutputLazyBindSection(Context<E> &ctx)
+  LazyBindSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__LINKEDIT", "__lazy_binding") {
     this->is_hidden = true;
-    this->hdr.p2align = std::countr_zero(8U);
+    this->hdr.p2align = 3;
   }
 
-  void add(Context<E> &ctx, Symbol<E> &sym, i64 flags);
+  void add(Context<E> &ctx, Symbol<E> &sym);
 
   void compute_size(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
@@ -400,14 +490,8 @@ public:
 
 class ExportEncoder {
 public:
-  void add(std::string_view name, u32 flags, u64 addr);
   i64 finish();
 
-  void write_trie(u8 *buf) {
-    write_trie(buf, root);
-  }
-
-private:
   struct Entry {
     std::string_view name;
     u32 flags;
@@ -416,15 +500,16 @@ private:
 
   struct TrieNode {
     std::string_view prefix;
-    bool is_leaf = false;
-    u32 flags = 0;
+    std::vector<std::unique_ptr<TrieNode>> children;
     u64 addr = 0;
+    u32 flags = 0;
     u32 offset = -1;
-    std::vector<TrieNode> children;
+    bool is_leaf = false;
   };
 
-  static i64 common_prefix_len(std::span<Entry> entries, i64 len);
-  static TrieNode construct_trie(std::span<Entry> entries, i64 len);
+  void construct_trie(TrieNode &node, std::span<Entry> entries, i64 len,
+                      tbb::task_group *tg, i64 grain_size, bool divide);
+
   static i64 set_offset(TrieNode &node, i64 offset);
   void write_trie(u8 *buf, TrieNode &node);
 
@@ -433,9 +518,9 @@ private:
 };
 
 template <typename E>
-class OutputExportSection : public Chunk<E> {
+class ExportSection : public Chunk<E> {
 public:
-  OutputExportSection(Context<E> &ctx)
+  ExportSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__LINKEDIT", "__export") {
     this->is_hidden = true;
   }
@@ -448,9 +533,9 @@ private:
 };
 
 template <typename E>
-class OutputFunctionStartsSection : public Chunk<E> {
+class FunctionStartsSection : public Chunk<E> {
 public:
-  OutputFunctionStartsSection(Context<E> &ctx)
+  FunctionStartsSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__LINKEDIT", "__func_starts") {
     this->is_hidden = true;
   }
@@ -462,63 +547,34 @@ public:
 };
 
 template <typename E>
-class OutputSymtabSection : public Chunk<E> {
+class SymtabSection : public Chunk<E> {
 public:
-  OutputSymtabSection(Context<E> &ctx)
+  SymtabSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__LINKEDIT", "__symbol_table") {
     this->is_hidden = true;
-    this->hdr.p2align = std::countr_zero(8U);
+    this->hdr.p2align = 3;
   }
 
   void compute_size(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
 
-  struct Entry {
-    Symbol<E> *sym;
-    i64 stroff;
-  };
+  std::vector<i64> symtab_offsets;
+  std::vector<i64> strtab_offsets;
 
-  std::vector<Entry> locals;
-  std::vector<Entry> globals;
-  std::vector<Entry> undefs;
+  i64 num_locals = 0;
+  i64 num_globals = 0;
+  i64 num_undefs =0;
 };
 
 template <typename E>
-class OutputStrtabSection : public Chunk<E> {
+class StrtabSection : public Chunk<E> {
 public:
-  OutputStrtabSection(Context<E> &ctx)
+  StrtabSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__LINKEDIT", "__string_table") {
     this->is_hidden = true;
-    this->hdr.p2align = std::countr_zero(8U);
+    this->hdr.p2align = 3;
+    this->hdr.size = 1;
   }
-
-  i64 add_string(std::string_view str);
-  void compute_size(Context<E> &ctx) override;
-  void copy_buf(Context<E> &ctx) override;
-
-  std::string contents{1, '\0'};
-};
-
-template <typename E>
-class OutputIndirectSymtabSection : public Chunk<E> {
-public:
-  OutputIndirectSymtabSection(Context<E> &ctx)
-    : Chunk<E>(ctx, "__LINKEDIT", "__ind_sym_tab") {
-    this->is_hidden = true;
-  }
-
-  static constexpr i64 ENTRY_SIZE = 4;
-
-  void compute_size(Context<E> &ctx) override;
-  void copy_buf(Context<E> &ctx) override;
-
-  struct Entry {
-    Symbol<E> *sym;
-    i64 symtab_idx;
-  };
-
-  std::vector<Entry> stubs;
-  std::vector<Entry> gots;
 };
 
 template <typename E>
@@ -558,6 +614,7 @@ public:
     this->hdr.p2align = std::countr_zero(2U);
     this->hdr.type = S_SYMBOL_STUBS;
     this->hdr.attr = S_ATTR_SOME_INSTRUCTIONS | S_ATTR_PURE_INSTRUCTIONS;
+    this->hdr.reserved1 = 0;
     this->hdr.reserved2 = E::stub_size;
   }
 
@@ -581,20 +638,6 @@ public:
 };
 
 template <typename E>
-class UnwindEncoder {
-public:
-  std::vector<u8> encode(Context<E> &ctx, std::span<UnwindRecord<E>> records);
-
-private:
-  u32 encode_personality(Context<E> &ctx, Symbol<E> *sym);
-
-  std::vector<std::span<UnwindRecord<E>>>
-  split_records(Context<E> &ctx, std::span<UnwindRecord<E>>);
-
-  std::vector<Symbol<E> *> personalities;
-};
-
-template <typename E>
 class UnwindInfoSection : public Chunk<E> {
 public:
   UnwindInfoSection(Context<E> &ctx)
@@ -612,7 +655,7 @@ template <typename E>
 class GotSection : public Chunk<E> {
 public:
   GotSection(Context<E> &ctx) : Chunk<E>(ctx, "__DATA_CONST", "__got") {
-    this->hdr.p2align = std::countr_zero(8U);
+    this->hdr.p2align = 3;
     this->hdr.type = S_NON_LAZY_SYMBOL_POINTERS;
   }
 
@@ -620,6 +663,7 @@ public:
   void copy_buf(Context<E> &ctx) override;
 
   std::vector<Symbol<E> *> syms;
+  std::vector<Subsection<E> *> subsections;
 };
 
 template <typename E>
@@ -627,7 +671,7 @@ class LazySymbolPtrSection : public Chunk<E> {
 public:
   LazySymbolPtrSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__DATA", "__la_symbol_ptr") {
-    this->hdr.p2align = std::countr_zero(8U);
+    this->hdr.p2align = 3;
     this->hdr.type = S_LAZY_SYMBOL_POINTERS;
   }
 
@@ -639,7 +683,7 @@ class ThreadPtrsSection : public Chunk<E> {
 public:
   ThreadPtrsSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__DATA", "__thread_ptrs") {
-    this->hdr.p2align = std::countr_zero(8U);
+    this->hdr.p2align = 3;
     this->hdr.type = S_THREAD_LOCAL_VARIABLE_POINTERS;
   }
 
@@ -649,42 +693,26 @@ public:
   std::vector<Symbol<E> *> syms;
 };
 
+template <typename E>
+class SectCreateSection : public Chunk<E> {
+public:
+  SectCreateSection(Context<E> &ctx, std::string_view seg, std::string_view sect,
+                    std::string_view contents)
+    : Chunk<E>(ctx, seg, sect), contents(contents) {
+    this->hdr.size = contents.size();
+  }
+
+  void copy_buf(Context<E> &ctx) override;
+
+  std::string_view contents;
+};
+
 //
 // mapfile.cc
 //
 
 template <typename E>
 void print_map(Context<E> &ctx);
-
-//
-// dumper.cc
-//
-
-void dump_file(std::string path);
-
-//
-// output-file.cc
-//
-
-template <typename E>
-class OutputFile {
-public:
-  static std::unique_ptr<OutputFile>
-  open(Context<E> &ctx, std::string path, i64 filesize, i64 perm);
-
-  virtual void close(Context<E> &ctx) = 0;
-  virtual ~OutputFile() {}
-
-  u8 *buf = nullptr;
-  std::string path;
-  i64 filesize;
-  bool is_mmapped;
-  bool is_unmapped = false;
-
-protected:
-  OutputFile(std::string path, i64 filesize, bool is_mmapped)
-    : path(path), filesize(filesize), is_mmapped(is_mmapped) {}
-};
 
 //
 // yaml.cc
@@ -709,12 +737,10 @@ parse_yaml(std::string_view str);
 //
 
 struct TextDylib {
-  std::string_view uuid;
   std::string_view install_name;
-  std::string_view current_version = "1.0";
-  std::string_view parent_umbrella;
   std::vector<std::string_view> reexported_libs;
   std::vector<std::string_view> exports;
+  std::vector<std::string_view> weak_exports;
 };
 
 template <typename E>
@@ -725,8 +751,7 @@ TextDylib parse_tbd(Context<E> &ctx, MappedFile<Context<E>> *mf);
 //
 
 template <typename E>
-void parse_nonpositional_args(Context<E> &ctx,
-                              std::vector<std::string> &remaining);
+std::vector<std::string> parse_nonpositional_args(Context<E> &ctx);
 
 //
 // dead-strip.cc
@@ -736,8 +761,32 @@ template <typename E>
 void dead_strip(Context<E> &ctx);
 
 //
+// lto.cc
+//
+
+template <typename E>
+void load_lto_plugin(Context<E> &ctx);
+
+template <typename E>
+void do_lto(Context<E> &ctx);
+
+//
+// arch-arm64.cc
+//
+
+void create_range_extension_thunks(Context<ARM64> &ctx, OutputSection<ARM64> &osec);
+
+//
 // main.cc
 //
+
+enum UuidKind { UUID_NONE, UUID_HASH, UUID_RANDOM };
+
+struct SectCreateOption {
+  std::string_view segname;
+  std::string_view sectname;
+  std::string_view filename;
+};
 
 template <typename E>
 struct Context {
@@ -769,49 +818,83 @@ struct Context {
 
   // Command-line arguments
   struct {
+    MultiGlob exported_symbols_list;
+    MultiGlob unexported_symbols_list;
+    Symbol<E> *entry = nullptr;
+    UuidKind uuid = UUID_HASH;
     bool ObjC = false;
-    bool adhoc_codesign = true;
+    bool adhoc_codesign = std::is_same_v<E, ARM64>;
     bool color_diagnostics = false;
-    bool dead_strip = true;
+    bool dead_strip = false;
     bool dead_strip_dylibs = false;
     bool deduplicate = true;
-    bool demangle = false;
+    bool demangle = true;
     bool dylib = false;
     bool dynamic = true;
+    bool export_dynamic = false;
     bool fatal_warnings = false;
     bool noinhibit_exec = false;
+    bool perf = false;
+    bool quick_exit = true;
+    bool search_paths_first = true;
+    bool stats = false;
     bool trace = false;
     i64 arch = CPU_TYPE_ARM64;
+    i64 compatibility_version = 0;
+    i64 current_version = 0;
+    i64 filler = 0;
     i64 headerpad = 256;
     i64 pagezero_size = 0;
     i64 platform = PLATFORM_MACOS;
     i64 platform_min_version = 0;
     i64 platform_sdk_version = 0;
+    i64 stack_size = 0;
+    i64 thread_count = 0;
     std::string chroot;
-    std::string entry = "_main";
+    std::string final_output;
+    std::string install_name;
+    std::string lto_library;
     std::string map;
+    std::string object_path_lto;
     std::string output = "a.out";
+    std::vector<SectCreateOption> sectcreate;
+    std::vector<std::string> U;
     std::vector<std::string> framework_paths;
     std::vector<std::string> library_paths;
+    std::vector<std::string> mllvm;
+    std::vector<std::string> order_file;
     std::vector<std::string> rpath;
     std::vector<std::string> syslibroot;
+    std::vector<std::string> u;
   } arg;
 
   std::vector<std::string_view> cmdline_args;
   u32 output_type = MH_EXECUTE;
+  i64 file_priority = 10000;
+  bool all_load = false;
+  bool needed_l = false;
+  bool hidden_l = false;
+  bool weak_l = false;
+  std::unordered_set<std::string_view> loaded_archives;
 
+  u8 uuid[16] = {};
   bool has_error = false;
+  u64 tls_begin = 0;
 
-  tbb::concurrent_hash_map<std::string_view, Symbol<E>> symbol_map;
+  LTOPlugin lto = {};
+  std::once_flag lto_plugin_loaded;
 
-  std::unique_ptr<OutputFile<E>> output_file;
+  tbb::concurrent_hash_map<std::string_view, Symbol<E>, HashCmp> symbol_map;
+
+  std::unique_ptr<OutputFile<Context<E>>> output_file;
   u8 *buf;
+  bool overwrite_output_file = false;
 
   tbb::concurrent_vector<std::unique_ptr<ObjectFile<E>>> obj_pool;
   tbb::concurrent_vector<std::unique_ptr<DylibFile<E>>> dylib_pool;
   tbb::concurrent_vector<std::unique_ptr<u8[]>> string_pool;
   tbb::concurrent_vector<std::unique_ptr<MappedFile<Context<E>>>> mf_pool;
-  std::vector<std::unique_ptr<OutputSection<E>>> osec_pool;
+  std::vector<std::unique_ptr<Chunk<E>>> chunk_pool;
 
   tbb::concurrent_vector<std::unique_ptr<TimerRecord>> timer_records;
 
@@ -832,18 +915,17 @@ struct Context {
   UnwindInfoSection<E> unwind_info{*this};
   GotSection<E> got{*this};
   LazySymbolPtrSection<E> lazy_symbol_ptr{*this};
-  CodeSignatureSection<E> code_sig{*this};
   DataInCodeSection<E> data_in_code{*this};
   ThreadPtrsSection<E> thread_ptrs{*this};
+  RebaseSection<E> rebase{*this};
+  BindSection<E> bind{*this};
+  LazyBindSection<E> lazy_bind{*this};
+  ExportSection<E> export_{*this};
+  FunctionStartsSection<E> function_starts{*this};
+  SymtabSection<E> symtab{*this};
+  StrtabSection<E> strtab{*this};
 
-  OutputRebaseSection<E> rebase{*this};
-  OutputBindSection<E> bind{*this};
-  OutputLazyBindSection<E> lazy_bind{*this};
-  OutputExportSection<E> export_{*this};
-  OutputFunctionStartsSection<E> function_starts{*this};
-  OutputSymtabSection<E> symtab{*this};
-  OutputIndirectSymtabSection<E> indir_symtab{*this};
-  OutputStrtabSection<E> strtab{*this};
+  std::unique_ptr<CodeSignatureSection<E>> code_sig;
 
   OutputSection<E> *text = nullptr;
   OutputSection<E> *data = nullptr;
@@ -867,13 +949,15 @@ std::ostream &operator<<(std::ostream &out, const InputSection<E> &sec) {
 
 template <typename E>
 u64 Subsection<E>::get_addr(Context<E> &ctx) const {
-  return ctx.arg.pagezero_size + raddr;
+  return isec.osec.hdr.addr + output_offset;
 }
 
 template <typename E>
 u64 Symbol<E>::get_addr(Context<E> &ctx) const {
-  if (subsec)
+  if (subsec) {
+    assert(subsec->is_alive);
     return subsec->get_addr(ctx) + value;
+  }
   if (stub_idx != -1)
     return ctx.stubs.hdr.addr + stub_idx * E::stub_size;
   return value;
@@ -900,7 +984,10 @@ inline Symbol<E> *get_symbol(Context<E> &ctx, std::string_view name) {
 
 template <typename E>
 inline std::ostream &operator<<(std::ostream &out, const Symbol<E> &sym) {
-  out << sym.name;
+  if (opt_demangle && sym.name.starts_with("__Z"))
+    out << demangle(sym.name.substr(1));
+  else
+    out << sym.name;
   return out;
 }
 
@@ -912,9 +999,8 @@ Chunk<E>::Chunk(Context<E> &ctx, std::string_view segname,
   hdr.set_sectname(sectname);
 }
 
-template <typename E>
-u64 UnwindRecord<E>::get_func_raddr(Context<E> &ctx) const {
-  return subsec->raddr + offset;
+inline u64 RangeExtensionThunk<ARM64>::get_addr(i64 idx) const {
+  return output_section.hdr.addr + offset + idx * ENTRY_SIZE;
 }
 
 } // namespace mold::macho

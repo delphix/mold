@@ -405,9 +405,6 @@ void parse_dynamic_list(Context<E> &ctx, std::string path) {
   template                                                              \
   void parse_dynamic_list(Context<E> &ctx, std::string path)
 
-INSTANTIATE(X86_64);
-INSTANTIATE(I386);
-INSTANTIATE(ARM64);
-INSTANTIATE(RISCV64);
+INSTANTIATE_ALL;
 
 } // namespace mold::elf

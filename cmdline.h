@@ -48,6 +48,7 @@ read_response_file(C &ctx, std::string_view path) {
   return vec;
 }
 
+// Replace "@path/to/some/text/file" with its file contents.
 template <typename C>
 std::vector<std::string_view> expand_response_files(C &ctx, char **argv) {
   std::vector<std::string_view> vec;
@@ -58,6 +59,18 @@ std::vector<std::string_view> expand_response_files(C &ctx, char **argv) {
       vec.push_back(argv[i]);
   }
   return vec;
+}
+
+static std::string_view string_trim(std::string_view str) {
+  size_t pos = str.find_first_not_of(" \t");
+  if (pos == str.npos)
+    return "";
+  str = str.substr(pos);
+
+  pos = str.find_last_not_of(" \t");
+  if (pos == str.npos)
+    return str;
+  return str.substr(0, pos + 1);
 }
 
 } // namespace mold

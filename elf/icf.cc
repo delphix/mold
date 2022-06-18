@@ -40,22 +40,35 @@
 // regular trees are equal. Given this formulation, we want to find as
 // many identical vertices as possible.
 //
-// Solving such problem is computationally intensive, but mold is quite fast.
-// For Chromium, mold's ICF finishes in less than 1 second with 20 threads.
-// This is contrary to lld and gold, which take about 5 and 50 seconds to
-// run ICF under the same condition, respectively.
+// Just like a lot of problems with graph, this problem doesn't have a
+// straightforward "optimal" solution, and we need to resort to heuristics.
 //
-// mold's ICF is faster because we are using a better algorithm.
-// It's actually me who developed and implemented the lld's ICF algorithm,
-// and I can say that mold's algorithm is better than that in all aspects.
-// It scales better for number of available cores, require less overall
-// computation, and has a smaller working set. So, it's better with a single
-// thread and even better with multiple threads.
+// mold approaches this problem by hashing program trees with increasing depth
+// on each iteration.
+// For example, when we start, we only hash individual functions with
+// their call into other functions omitted. From the second iteration, we
+// put the function they call into the hash by appending the hash of those
+// functions from the previous iteration. This means that the nth iteration
+// hashes call chain up to (n-1) levels deep.
+// We use a cryptographic hash function, so the unique number of hashes will
+// only monotonically increase as we take into account of deeper trees with
+// iterations (otherwise, that means we have found a hash collision). We stop
+// when the unique number of hashes stop increasing; this is based on the fact
+// that once we observe an iteration with the same amount of unique hashes as
+// the previous iteration, it will remain unchanged for further iterations.
+// This is provable, but here we omit the proof for brevity.
+//
+// When compared to other approaches, mold's approach has a relatively cheaper
+// cost per iteration, and as a bonus, is highly parallelizable.
+// For Chromium, mold's ICF finishes in less than 1 second with 20 threads,
+// whereas lld takes 5 seconds and gold takes 50 seconds under the same
+// conditions.
 
 #include "mold.h"
 #include "../sha.h"
 
 #include <array>
+#include <cstdio>
 #include <tbb/concurrent_unordered_map.h>
 #include <tbb/concurrent_vector.h>
 #include <tbb/enumerable_thread_specific.h>
@@ -73,6 +86,13 @@ template<> struct hash<Digest> {
     return *(int64_t *)&k[0];
   }
 };
+
+std::string to_string(Digest digest) {
+  char buf[HASH_SIZE * 2];
+  for (int i = 0; i < HASH_SIZE; i++)
+    sprintf(buf + i * 2, "%02x", digest[i]);
+  return {buf, sizeof(buf)};
+}
 }
 
 namespace mold::elf {
@@ -98,12 +118,13 @@ static void uniquify_cies(Context<E> &ctx) {
 }
 
 template <typename E>
-static bool is_eligible(InputSection<E> &isec) {
+static bool is_eligible(Context<E> &ctx, InputSection<E> &isec) {
   const ElfShdr<E> &shdr = isec.shdr();
   std::string_view name = isec.name();
 
   bool is_alloc = (shdr.sh_flags & SHF_ALLOC);
-  bool is_executable = (shdr.sh_flags & SHF_EXECINSTR);
+  bool is_exec = (shdr.sh_flags & SHF_EXECINSTR) ||
+                 ctx.arg.ignore_data_address_equality;
   bool is_relro = (name == ".data.rel.ro" ||
                    name.starts_with(".data.rel.ro."));
   bool is_readonly = !(shdr.sh_flags & SHF_WRITE) || is_relro;
@@ -112,9 +133,10 @@ static bool is_eligible(InputSection<E> &isec) {
   bool is_init = (shdr.sh_type == SHT_INIT_ARRAY || name == ".init");
   bool is_fini = (shdr.sh_type == SHT_FINI_ARRAY || name == ".fini");
   bool is_enumerable = is_c_identifier(name);
+  bool is_addr_taken = !ctx.arg.icf_all && isec.address_significant;
 
-  return is_alloc && is_executable && is_readonly && !is_bss &&
-         !is_empty && !is_init && !is_fini && !is_enumerable;
+  return is_alloc && is_exec && is_readonly && !is_bss && !is_empty &&
+         !is_init && !is_fini && !is_enumerable && !is_addr_taken;
 }
 
 static Digest digest_final(SHA256_CTX &sha) {
@@ -175,6 +197,8 @@ struct LeafEq {
   }
 };
 
+// Early merge of leaf nodes, which can be processed without constructing the
+// entire graph. This reduces the vertex count and improves memory efficiency.
 template <typename E>
 static void merge_leaf_nodes(Context<E> &ctx) {
   Timer t(ctx, "merge_leaf_nodes");
@@ -191,30 +215,30 @@ static void merge_leaf_nodes(Context<E> &ctx) {
       if (!isec || !isec->is_alive)
         continue;
 
-      if (!is_eligible(*isec)) {
+      if (!is_eligible(ctx, *isec)) {
         non_eligible++;
         continue;
       }
 
       if (is_leaf(ctx, *isec)) {
         leaf++;
-        isec->extra().icf_leaf = true;
+        isec->icf_leaf = true;
         auto [it, inserted] = map.insert({isec.get(), isec.get()});
         if (!inserted && isec->get_priority() < it->second->get_priority())
           it->second = isec.get();
       } else {
         eligible++;
-        isec->extra().icf_eligible = true;
+        isec->icf_eligible = true;
       }
     }
   });
 
   tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
     for (std::unique_ptr<InputSection<E>> &isec : ctx.objs[i]->sections) {
-      if (isec && isec->is_alive && isec->extra().icf_leaf) {
+      if (isec && isec->is_alive && isec->icf_leaf) {
         auto it = map.find(isec.get());
         assert(it != map.end());
-        isec->extra().leader = it->second;
+        isec->leader = it->second;
       }
     }
   });
@@ -245,10 +269,10 @@ static Digest compute_digest(Context<E> &ctx, InputSection<E> &isec) {
       hash((u64)frag);
     } else if (!isec) {
       hash('3');
-    } else if (isec->extra().leader) {
+    } else if (isec->leader) {
       hash('4');
-      hash((u64)isec->extra().leader);
-    } else if (isec->extra().icf_eligible) {
+      hash((u64)isec->leader);
+    } else if (isec->icf_eligible) {
       hash('5');
     } else {
       hash('6');
@@ -271,7 +295,7 @@ static Digest compute_digest(Context<E> &ctx, InputSection<E> &isec) {
 
     hash(fde.get_rels(isec.file).size());
 
-    for (ElfRel<E> &rel : fde.get_rels(isec.file).subspan(1)) {
+    for (const ElfRel<E> &rel : fde.get_rels(isec.file).subspan(1)) {
       hash_symbol(*isec.file.symbols[rel.r_sym]);
       hash(rel.r_type);
       hash(rel.r_offset - fde.input_offset);
@@ -282,7 +306,7 @@ static Digest compute_digest(Context<E> &ctx, InputSection<E> &isec) {
   i64 frag_idx = 0;
 
   for (i64 i = 0; i < isec.get_rels(ctx).size(); i++) {
-    ElfRel<E> &rel = isec.get_rels(ctx)[i];
+    const ElfRel<E> &rel = isec.get_rels(ctx)[i];
     hash(rel.r_offset);
     hash(rel.r_type);
     hash(isec.get_addend(rel));
@@ -309,7 +333,7 @@ static std::vector<InputSection<E> *> gather_sections(Context<E> &ctx) {
 
   tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
     for (std::unique_ptr<InputSection<E>> &isec : ctx.objs[i]->sections)
-      if (isec && isec->is_alive && isec->extra().icf_eligible)
+      if (isec && isec->is_alive && isec->icf_eligible)
         num_sections[i]++;
   });
 
@@ -324,12 +348,12 @@ static std::vector<InputSection<E> *> gather_sections(Context<E> &ctx) {
   tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
     i64 idx = section_indices[i];
     for (std::unique_ptr<InputSection<E>> &isec : ctx.objs[i]->sections)
-      if (isec && isec->is_alive && isec->extra().icf_eligible)
+      if (isec && isec->is_alive && isec->icf_eligible)
         sections[idx++] = isec.get();
   });
 
   tbb::parallel_for((i64)0, (i64)sections.size(), [&](i64 i) {
-    sections[i]->extra().icf_idx = i;
+    sections[i]->icf_idx = i;
   });
 
   return sections;
@@ -347,6 +371,9 @@ compute_digests(Context<E> &ctx, std::span<InputSection<E> *> sections) {
   return digests;
 }
 
+// Build a graph, treating every function as a vertex and every function call
+// as an edge. See the description at the top for a more detailed formulation.
+// We use u32 indices here to improve cache locality.
 template <typename E>
 static void gather_edges(Context<E> &ctx,
                          std::span<InputSection<E> *> sections,
@@ -362,18 +389,18 @@ static void gather_edges(Context<E> &ctx,
 
   tbb::parallel_for((i64)0, (i64)sections.size(), [&](i64 i) {
     InputSection<E> &isec = *sections[i];
-    assert(isec.extra().icf_eligible);
+    assert(isec.icf_eligible);
     i64 frag_idx = 0;
 
     for (i64 j = 0; j < isec.get_rels(ctx).size(); j++) {
       if (isec.rel_fragments && isec.rel_fragments[frag_idx].idx == j) {
         frag_idx++;
       } else {
-        ElfRel<E> &rel = isec.get_rels(ctx)[j];
+        const ElfRel<E> &rel = isec.get_rels(ctx)[j];
         Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
         if (!sym.get_frag())
           if (InputSection<E> *isec = sym.get_input_section())
-            if (isec->extra().icf_eligible)
+            if (isec->icf_eligible)
               num_edges[i]++;
       }
     }
@@ -392,12 +419,13 @@ static void gather_edges(Context<E> &ctx,
     for (i64 j = 0; j < isec.get_rels(ctx).size(); j++) {
       if (isec.rel_fragments && isec.rel_fragments[frag_idx].idx == j) {
         frag_idx++;
-        ElfRel<E> &rel = isec.get_rels(ctx)[j];
+      } else {
+        const ElfRel<E> &rel = isec.get_rels(ctx)[j];
         Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
         if (!sym.get_frag())
           if (InputSection<E> *isec = sym.get_input_section())
-            if (isec->extra().icf_eligible)
-              edges[idx++] = isec->extra().icf_idx;
+            if (isec->icf_eligible)
+              edges[idx++] = isec->icf_idx;
       }
     }
   });
@@ -458,11 +486,11 @@ static void print_icf_sections(Context<E> &ctx) {
 
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     for (std::unique_ptr<InputSection<E>> &isec : file->sections) {
-      if (isec && isec->is_alive && isec->extra().leader) {
-        if (isec.get() == isec->extra().leader)
+      if (isec && isec->is_alive && isec->leader) {
+        if (isec.get() == isec->leader)
           leaders.push_back(isec.get());
         else
-          map.insert({isec->extra().leader, isec.get()});
+          map.insert({isec->leader, isec.get()});
       }
     }
   });
@@ -495,9 +523,8 @@ static void print_icf_sections(Context<E> &ctx) {
 template <typename E>
 void icf_sections(Context<E> &ctx) {
   Timer t(ctx, "icf");
-
-  for (ObjectFile<E> *file : ctx.objs)
-    file->extras.resize(file->sections.size());
+  if (ctx.objs.empty())
+    return;
 
   uniquify_cies(ctx);
   merge_leaf_nodes(ctx);
@@ -505,6 +532,11 @@ void icf_sections(Context<E> &ctx) {
   // Prepare for the propagation rounds.
   std::vector<InputSection<E> *> sections = gather_sections(ctx);
 
+  // We allocate 3 arrays to store hashes for each vertex.
+  // Index 0 and 1 are used for tree hashes from the previous iteration and the current iteration.
+  // They switch roles every iteration --- see `slot` below.
+  // Index 2 stores the initial, single-vertex hash --- this is combined with hashes from the connected vertices to
+  // form the tree hash described above.
   std::vector<std::vector<Digest>> digests(3);
   digests[0] = compute_digests<E>(ctx, sections);
   digests[1].resize(digests[0].size());
@@ -521,6 +553,17 @@ void icf_sections(Context<E> &ctx) {
     Timer t(ctx, "propagate");
     tbb::affinity_partitioner ap;
 
+    // A cheap test that the graph hasn't converged yet.
+    // The loop after this one uses a strict condition, but it's expensive
+    // as it requires sorting the entire hash collection.
+    //
+    // For nodes that have a cycle in downstream (i.e. recursive
+    // functions and functions that calls recursive functions) will always
+    // change with the iterations. Nodes that doesn't (i.e. non-recursive
+    // functions) will stop changing as soon as the propagation depth reaches
+    // the call tree depth.
+    // Here, we test whether we have reached sufficient depth for the latter,
+    // which is a necessary (but not sufficient) condition for convergence.
     i64 num_changed = -1;
     for (;;) {
       i64 n = propagate<E>(digests, edges, edge_indices, slot, ap);
@@ -529,8 +572,12 @@ void icf_sections(Context<E> &ctx) {
       num_changed = n;
     }
 
+    // Run the pass until the unique number of hashes stop increasing, at which
+    // point we have achieved convergence (proof omitted for brevity).
     i64 num_classes = -1;
     for (;;) {
+      // count_num_classes requires sorting which is O(n log n), so do a little
+      // more work beforehand to amortize that log factor.
       for (i64 i = 0; i < 10; i++)
         propagate<E>(digests, edges, edge_indices, slot, ap);
 
@@ -558,7 +605,7 @@ void icf_sections(Context<E> &ctx) {
     tbb::parallel_for((i64)0, (i64)sections.size(), [&](i64 i) {
       auto it = map->find(digest[i]);
       assert(it != map->end());
-      sections[i]->extra().leader = it->second;
+      sections[i]->leader = it->second;
     });
 
     // Since free'ing the map is slow, postpone it.
@@ -573,13 +620,12 @@ void icf_sections(Context<E> &ctx) {
     Timer t(ctx, "reassign");
     tbb::parallel_for_each(ctx.objs, [](ObjectFile<E> *file) {
       for (Symbol<E> *sym : file->symbols) {
-        if (sym->file != file)
-          continue;
-        InputSection<E> *isec = sym->get_input_section();
-        if (isec && isec->extra().leader && isec->extra().leader != isec) {
-          sym->file = &isec->extra().leader->file;
-          sym->shndx = isec->extra().leader->shndx;
-          isec->kill();
+        if (sym->file == file) {
+          InputSection<E> *isec = sym->get_input_section();
+          if (isec && isec->leader && isec->leader != isec) {
+            isec->kill();
+            isec->killed_by_icf = true;
+          }
         }
       }
     });
@@ -589,9 +635,6 @@ void icf_sections(Context<E> &ctx) {
 #define INSTANTIATE(E)                          \
   template void icf_sections(Context<E> &ctx);
 
-INSTANTIATE(X86_64);
-INSTANTIATE(I386);
-INSTANTIATE(ARM64);
-INSTANTIATE(RISCV64);
+INSTANTIATE_ALL;
 
 } // namespace mold::elf

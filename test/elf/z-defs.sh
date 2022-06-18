@@ -1,12 +1,15 @@
 #!/bin/bash
-export LANG=
+export LC_ALL=C
 set -e
-CC="${CC:-cc}"
-CXX="${CXX:-c++}"
+CC="${TEST_CC:-cc}"
+CXX="${TEST_CXX:-c++}"
+GCC="${TEST_GCC:-gcc}"
+GXX="${TEST_GXX:-g++}"
+OBJDUMP="${OBJDUMP:-objdump}"
+MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
-mold="$(pwd)/mold"
 t=out/test/elf/$testname
 mkdir -p $t
 
@@ -28,7 +31,7 @@ grep -q 'undefined symbol:.* foo' $t/log
 
 $CC -B. -shared -o $t/c.so $t/a.o -Wl,-z,defs \
   -Wl,--warn-unresolved-symbols 2> $t/log
-grep -q 'undefined symbol: .* foo$' $t/log
+grep -q 'undefined symbol:.* foo$' $t/log
 readelf --dyn-syms $t/c.so | grep -q ' foo$'
 
 echo OK

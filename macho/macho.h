@@ -1,10 +1,11 @@
 #pragma once
 
-#include "../big-endian.h"
+#include "../inttypes.h"
 
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <string_view>
 
 namespace mold::macho {
@@ -18,6 +19,12 @@ typedef int8_t i8;
 typedef int16_t i16;
 typedef int32_t i32;
 typedef int64_t i64;
+
+class ARM64;
+class X86_64;
+
+template <typename E>
+std::string rel_to_string(u8 r_type);
 
 static constexpr u32 FAT_MAGIC = 0xcafebabe;
 
@@ -282,6 +289,11 @@ static constexpr u32 REFERENCE_FLAG_PRIVATE_UNDEFINED_LAZY = 5;
 
 static constexpr u32 REFERENCED_DYNAMICALLY = 0x0010;
 
+static constexpr u32 SELF_LIBRARY_ORDINAL = 0x0;
+static constexpr u32 MAX_LIBRARY_ORDINAL = 0xfd;
+static constexpr u32 DYNAMIC_LOOKUP_ORDINAL = 0xfe;
+static constexpr u32 EXECUTABLE_ORDINAL = 0xff;
+
 static constexpr u32 N_NO_DEAD_STRIP = 0x0020;
 static constexpr u32 N_DESC_DISCARDED = 0x0020;
 static constexpr u32 N_WEAK_REF = 0x0040;
@@ -318,6 +330,24 @@ static constexpr u32 ARM64_RELOC_TLVP_LOAD_PAGE21 = 8;
 static constexpr u32 ARM64_RELOC_TLVP_LOAD_PAGEOFF12 = 9;
 static constexpr u32 ARM64_RELOC_ADDEND = 10;
 
+template <>
+inline std::string rel_to_string<ARM64>(u8 type) {
+  switch (type) {
+  case ARM64_RELOC_UNSIGNED: return "ARM64_RELOC_UNSIGNED";
+  case ARM64_RELOC_SUBTRACTOR: return "ARM64_RELOC_SUBTRACTOR";
+  case ARM64_RELOC_BRANCH26: return "ARM64_RELOC_BRANCH26";
+  case ARM64_RELOC_PAGE21: return "ARM64_RELOC_PAGE21";
+  case ARM64_RELOC_PAGEOFF12: return "ARM64_RELOC_PAGEOFF12";
+  case ARM64_RELOC_GOT_LOAD_PAGE21: return "ARM64_RELOC_GOT_LOAD_PAGE21";
+  case ARM64_RELOC_GOT_LOAD_PAGEOFF12: return "ARM64_RELOC_GOT_LOAD_PAGEOFF12";
+  case ARM64_RELOC_POINTER_TO_GOT: return "ARM64_RELOC_POINTER_TO_GOT";
+  case ARM64_RELOC_TLVP_LOAD_PAGE21: return "ARM64_RELOC_TLVP_LOAD_PAGE21";
+  case ARM64_RELOC_TLVP_LOAD_PAGEOFF12: return "ARM64_RELOC_TLVP_LOAD_PAGEOFF12";
+  case ARM64_RELOC_ADDEND: return "ARM64_RELOC_ADDEND";
+  }
+  return "unknown (" + std::to_string(type) + ")";
+}
+
 static constexpr u32 X86_64_RELOC_UNSIGNED = 0;
 static constexpr u32 X86_64_RELOC_SIGNED = 1;
 static constexpr u32 X86_64_RELOC_BRANCH = 2;
@@ -329,33 +359,50 @@ static constexpr u32 X86_64_RELOC_SIGNED_2 = 7;
 static constexpr u32 X86_64_RELOC_SIGNED_4 = 8;
 static constexpr u32 X86_64_RELOC_TLV = 9;
 
+template <>
+inline std::string rel_to_string<X86_64>(u8 type) {
+  switch (type) {
+  case X86_64_RELOC_UNSIGNED: return "X86_64_RELOC_UNSIGNED";
+  case X86_64_RELOC_SIGNED: return "X86_64_RELOC_SIGNED";
+  case X86_64_RELOC_BRANCH: return "X86_64_RELOC_BRANCH";
+  case X86_64_RELOC_GOT_LOAD: return "X86_64_RELOC_GOT_LOAD";
+  case X86_64_RELOC_GOT: return "X86_64_RELOC_GOT";
+  case X86_64_RELOC_SUBTRACTOR: return "X86_64_RELOC_SUBTRACTOR";
+  case X86_64_RELOC_SIGNED_1: return "X86_64_RELOC_SIGNED_1";
+  case X86_64_RELOC_SIGNED_2: return "X86_64_RELOC_SIGNED_2";
+  case X86_64_RELOC_SIGNED_4: return "X86_64_RELOC_SIGNED_4";
+  case X86_64_RELOC_TLV: return "X86_64_RELOC_TLV";
+  }
+  return "unknown (" + std::to_string(type) + ")";
+}
+
 struct FatHeader {
-  ubig32 magic;
-  ubig32 nfat_arch;
+  ub32 magic;
+  ub32 nfat_arch;
 };
 
 struct FatArch {
-  ubig32 cputype;
-  ubig32 cpusubtype;
-  ubig32 offset;
-  ubig32 size;
-  ubig32 align;
+  ub32 cputype;
+  ub32 cpusubtype;
+  ub32 offset;
+  ub32 size;
+  ub32 align;
 };
 
 struct MachHeader {
-  u32 magic;
-  u32 cputype;
-  u32 cpusubtype;
-  u32 filetype;
-  u32 ncmds;
-  u32 sizeofcmds;
-  u32 flags;
-  u32 reserved;
+  ul32 magic;
+  ul32 cputype;
+  ul32 cpusubtype;
+  ul32 filetype;
+  ul32 ncmds;
+  ul32 sizeofcmds;
+  ul32 flags;
+  ul32 reserved;
 };
 
 struct LoadCommand {
-  u32 cmd;
-  u32 cmdsize;
+  ul32 cmd;
+  ul32 cmdsize;
 };
 
 struct SegmentCommand {
@@ -363,17 +410,17 @@ struct SegmentCommand {
     return {segname, strnlen(segname, sizeof(segname))};
   }
 
-  u32 cmd;
-  u32 cmdsize;
+  ul32 cmd;
+  ul32 cmdsize;
   char segname[16];
-  u64 vmaddr;
-  u64 vmsize;
-  u64 fileoff;
-  u64 filesize;
-  u32 maxprot;
-  u32 initprot;
-  u32 nsects;
-  u32 flags;
+  ul64 vmaddr;
+  ul64 vmsize;
+  ul64 fileoff;
+  ul64 filesize;
+  ul32 maxprot;
+  ul32 initprot;
+  ul32 nsects;
+  ul32 flags;
 };
 
 struct MachSection {
@@ -401,138 +448,144 @@ struct MachSection {
 
   char sectname[16];
   char segname[16];
-  u64 addr;
-  u64 size;
-  u32 offset;
-  u32 p2align;
-  u32 reloff;
-  u32 nreloc;
-  u32 type : 8;
-  u32 attr : 24;
-  u32 reserved1;
-  u32 reserved2;
-  u32 reserved3;
+  ul64 addr;
+  ul64 size;
+  ul32 offset;
+  ul32 p2align;
+  ul32 reloff;
+  ul32 nreloc;
+  u8 type;
+  ul24 attr;
+  ul32 reserved1;
+  ul32 reserved2;
+  ul32 reserved3;
 };
 
 struct DylibCommand {
-  u32 cmd;
-  u32 cmdsize;
-  u32 nameoff;
-  u32 timestamp;
-  u32 current_version;
-  u32 compatibility_version;
+  ul32 cmd;
+  ul32 cmdsize;
+  ul32 nameoff;
+  ul32 timestamp;
+  ul32 current_version;
+  ul32 compatibility_version;
 };
 
 struct DylinkerCommand {
-  u32 cmd;
-  u32 cmdsize;
-  u32 nameoff;
+  ul32 cmd;
+  ul32 cmdsize;
+  ul32 nameoff;
 };
 
 struct SymtabCommand {
-  u32 cmd;
-  u32 cmdsize;
-  u32 symoff;
-  u32 nsyms;
-  u32 stroff;
-  u32 strsize;
+  ul32 cmd;
+  ul32 cmdsize;
+  ul32 symoff;
+  ul32 nsyms;
+  ul32 stroff;
+  ul32 strsize;
 };
 
 struct DysymtabCommand {
-  u32 cmd;
-  u32 cmdsize;
-  u32 ilocalsym;
-  u32 nlocalsym;
-  u32 iextdefsym;
-  u32 nextdefsym;
-  u32 iundefsym;
-  u32 nundefsym;
-  u32 tocoff;
-  u32 ntoc;
-  u32 modtaboff;
-  u32 nmodtab;
-  u32 extrefsymoff;
-  u32 nextrefsyms;
-  u32 indirectsymoff;
-  u32 nindirectsyms;
-  u32 extreloff;
-  u32 nextrel;
-  u32 locreloff;
-  u32 nlocrel;
+  ul32 cmd;
+  ul32 cmdsize;
+  ul32 ilocalsym;
+  ul32 nlocalsym;
+  ul32 iextdefsym;
+  ul32 nextdefsym;
+  ul32 iundefsym;
+  ul32 nundefsym;
+  ul32 tocoff;
+  ul32 ntoc;
+  ul32 modtaboff;
+  ul32 nmodtab;
+  ul32 extrefsymoff;
+  ul32 nextrefsyms;
+  ul32 indirectsymoff;
+  ul32 nindirectsyms;
+  ul32 extreloff;
+  ul32 nextrel;
+  ul32 locreloff;
+  ul32 nlocrel;
 };
 
 struct VersionMinCommand {
-  u32 cmd;
-  u32 cmdsize;
-  u32 version;
-  u32 sdk;
+  ul32 cmd;
+  ul32 cmdsize;
+  ul32 version;
+  ul32 sdk;
 };
 
 struct DyldInfoCommand {
-  u32 cmd;
-  u32 cmdsize;
-  u32 rebase_off;
-  u32 rebase_size;
-  u32 bind_off;
-  u32 bind_size;
-  u32 weak_bind_off;
-  u32 weak_bind_size;
-  u32 lazy_bind_off;
-  u32 lazy_bind_size;
-  u32 export_off;
-  u32 export_size;
+  ul32 cmd;
+  ul32 cmdsize;
+  ul32 rebase_off;
+  ul32 rebase_size;
+  ul32 bind_off;
+  ul32 bind_size;
+  ul32 weak_bind_off;
+  ul32 weak_bind_size;
+  ul32 lazy_bind_off;
+  ul32 lazy_bind_size;
+  ul32 export_off;
+  ul32 export_size;
 };
 
 struct UUIDCommand {
-  u32 cmd;
-  u32 cmdsize;
+  ul32 cmd;
+  ul32 cmdsize;
   u8 uuid[16];
 };
 
 struct RpathCommand {
-  u32 cmd;
-  u32 cmdsize;
-  u32 path_off;
+  ul32 cmd;
+  ul32 cmdsize;
+  ul32 path_off;
 };
 
 struct LinkEditDataCommand {
-  u32 cmd;
-  u32 cmdsize;
-  u32 dataoff;
-  u32 datasize;
+  ul32 cmd;
+  ul32 cmdsize;
+  ul32 dataoff;
+  ul32 datasize;
 };
 
 struct BuildToolVersion {
-  u32 tool;
-  u32 version;
+  ul32 tool;
+  ul32 version;
 };
 
 struct BuildVersionCommand {
-  u32 cmd;
-  u32 cmdsize;
-  u32 platform;
-  u32 minos;
-  u32 sdk;
-  u32 ntools;
+  ul32 cmd;
+  ul32 cmdsize;
+  ul32 platform;
+  ul32 minos;
+  ul32 sdk;
+  ul32 ntools;
 };
 
 struct EntryPointCommand {
-  u32 cmd;
-  u32 cmdsize;
-  u64 entryoff;
-  u64 stacksize;
+  ul32 cmd;
+  ul32 cmdsize;
+  ul64 entryoff;
+  ul64 stacksize;
 };
 
 struct SourceVersionCommand {
-  u32 cmd;
-  u32 cmdsize;
-  u64 version;
+  ul32 cmd;
+  ul32 cmdsize;
+  ul64 version;
 };
 
 struct DataInCodeEntry {
-  u32 offset;
-  u16 length;
-  u16 kind;
+  ul32 offset;
+  ul16 length;
+  ul16 kind;
+};
+
+struct LinkerOptionCommand {
+  ul32 cmd;
+  ul32 cmdsize;
+  ul32 count;
 };
 
 // This struct is named `n_list` on BSD and macOS.
@@ -542,34 +595,33 @@ struct MachSym {
   }
 
   bool is_common() const {
-    return type == N_UNDF && ext && value;
+    return type == N_UNDF && is_extern && value;
   }
 
-  u32 stroff;
-  u8 ext : 1;
+  ul32 stroff;
+  u8 is_extern : 1;
   u8 type : 3;
-  u8 pext : 1;
+  u8 is_private_extern : 1;
   u8 stub : 3;
   u8 sect;
   union {
-    u16 desc;
+    ul16 desc;
     struct {
-      u16 : 8;
-      u16 p2align : 4;
-      u16 : 4;
+      u8 padding;
+      u8 p2align : 4;
     };
   };
-  u64 value;
+  ul64 value;
 };
 
 // This struct is named `relocation_info` on BSD and macOS.
 struct MachRel {
-  u32 offset;
-  u32 idx : 24;
-  u32 is_pcrel : 1;
-  u32 p2size : 2;
-  u32 is_extern : 1;
-  u32 type : 4;
+  ul32 offset;
+  ul24 idx;
+  u8 is_pcrel : 1;
+  u8 p2size : 2;
+  u8 is_extern : 1;
+  u8 type : 4;
 };
 
 // __TEXT,__unwind_info section contents
@@ -580,47 +632,47 @@ static constexpr u32 UNWIND_SECOND_LEVEL_COMPRESSED = 3;
 static constexpr u32 UNWIND_PERSONALITY_MASK = 0x30000000;
 
 struct UnwindSectionHeader {
-  u32 version;
-  u32 encoding_offset;
-  u32 encoding_count;
-  u32 personality_offset;
-  u32 personality_count;
-  u32 page_offset;
-  u32 page_count;
+  ul32 version;
+  ul32 encoding_offset;
+  ul32 encoding_count;
+  ul32 personality_offset;
+  ul32 personality_count;
+  ul32 page_offset;
+  ul32 page_count;
 };
 
 struct UnwindFirstLevelPage {
-  u32 func_addr;
-  u32 page_offset;
-  u32 lsda_offset;
+  ul32 func_addr;
+  ul32 page_offset;
+  ul32 lsda_offset;
 };
 
 struct UnwindSecondLevelPage {
-  u32 kind;
-  u16 page_offset;
-  u16 page_count;
-  u16 encoding_offset;
-  u16 encoding_count;
+  ul32 kind;
+  ul16 page_offset;
+  ul16 page_count;
+  ul16 encoding_offset;
+  ul16 encoding_count;
 };
 
 struct UnwindLsdaEntry {
-  u32 func_addr;
-  u32 lsda_addr;
+  ul32 func_addr;
+  ul32 lsda_addr;
 };
 
 struct UnwindPageEntry {
-  u32 func_addr : 24;
-  u32 encoding : 8;
+  ul24 func_addr;
+  u8 encoding;
 };
 
 // __LD,__compact_unwind section contents
 
 struct CompactUnwindEntry {
-  u64 code_start;
-  u32 code_len;
-  u32 encoding;
-  u64 personality;
-  u64 lsda;
+  ul64 code_start;
+  ul32 code_len;
+  ul32 encoding;
+  ul64 personality;
+  ul64 lsda;
 };
 
 // __LINKEDIT,__code_signature
@@ -635,39 +687,39 @@ static constexpr u32 CS_EXECSEG_MAIN_BINARY = 1;
 static constexpr u32 CS_HASHTYPE_SHA256 = 2;
 
 struct CodeSignatureHeader {
-  ubig32 magic;
-  ubig32 length;
-  ubig32 count;
+  ub32 magic;
+  ub32 length;
+  ub32 count;
 };
 
 struct CodeSignatureBlobIndex {
-  ubig32 type;
-  ubig32 offset;
-  u32 padding;
+  ub32 type;
+  ub32 offset;
+  ub32 padding;
 };
 
 struct CodeSignatureDirectory {
-  ubig32 magic;
-  ubig32 length;
-  ubig32 version;
-  ubig32 flags;
-  ubig32 hash_offset;
-  ubig32 ident_offset;
-  ubig32 n_special_slots;
-  ubig32 n_code_slots;
-  ubig32 code_limit;
+  ub32 magic;
+  ub32 length;
+  ub32 version;
+  ub32 flags;
+  ub32 hash_offset;
+  ub32 ident_offset;
+  ub32 n_special_slots;
+  ub32 n_code_slots;
+  ub32 code_limit;
   u8 hash_size;
   u8 hash_type;
   u8 platform;
   u8 page_size;
-  ubig32 spare2;
-  ubig32 scatter_offset;
-  ubig32 team_offset;
-  ubig32 spare3;
-  ubig64 code_limit64;
-  ubig64 exec_seg_base;
-  ubig64 exec_seg_limit;
-  ubig64 exec_seg_flags;
+  ub32 spare2;
+  ub32 scatter_offset;
+  ub32 team_offset;
+  ub32 spare3;
+  ub64 code_limit64;
+  ub64 exec_seg_base;
+  ub64 exec_seg_limit;
+  ub64 exec_seg_flags;
 };
 
 struct ARM64 {
