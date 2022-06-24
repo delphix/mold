@@ -3,13 +3,11 @@ Section: devel
 Priority: optional
 Maintainer: Sylvestre Ledru <sylvestre@debian.org>
 Build-Depends:
- clang,
  cmake,
  debhelper-compat (= 13),
  dwarfdump,
  libmimalloc-dev,
  libssl-dev,
- libstdc++-10-dev,
  libtbb-dev,
  libxxhash-dev,
  pkg-config,
