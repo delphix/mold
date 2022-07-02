@@ -10,21 +10,20 @@ MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
+t=out/test/macho/$testname
 mkdir -p $t
 
-[ $MACHINE = x86_64 ] || { echo skipped; exit; }
-
-cat <<EOF | $CC -o $t/a.o -c -fPIC -xc -
+cat <<EOF | $CC -c -o $t/a.o -xc -
 #include <stdio.h>
+
 int main() {
-  puts("Hello world");
+  printf("Hello world\n");
 }
 EOF
 
-$CC -B. -o $t/exe $t/a.o -Wl,-emit-relocs
-$QEMU $t/exe | grep -q 'Hello world'
+clang --ld-path=./ld64 -B. -o $t/exe1 $t/a.o -Wl,-adhoc_codesign
+clang --ld-path=./ld64 -B. -o $t/exe2 $t/a.o -Wl,-adhoc_codesign
 
-readelf -S $t/exe | grep -Eq 'rela?\.text'
+[ "$(otool -l $t/exe1 | grep 'uuid ')" != "$(otool -l $t/exe2 | grep 'uuid ')" ]
 
 echo OK

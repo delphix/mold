@@ -2,10 +2,10 @@
 #include "../cmdline.h"
 
 #include <optional>
+#include <regex>
 #include <sstream>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <regex>
 #include <unistd.h>
 #include <unordered_set>
 
@@ -20,10 +20,14 @@ Options:
   -U <SYMBOL>                 Allow a symbol to be undefined
   -Z                          Do not search the standard directories when
                               searching for libraries and frameworks
+  -add_empty_section <SEGNAME> <SECTNAME>
+                              Add an empty section
   -adhoc_codesign             Add ad-hoc code signature to the output file
     -no_adhoc_codesign
   -all_load                   Include all objects from static archives
     -noall_load
+  -application_extension      Verify that all dylibs are extension-safe
+    -no_application_extension
   -arch <ARCH_NAME>           Specify target architecture
   -bundle                     Produce a mach-o bundle
   -compatibility_version <VERSION>
@@ -31,12 +35,15 @@ Options:
   -current_version <VERSION>  Specifies the current version number of the library.
   -dead_strip                 Remove unreachable functions and data
   -dead_strip_dylibs          Remove unreachable dylibs from dependencies
+  -debug_variant              Ignored
   -demangle                   Demangle C++ symbols in log messages (default)
+  -dependency_info <FILE>     Ignored
   -dylib                      Produce a dynamic library
   -dylib_compatibility_version <VERSION>
                               Alias for -compatibility_version
   -dylib_current_version <VERSION>
                               Alias for -current_version
+  -dylib_install_name         Alias for -install_name
   -dynamic                    Link against dylibs (default)
   -e <SYMBOL>                 Specify the entry point of a main executable
   -execute                    Produce an executable (default)
@@ -65,15 +72,19 @@ Options:
   -no_deduplicate             Ignored
   -no_uuid                    Do not generate an LC_UUID load command
   -o <FILE>                   Set output filename
+  -objc_abi_version <VERSION> Ignored
   -object_path_lto <FILE>     Write a LTO temporary file to a given path
   -order_file <FILE>          Ignored
   -pagezero_size <SIZE>       Specify the size of the __PAGEZERO segment
   -platform_version <PLATFORM> <MIN_VERSION> <SDK_VERSION>
                               Set platform, platform version and SDK version
   -random_uuid                Generate a random LC_UUID load command
+  -reexport-l<LIB>            Search for a given library
   -rpath <PATH>               Add PATH to the runpath search path list
   -search_dylibs_first
   -search_paths_first
+  -sectalign <SEGNAME> <SECTNAME> <VALUE>
+                              Set a section's alignment to a given value
   -sectcreate <SEGNAME> <SECTNAME> <FILE>
   -stack_size <SIZE>
   -stats                      Show statistics info
@@ -119,7 +130,7 @@ static i64 parse_platform(Context<E> &ctx, std::string_view arg) {
 }
 
 template <typename E>
-static i64 parse_version(Context<E> &ctx, std::string_view arg) {
+i64 parse_version(Context<E> &ctx, std::string_view arg) {
   static std::regex re(R"((\d+)(?:\.(\d+))?(?:\.(\d+))?)",
                        std::regex_constants::ECMAScript);
   std::cmatch m;
@@ -130,6 +141,20 @@ static i64 parse_version(Context<E> &ctx, std::string_view arg) {
   i64 minor = (m[2].length() == 0) ? 0 : stoi(m[2]);
   i64 patch = (m[3].length() == 0) ? 0 : stoi(m[3]);
   return (major << 16) | (minor << 8) | patch;
+}
+
+template <typename E>
+i64 parse_hex(Context<E> &ctx, std::string_view arg) {
+  auto flags = std::regex_constants::ECMAScript | std::regex_constants::icase;
+  static std::regex re(R"((?:0x)?[0-9a-f]+)", flags);
+
+  std::cmatch m;
+  if (!std::regex_match(arg.begin(), arg.end(), re))
+    Fatal(ctx) << "malformed hexadecimal number: " << arg;
+
+  if (arg.starts_with("0x") || arg.starts_with("0X"))
+    return std::stoll(std::string(arg.substr(2)), nullptr, 16);
+  return std::stoll(std::string(arg), nullptr, 16);
 }
 
 static bool is_directory(std::filesystem::path path) {
@@ -188,6 +213,18 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
           Fatal(ctx) << "option -" << name << ": argument missing";
         arg = args[i + 1];
         i += 2;
+        return true;
+      }
+      return false;
+    };
+
+    auto read_arg2 = [&](std::string name) {
+      if (args[i] == name) {
+        if (args.size() <= i + 2)
+          Fatal(ctx) << "option -" << name << ": argument missing";
+        arg = args[i + 1];
+        arg2 = args[i + 2];
+        i += 3;
         return true;
       }
       return false;
@@ -260,6 +297,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.ObjC = true;
     } else if (read_arg("-U")) {
       ctx.arg.U.push_back(std::string(arg));
+    } else if (read_arg2("-add_empty_section")) {
+      ctx.arg.add_empty_section.push_back({arg, arg2});
     } else if (read_flag("-adhoc_codesign")) {
       ctx.arg.adhoc_codesign = true;
     } else if (read_flag("-no_adhoc_codesign")) {
@@ -268,6 +307,10 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       remaining.push_back("-all_load");
     } else if (read_flag("-noall_load")) {
       remaining.push_back("-noall_load");
+    } else if (read_flag("-application_extension")) {
+      ctx.arg.application_extension = true;
+    } else if (read_flag("-no_application_extension")) {
+      ctx.arg.application_extension = false;
     } else if (read_arg("-arch")) {
       if (arg == "x86_64")
         ctx.arg.arch = CPU_TYPE_X86_64;
@@ -290,8 +333,10 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.dead_strip = true;
     } else if (read_flag("-dead_strip_dylibs")) {
       ctx.arg.dead_strip_dylibs = true;
+    } else if (read_flag("-debug_variant")) {
     } else if (read_flag("-demangle")) {
       ctx.arg.demangle = true;
+    } else if (read_arg("-dependency_info")) {
     } else if (read_flag("-dylib")) {
       ctx.output_type = MH_DYLIB;
     } else if (read_hex("-headerpad")) {
@@ -334,7 +379,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_joined("-hidden-l")) {
       remaining.push_back("-hidden-l");
       remaining.push_back(std::string(arg));
-    } else if (read_arg("-install_name")) {
+    } else if (read_arg("-install_name") || read_arg("-dylib_install_name")) {
       ctx.arg.install_name = arg;
     } else if (read_joined("-l")) {
       remaining.push_back("-l");
@@ -354,6 +399,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.uuid = UUID_NONE;
     } else if (read_arg("-o")) {
       ctx.arg.output = arg;
+    } else if (read_arg("-objc_abi_version")) {
     } else if (read_arg("-object_path_lto")) {
       ctx.arg.object_path_lto = arg;
     } else if (read_arg("-order_file")) {
@@ -372,12 +418,21 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.quick_exit = false;
     } else if (read_flag("-random_uuid")) {
       ctx.arg.uuid = UUID_RANDOM;
+    } else if (read_joined("-reexport-l")) {
+      remaining.push_back("-reexport-l");
+      remaining.push_back(std::string(arg));
     } else if (read_arg("-rpath")) {
       ctx.arg.rpath.push_back(std::string(arg));
     } else if (read_flag("-search_paths_first")) {
       ctx.arg.search_paths_first = true;
     } else if (read_flag("-search_dylibs_first")) {
       ctx.arg.search_paths_first = false;
+    } else if (read_arg3("-sectalign")) {
+      u64 val = parse_hex(ctx, arg3);
+      std::string key = std::string(arg) + "," + std::string(arg2);
+      if (!has_single_bit(val))
+        Fatal(ctx) << "-sectalign: invalid alignment value: " << arg3;
+      ctx.arg.sectalign.push_back({arg, arg2, (u8)std::countl_zero(val)});
     } else if (read_arg3("-sectcreate")) {
       ctx.arg.sectcreate.push_back({arg, arg2, arg3});
     } else if (read_hex("-stack_size")) {
@@ -483,7 +538,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   return remaining;
 }
 
-#define INSTANTIATE(E) \
+#define INSTANTIATE(E)                                                  \
+  template i64 parse_version(Context<E> &, std::string_view);           \
   template std::vector<std::string> parse_nonpositional_args(Context<E> &)
 
 INSTANTIATE_ALL;

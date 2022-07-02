@@ -1,4 +1,4 @@
-VERSION = 1.3.0
+VERSION = 1.3.1
 
 PREFIX = /usr/local
 BINDIR = $(PREFIX)/bin
@@ -103,9 +103,9 @@ ifeq ($(NEEDS_LIBCRYPTO), 1)
   MOLD_LDFLAGS += -lcrypto
 endif
 
-# '-latomic' flag is needed building on riscv64 system.
+# '-latomic' flag is needed building on armv6/riscv64 systems.
 # Seems like '-atomic' would be better but not working.
-ifeq ($(ARCH), riscv64)
+ifneq (,$(filter armv6% riscv64, $(ARCH)))
   MOLD_LDFLAGS += -latomic
 endif
 
@@ -146,7 +146,7 @@ $(MIMALLOC_LIB):
 
 $(TBB_LIB):
 	mkdir -p out/tbb
-	(cd out/tbb; cmake -G'Unix Makefiles' -DBUILD_SHARED_LIBS=OFF -DTBB_TEST=OFF -DCMAKE_CXX_FLAGS="$(CXXFLAGS) -D__TBB_DYNAMIC_LOAD_ENABLED=0" -DTBB_STRICT=OFF ../../third-party/tbb)
+	(cd out/tbb; cmake -G'Unix Makefiles' -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_SHARED_LIBS=OFF -DTBB_TEST=OFF -DCMAKE_CXX_FLAGS="$(CXXFLAGS) -D__TBB_DYNAMIC_LOAD_ENABLED=0" -DTBB_STRICT=OFF ../../third-party/tbb)
 	$(MAKE) -C out/tbb tbb
 	(cd out/tbb; ln -sf *_relwithdebinfo libs)
 

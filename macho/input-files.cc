@@ -20,7 +20,7 @@ void InputFile<E>::clear_symbols() {
       sym->file = nullptr;
       sym->scope = SCOPE_LOCAL;
       sym->is_imported = false;
-      sym->is_weak_def = false;
+      sym->is_weak = false;
       sym->subsec = nullptr;
       sym->value = 0;
       sym->is_common = false;
@@ -138,7 +138,7 @@ void ObjectFile<E>::parse_symbols(Context<E> &ctx) {
       sym.subsec = nullptr;
       sym.scope = SCOPE_LOCAL;
       sym.is_common = false;
-      sym.is_weak_def = false;
+      sym.is_weak = false;
 
       switch (msym.type) {
       case N_UNDF:
@@ -533,7 +533,7 @@ template <typename E>
 static u64 get_rank(Symbol<E> &sym) {
   if (!sym.file)
     return 7 << 24;
-  return get_rank(sym.file, sym.is_common, sym.is_weak_def);
+  return get_rank(sym.file, sym.is_common, sym.is_weak);
 }
 
 template <typename E>
@@ -559,14 +559,14 @@ void ObjectFile<E>::resolve_symbols(Context<E> &ctx) {
 
     Symbol<E> &sym = *this->syms[i];
     std::scoped_lock lock(sym.mu);
-    bool is_weak_def = (msym.desc & N_WEAK_DEF);
+    bool is_weak = (msym.desc & N_WEAK_DEF);
 
     sym.scope = merge_scope(sym, msym);
 
-    if (get_rank(this, msym.is_common(), is_weak_def) < get_rank(sym)) {
+    if (get_rank(this, msym.is_common(), is_weak) < get_rank(sym)) {
       sym.file = this;
       sym.is_imported = false;
-      sym.is_weak_def = is_weak_def;
+      sym.is_weak = is_weak;
 
       switch (msym.type) {
       case N_UNDF:
@@ -647,7 +647,7 @@ void ObjectFile<E>::convert_common_symbols(Context<E> &ctx) {
       subsections.emplace_back(subsec);
 
       sym.is_imported = false;
-      sym.is_weak_def = false;
+      sym.is_weak = false;
       sym.subsec = subsec;
       sym.value = 0;
       sym.is_common = false;
@@ -734,25 +734,89 @@ void ObjectFile<E>::parse_lto_symbols(Context<E> &ctx) {
 }
 
 template <typename E>
-DylibFile<E> *DylibFile<E>::create(Context<E> &ctx, MappedFile<Context<E>> *mf) {
-  DylibFile<E> *dylib = new DylibFile<E>(mf);
-  dylib->is_alive = (ctx.needed_l || !ctx.arg.dead_strip_dylibs);
-  dylib->is_weak = ctx.weak_l;
-  ctx.dylib_pool.emplace_back(dylib);
+DylibFile<E>::DylibFile(Context<E> &ctx, MappedFile<Context<E>> *mf)
+  : InputFile<E>(mf) {
+  this->is_dylib = true;
+  this->is_alive = (ctx.needed_l || !ctx.arg.dead_strip_dylibs);
+  this->is_weak = ctx.weak_l;
+  this->is_reexported = ctx.reexport_l;
+  ctx.dylib_pool.emplace_back(this);
+}
 
-  switch (get_file_type(mf)) {
-  case FileType::TAPI:
-    dylib->parse_tapi(ctx);
-    break;
-  case FileType::MACH_DYLIB:
-    dylib->parse_dylib(ctx);
-    break;
-  default:
-    Fatal(ctx) << mf->name << ": is not a dylib";
+template <typename E>
+DylibFile<E> *DylibFile<E>::create(Context<E> &ctx, MappedFile<Context<E>> *mf) {
+  DylibFile<E> *file = new DylibFile<E>(ctx, mf);
+  file->parse(ctx);
+  return file;
+}
+
+template <typename E>
+static MappedFile<Context<E>> *
+find_external_lib(Context<E> &ctx, std::string_view parent, std::string path) {
+  if (!path.starts_with('/'))
+    return MappedFile<Context<E>>::open(ctx, path);
+
+  for (const std::string &root : ctx.arg.syslibroot) {
+    if (path.ends_with(".tbd")) {
+      if (auto *file = MappedFile<Context<E>>::open(ctx, root + path))
+        return file;
+      continue;
+    }
+
+    if (path.ends_with(".dylib")) {
+      std::string stem(path.substr(0, path.size() - 6));
+      if (auto *file = MappedFile<Context<E>>::open(ctx, root + stem + ".tbd"))
+        return file;
+      if (auto *file = MappedFile<Context<E>>::open(ctx, root + path))
+        return file;
+    }
+
+    for (std::string extn : {".tbd", ".dylib"})
+      if (auto *file = MappedFile<Context<E>>::open(ctx, root + path + extn))
+        return file;
   }
 
-  return dylib;
-};
+  return nullptr;
+}
+
+template <typename E>
+void DylibFile<E>::parse(Context<E> &ctx) {
+  switch (get_file_type(this->mf)) {
+  case FileType::TAPI:
+    parse_tapi(ctx);
+    break;
+  case FileType::MACH_DYLIB:
+    parse_dylib(ctx);
+    break;
+  default:
+    Fatal(ctx) << *this << ": is not a dylib";
+  }
+
+  // Read reexported libraries if any
+  for (std::string_view path : reexported_libs) {
+    MappedFile<Context<E>> *mf =
+      find_external_lib(ctx, install_name, std::string(path));
+    if (!mf)
+      Fatal(ctx) << install_name << ": cannot open reexported library " << path;
+
+    DylibFile<E> *child = DylibFile<E>::create(ctx, mf);
+    exports.merge(child->exports);
+    weak_exports.merge(child->weak_exports);
+  }
+
+  // Initialize syms and is_weak_symbols vectors
+  for (std::string_view s : exports) {
+    this->syms.push_back(get_symbol(ctx, s));
+    is_weak_symbol.push_back(false);
+  }
+
+  for (std::string_view s : weak_exports) {
+    if (!exports.contains(s)) {
+      this->syms.push_back(get_symbol(ctx, s));
+      is_weak_symbol.push_back(true);
+    }
+  }
+}
 
 template <typename E>
 void DylibFile<E>::read_trie(Context<E> &ctx, u8 *start, i64 offset,
@@ -761,9 +825,13 @@ void DylibFile<E>::read_trie(Context<E> &ctx, u8 *start, i64 offset,
 
   if (*buf) {
     read_uleb(buf); // size
-    read_uleb(buf); // flags
+    i64 flags = read_uleb(buf);
     read_uleb(buf); // addr
-    this->syms.push_back(get_symbol(ctx, save_string(ctx, prefix)));
+
+    if (flags == EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION)
+      weak_exports.insert(save_string(ctx, prefix));
+    else
+      exports.insert(save_string(ctx, prefix));
   } else {
     buf++;
   }
@@ -782,20 +850,20 @@ template <typename E>
 void DylibFile<E>::parse_tapi(Context<E> &ctx) {
   TextDylib tbd = parse_tbd(ctx, this->mf);
 
-  for (std::string_view s : tbd.exports)
-    this->syms.push_back(get_symbol(ctx, s));
-
-  for (std::string_view s : tbd.weak_exports)
-    this->syms.push_back(get_symbol(ctx, s));
-
   install_name = tbd.install_name;
-  reexported_libs = tbd.reexported_libs;
+  reexported_libs = std::move(tbd.reexported_libs);
+  exports = std::move(tbd.exports);
+  weak_exports = std::move(tbd.weak_exports);
 }
 
 template <typename E>
 void DylibFile<E>::parse_dylib(Context<E> &ctx) {
   MachHeader &hdr = *(MachHeader *)this->mf->data;
   u8 *p = this->mf->data + sizeof(hdr);
+
+  if (ctx.arg.application_extension && !(hdr.flags & MH_APP_EXTENSION_SAFE))
+    Warn(ctx) << "linking against a dylib which is not safe for use in "
+              << "application extensions: " << *this;
 
   for (i64 i = 0; i < hdr.ncmds; i++) {
     LoadCommand &lc = *(LoadCommand *)p;
@@ -817,25 +885,30 @@ void DylibFile<E>::parse_dylib(Context<E> &ctx) {
       read_trie(ctx, this->mf->data + cmd.dataoff);
       break;
     }
+    case LC_REEXPORT_DYLIB: {
+      DylibCommand &cmd = *(DylibCommand *)p;
+      reexported_libs.push_back((char *)p + cmd.nameoff);
+      break;
     }
-
+    }
     p += lc.cmdsize;
   }
 }
 
 template <typename E>
 void DylibFile<E>::resolve_symbols(Context<E> &ctx) {
-  for (Symbol<E> *sym : this->syms) {
-    std::scoped_lock lock(sym->mu);
+  for (i64 i = 0; i < this->syms.size(); i++) {
+    Symbol<E> &sym = *this->syms[i];
+    std::scoped_lock lock(sym.mu);
 
-    if (get_rank(this, false, false) < get_rank(*sym)) {
-      sym->file = this;
-      sym->scope = SCOPE_LOCAL;
-      sym->is_imported = true;
-      sym->is_weak_def = this->is_weak;
-      sym->subsec = nullptr;
-      sym->value = 0;
-      sym->is_common = false;
+    if (get_rank(this, false, false) < get_rank(sym)) {
+      sym.file = this;
+      sym.scope = SCOPE_LOCAL;
+      sym.is_imported = true;
+      sym.is_weak = (this->is_weak || is_weak_symbol[i]);
+      sym.subsec = nullptr;
+      sym.value = 0;
+      sym.is_common = false;
     }
   }
 }

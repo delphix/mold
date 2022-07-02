@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <tbb/concurrent_hash_map.h>
 #include <tbb/spin_mutex.h>
@@ -159,21 +160,27 @@ class DylibFile : public InputFile<E> {
 public:
   static DylibFile *create(Context<E> &ctx, MappedFile<Context<E>> *mf);
 
-  void parse_tapi(Context<E> &ctx);
-  void parse_dylib(Context<E> &ctx);
+  void parse(Context<E> &ctx);
   void resolve_symbols(Context<E> &ctx) override;
 
   std::string_view install_name;
   i64 dylib_idx = 0;
+  bool is_reexported = false;
+
   std::vector<std::string_view> reexported_libs;
+  std::set<std::string_view> exports;
+  std::set<std::string_view> weak_exports;
 
 private:
+  DylibFile(Context<E> &ctx, MappedFile<Context<E>> *mf);
+
+  void parse_tapi(Context<E> &ctx);
+  void parse_dylib(Context<E> &ctx);
+
   void read_trie(Context<E> &ctx, u8 *start, i64 offset = 0,
                  const std::string &prefix = "");
 
-  DylibFile(MappedFile<Context<E>> *mf) : InputFile<E>(mf) {
-    this->is_dylib = true;
-  }
+  std::vector<bool> is_weak_symbol;
 };
 
 template <typename E>
@@ -281,7 +288,7 @@ struct Symbol {
 
   u8 scope : 2 = SCOPE_LOCAL;
   bool is_common : 1 = false;
-  bool is_weak_def : 1 = false;
+  bool is_weak : 1 = false;
   bool is_imported : 1 = false;
   bool referenced_dynamically : 1 = false;
 
@@ -331,11 +338,14 @@ private:
 template <typename E>
 class Chunk {
 public:
-  inline Chunk(Context<E> &ctx, std::string_view segname,
-               std::string_view sectname);
+  Chunk(Context<E> &ctx, std::string_view segname, std::string_view sectname) {
+    ctx.chunks.push_back(this);
+    hdr.set_segname(segname);
+    hdr.set_sectname(sectname);
+  }
 
   virtual ~Chunk() = default;
-  virtual void compute_size(Context<E> &ctx) {};
+  virtual void compute_size(Context<E> &ctx) {}
   virtual void copy_buf(Context<E> &ctx) {}
 
   MachSection hdr = {};
@@ -563,7 +573,7 @@ public:
 
   i64 num_locals = 0;
   i64 num_globals = 0;
-  i64 num_undefs =0;
+  i64 num_undefs = 0;
 };
 
 template <typename E>
@@ -697,10 +707,7 @@ template <typename E>
 class SectCreateSection : public Chunk<E> {
 public:
   SectCreateSection(Context<E> &ctx, std::string_view seg, std::string_view sect,
-                    std::string_view contents)
-    : Chunk<E>(ctx, seg, sect), contents(contents) {
-    this->hdr.size = contents.size();
-  }
+                    std::string_view contents);
 
   void copy_buf(Context<E> &ctx) override;
 
@@ -739,8 +746,8 @@ parse_yaml(std::string_view str);
 struct TextDylib {
   std::string_view install_name;
   std::vector<std::string_view> reexported_libs;
-  std::vector<std::string_view> exports;
-  std::vector<std::string_view> weak_exports;
+  std::set<std::string_view> exports;
+  std::set<std::string_view> weak_exports;
 };
 
 template <typename E>
@@ -749,6 +756,9 @@ TextDylib parse_tbd(Context<E> &ctx, MappedFile<Context<E>> *mf);
 //
 // cmdline.cc
 //
+
+template <typename E>
+i64 parse_version(Context<E> &ctx, std::string_view arg);
 
 template <typename E>
 std::vector<std::string> parse_nonpositional_args(Context<E> &ctx);
@@ -781,6 +791,17 @@ void create_range_extension_thunks(Context<ARM64> &ctx, OutputSection<ARM64> &os
 //
 
 enum UuidKind { UUID_NONE, UUID_HASH, UUID_RANDOM };
+
+struct AddEmptySectionOption {
+  std::string_view segname;
+  std::string_view sectname;
+};
+
+struct SectAlignOption {
+  std::string_view segname;
+  std::string_view sectname;
+  u8 p2align;
+};
 
 struct SectCreateOption {
   std::string_view segname;
@@ -824,6 +845,7 @@ struct Context {
     UuidKind uuid = UUID_HASH;
     bool ObjC = false;
     bool adhoc_codesign = std::is_same_v<E, ARM64>;
+    bool application_extension = false;
     bool color_diagnostics = false;
     bool dead_strip = false;
     bool dead_strip_dylibs = false;
@@ -857,6 +879,8 @@ struct Context {
     std::string map;
     std::string object_path_lto;
     std::string output = "a.out";
+    std::vector<AddEmptySectionOption> add_empty_section;
+    std::vector<SectAlignOption> sectalign;
     std::vector<SectCreateOption> sectcreate;
     std::vector<std::string> U;
     std::vector<std::string> framework_paths;
@@ -875,6 +899,7 @@ struct Context {
   bool needed_l = false;
   bool hidden_l = false;
   bool weak_l = false;
+  bool reexport_l = false;
   std::unordered_set<std::string_view> loaded_archives;
 
   u8 uuid[16] = {};
@@ -989,14 +1014,6 @@ inline std::ostream &operator<<(std::ostream &out, const Symbol<E> &sym) {
   else
     out << sym.name;
   return out;
-}
-
-template <typename E>
-Chunk<E>::Chunk(Context<E> &ctx, std::string_view segname,
-                std::string_view sectname) {
-  ctx.chunks.push_back(this);
-  hdr.set_segname(segname);
-  hdr.set_sectname(sectname);
 }
 
 inline u64 RangeExtensionThunk<ARM64>::get_addr(i64 idx) const {

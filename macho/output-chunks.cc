@@ -3,6 +3,7 @@
 
 #include <shared_mutex>
 #include <sys/mman.h>
+#include <tbb/enumerable_thread_specific.h>
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_for_each.h>
 #include <tbb/parallel_sort.h>
@@ -120,8 +121,8 @@ static std::vector<u8> create_build_version_cmd(Context<E> &ctx) {
   cmd.ntools = 1;
 
   BuildToolVersion &tool = *(BuildToolVersion *)(buf.data() + sizeof(cmd));
-  tool.tool = 3;
-  tool.version = 0x28a0900;
+  tool.tool = TOOL_MOLD;
+  tool.version = parse_version(ctx, MOLD_VERSION);
   return buf;
 }
 
@@ -154,7 +155,13 @@ create_load_dylib_cmd(Context<E> &ctx, DylibFile<E> &dylib) {
   std::vector<u8> buf(align_to(size, 8));
   DylibCommand &cmd = *(DylibCommand *)buf.data();
 
-  cmd.cmd = (dylib.is_weak ? LC_LOAD_WEAK_DYLIB : LC_LOAD_DYLIB);
+  if (dylib.is_reexported)
+    cmd.cmd = LC_REEXPORT_DYLIB;
+  else if (dylib.is_weak)
+    cmd.cmd = LC_LOAD_WEAK_DYLIB;
+  else
+    cmd.cmd = LC_LOAD_DYLIB;
+
   cmd.cmdsize = buf.size();
   cmd.nameoff = sizeof(cmd);
   cmd.timestamp = 2;
@@ -314,6 +321,14 @@ static bool has_tlv(Context<E> &ctx) {
 }
 
 template <typename E>
+static bool has_reexported_lib(Context<E> &ctx) {
+  for (DylibFile<E> *file : ctx.dylibs)
+    if (file->is_reexported)
+      return true;
+  return false;
+}
+
+template <typename E>
 void OutputMachHeader<E>::copy_buf(Context<E> &ctx) {
   u8 *buf = ctx.buf + this->hdr.offset;
 
@@ -331,7 +346,7 @@ void OutputMachHeader<E>::copy_buf(Context<E> &ctx) {
   if (has_tlv(ctx))
     mhdr.flags |= MH_HAS_TLV_DESCRIPTORS;
 
-  if (ctx.output_type == MH_DYLIB)
+  if (ctx.output_type == MH_DYLIB && !has_reexported_lib(ctx))
     mhdr.flags |= MH_NO_REEXPORTED_DYLIBS;
 
   write_vector(buf + sizeof(mhdr), flatten(cmds));
@@ -670,7 +685,7 @@ BindEncoder::BindEncoder() {
 }
 
 template <typename E>
-static u32 get_dylib_idx(InputFile<E> *file) {
+static i32 get_dylib_idx(InputFile<E> *file) {
   if (file->is_dylib)
     return ((DylibFile<E> *)file)->dylib_idx;
   return BIND_SPECIAL_DYLIB_FLAT_LOOKUP;
@@ -679,10 +694,13 @@ static u32 get_dylib_idx(InputFile<E> *file) {
 template <typename E>
 void BindEncoder::add(Symbol<E> &sym, i64 seg_idx, i64 offset) {
   i64 dylib_idx = get_dylib_idx(sym.file);
-  i64 flags = (sym.file->is_weak ? BIND_SYMBOL_FLAGS_WEAK_IMPORT : 0);
+  i64 flags = (sym.is_weak ? BIND_SYMBOL_FLAGS_WEAK_IMPORT : 0);
 
   if (last_dylib != dylib_idx) {
-    if (dylib_idx < 16) {
+    if (dylib_idx < 0) {
+      buf.push_back(BIND_OPCODE_SET_DYLIB_SPECIAL_IMM |
+                    (dylib_idx & BIND_IMMEDIATE_MASK));
+    } else if (dylib_idx < 16) {
       buf.push_back(BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | dylib_idx);
     } else {
       buf.push_back(BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB);
@@ -759,14 +777,16 @@ void LazyBindSection<E>::add(Context<E> &ctx, Symbol<E> &sym) {
 
   i64 dylib_idx = get_dylib_idx(sym.file);
 
-  if (dylib_idx < 16) {
+  if (dylib_idx < 0) {
+    emit(BIND_OPCODE_SET_DYLIB_SPECIAL_IMM | (dylib_idx & BIND_IMMEDIATE_MASK));
+  } else if (dylib_idx < 16) {
     emit(BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | dylib_idx);
   } else {
     emit(BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB);
     encode_uleb(contents, dylib_idx);
   }
 
-  i64 flags = (sym.file->is_weak ? BIND_SYMBOL_FLAGS_WEAK_IMPORT : 0);
+  i64 flags = (sym.is_weak ? BIND_SYMBOL_FLAGS_WEAK_IMPORT : 0);
   assert(flags < 16);
 
   emit(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | flags);
@@ -832,8 +852,7 @@ i64 ExportEncoder::finish() {
 
 static i64 common_prefix_len(std::string_view x, std::string_view y) {
   i64 i = 0;
-  i64 end = std::min(x.size(), y.size());
-  while (i < end && x[i] == y[i])
+  while (i < x.size() && i < y.size() && x[i] == y[i])
     i++;
   return i;
 }
@@ -864,7 +883,7 @@ ExportEncoder::construct_trie(TrieNode &node, std::span<Entry> entries, i64 len,
     std::span<Entry> subspan = entries.subspan(i, j - i);
 
     if (divide && j - i < grain_size) {
-      tg->run([=] {
+      tg->run([=, this] {
         construct_trie(*child, subspan, new_len, tg, grain_size, false);
       });
     } else {
@@ -926,14 +945,22 @@ void ExportSection<E>::compute_size(Context<E> &ctx) {
   for (ObjectFile<E> *file : ctx.objs)
     for (Symbol<E> *sym : file->syms)
       if (sym && sym->file == file & sym->scope == SCOPE_EXTERN)
-        enc.entries.push_back({sym->name, 0,
-                               sym->get_addr(ctx) - ctx.arg.pagezero_size});
+        enc.entries.push_back({
+            sym->name,
+            sym->is_weak ? EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION : 0,
+            sym->get_addr(ctx) - ctx.arg.pagezero_size});
+
+  if (enc.entries.empty())
+    return;
 
   this->hdr.size = align_to(enc.finish(), 8);
 }
 
 template <typename E>
 void ExportSection<E>::copy_buf(Context<E> &ctx) {
+  if (this->hdr.size == 0)
+    return;
+
   u8 *buf = ctx.buf + this->hdr.offset;
   memset(buf, 0, this->hdr.size);
   enc.write_trie(buf, enc.root);
@@ -981,12 +1008,26 @@ void SymtabSection<E>::compute_size(Context<E> &ctx) {
   symtab_offsets.resize(ctx.objs.size() + ctx.dylibs.size() + 1);
   strtab_offsets.resize(ctx.objs.size() + ctx.dylibs.size() + 1);
 
+  tbb::enumerable_thread_specific<i64> locals;
+  tbb::enumerable_thread_specific<i64> globals;
+  tbb::enumerable_thread_specific<i64> undefs;
+
+  auto count = [&](Symbol<E> *sym) {
+    if (sym->is_imported)
+      undefs.local() += 1;
+    else if (sym->scope == SCOPE_EXTERN)
+      globals.local() += 1;
+    else
+      locals.local() += 1;
+  };
+
   tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
     ObjectFile<E> &file = *ctx.objs[i];
     for (Symbol<E> *sym : file.syms) {
-      if (sym && sym->file == &file) {
+      if (sym && sym->file == &file && (!sym->subsec || sym->subsec->is_alive)) {
         symtab_offsets[i + 1]++;
         strtab_offsets[i + 1] += sym->name.size() + 1;
+        count(sym);
       }
     }
   });
@@ -998,9 +1039,14 @@ void SymtabSection<E>::compute_size(Context<E> &ctx) {
           (sym->stub_idx != -1 || sym->got_idx != -1)) {
         symtab_offsets[i + 1 + ctx.objs.size()]++;
         strtab_offsets[i + 1 + ctx.objs.size()] += sym->name.size() + 1;
+        count(sym);
       }
     }
   });
+
+  num_locals = locals.combine(std::plus());
+  num_globals = globals.combine(std::plus());
+  num_undefs = undefs.combine(std::plus());
 
   for (i64 i = 1; i < symtab_offsets.size(); i++)
     symtab_offsets[i] += symtab_offsets[i - 1];
@@ -1020,20 +1066,32 @@ void SymtabSection<E>::copy_buf(Context<E> &ctx) {
   u8 *strtab = ctx.buf + ctx.strtab.hdr.offset;
   strtab[0] = '\0';
 
+  Symbol<E> *mh_execute_header = get_symbol(ctx, "__mh_execute_header");
+  Symbol<E> *dyld_private = get_symbol(ctx, "__dyld_private");
+  Symbol<E> *mh_dylib_header = get_symbol(ctx, "__mh_dylib_header");
+  Symbol<E> *mh_bundle_header = get_symbol(ctx, "__mh_bundle_header");
+  Symbol<E> *dso_handle = get_symbol(ctx, "___dso_handle");
+
   auto write = [&](Symbol<E> &sym, i64 symoff, i64 stroff) {
     MachSym &msym = buf[symoff];
 
     msym.stroff = stroff;
     write_string(strtab + stroff, sym.name);
 
-    msym.type = (sym.is_imported ? N_UNDF : N_SECT);
     msym.is_extern = (sym.is_imported || sym.scope == SCOPE_EXTERN);
+    msym.type = (sym.is_imported ? N_UNDF : N_SECT);
 
-    if (!sym.is_imported && (!sym.subsec || sym.subsec->is_alive))
-      msym.value = sym.get_addr(ctx);
-
-    if (sym.subsec && sym.subsec->is_alive)
+    if (sym.is_imported)
+      msym.sect = N_UNDF;
+    else if (sym.subsec)
       msym.sect = sym.subsec->isec.osec.sect_idx;
+    else if (&sym == mh_execute_header)
+      msym.sect = ctx.text->sect_idx;
+    else if (&sym == dyld_private || &sym == mh_dylib_header ||
+             &sym == mh_bundle_header || &sym == dso_handle)
+      msym.sect = ctx.data->sect_idx;
+    else
+      msym.sect = N_ABS;
 
     if (sym.file->is_dylib)
       msym.desc = ((DylibFile<E> *)sym.file)->dylib_idx << 8;
@@ -1041,6 +1099,9 @@ void SymtabSection<E>::copy_buf(Context<E> &ctx) {
       msym.desc = DYNAMIC_LOOKUP_ORDINAL << 8;
     else if (sym.referenced_dynamically)
       msym.desc = REFERENCED_DYNAMICALLY;
+
+    if (!sym.is_imported && (!sym.subsec || sym.subsec->is_alive))
+      msym.value = sym.get_addr(ctx);
   };
 
   tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
@@ -1049,7 +1110,7 @@ void SymtabSection<E>::copy_buf(Context<E> &ctx) {
     i64 stroff = strtab_offsets[i];
 
     for (Symbol<E> *sym : file.syms) {
-      if (sym && sym->file == &file) {
+      if (sym && sym->file == &file && (!sym->subsec || sym->subsec->is_alive)) {
         write(*sym, symoff, stroff);
         symoff++;
         stroff += sym->name.size() + 1;
@@ -1070,6 +1131,19 @@ void SymtabSection<E>::copy_buf(Context<E> &ctx) {
         stroff += sym->name.size() + 1;
       }
     }
+  });
+
+  auto get_rank = [](const MachSym &msym) {
+    if (msym.sect == N_UNDF)
+      return 2;
+    if (msym.is_extern)
+      return 1;
+    return 0;
+  };
+
+  std::stable_sort(buf, buf + this->hdr.size / sizeof(MachSym),
+       [&](const MachSym &a, const MachSym &b) {
+     return std::tuple{get_rank(a), a.value} < std::tuple{get_rank(b), b.value};
   });
 }
 
@@ -1146,7 +1220,7 @@ void CodeSignatureSection<E>::write_signature(Context<E> &ctx) {
 
   for (i64 i = 0; i < num_blocks; i += 1024) {
     i64 j = std::min(num_blocks, i + 1024);
-    tbb::parallel_for(i, j, [&](i64 k) { compute_hash(k); });
+    tbb::parallel_for(i, j, compute_hash);
 
 #if __APPLE__
     // Calling msync() with MS_ASYNC speeds up the following msync()
@@ -1159,7 +1233,7 @@ void CodeSignatureSection<E>::write_signature(Context<E> &ctx) {
   // entire file. We compute its value as a tree hash.
   if (ctx.arg.uuid == UUID_HASH) {
     u8 uuid[SHA256_SIZE];
-    SHA256(buf, num_blocks * SHA256_SIZE, uuid);
+    SHA256(ctx.buf + this->hdr.offset, this->hdr.size, uuid);
 
     // Indicate that this is UUIDv4 as defined by RFC4122.
     uuid[6] = (uuid[6] & 0b00001111) | 0b01010000;
@@ -1332,7 +1406,6 @@ UnwindEncoder<E>::encode(Context<E> &ctx, std::span<UnwindRecord<E>> records) {
 
     page1++;
     page2 = (UnwindSecondLevelPage *)(encoding + map.size());
-    break;
   }
 
   // Write a terminator
@@ -1455,6 +1528,15 @@ void ThreadPtrsSection<E>::copy_buf(Context<E> &ctx) {
   for (i64 i = 0; i < syms.size(); i++)
     if (Symbol<E> &sym = *syms[i]; !sym.is_imported)
       buf[i] = sym.get_addr(ctx);
+}
+
+template <typename E>
+SectCreateSection<E>::SectCreateSection(Context<E> &ctx, std::string_view seg,
+                                        std::string_view sect,
+                                        std::string_view contents)
+  : Chunk<E>(ctx, seg, sect), contents(contents) {
+  this->hdr.size = contents.size();
+  ctx.chunk_pool.emplace_back(this);
 }
 
 template <typename E>
