@@ -3,7 +3,7 @@ Index: mold/Makefile
 --- mold.orig/Makefile
 +++ mold/Makefile
 @@ -1,6 +1,6 @@
- VERSION = 1.3.0
+ VERSION = 1.3.1
  
 -PREFIX = /usr/local
 +PREFIX = /usr
