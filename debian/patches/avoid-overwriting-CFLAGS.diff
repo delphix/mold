@@ -1,0 +1,18 @@
+Index: mold/Makefile
+===================================================================
+--- a/Makefile
++++ b/Makefile
+@@ -35,8 +35,11 @@ endif
+ 
+ # If you want to compile mold for debugging, invoke make as
+ # `make CXXFLAGS=-g`.
+-CFLAGS = -O2
+-CXXFLAGS = -O2
++
++# Avoid overwriting C*FLAGS set by debian/rules, such as hardening.
++# And we already have -O2 by default, so no need to append here.
++#CFLAGS = -O2
++#CXXFLAGS = -O2
+ 
+ MOLD_CXXFLAGS := -std=c++20 -fno-exceptions -fno-unwind-tables \
+                  -fno-asynchronous-unwind-tables -Ithird-party/xxhash \
