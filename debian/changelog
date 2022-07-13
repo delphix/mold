@@ -1,3 +1,16 @@
+mold (1.3.1+dfsg-2) UNRELEASED; urgency=medium
+
+  * d/control:
+    - Sort B-D list.
+    - Remove libstdc++-10-dev and unused clang from B-D list.
+    - Add libmimalloc-dev and libtbb-dev to B-D list.
+  * debian/rules:
+    - Prefer to use system library mimalloc and tbb.
+  * debian/patches:
+    - Add patch to avoid overwriting C*FLAGS set by debian/rules.
+
+ -- Roger Shimizu <rosh@debian.org>  Wed, 13 Jul 2022 17:26:07 +0200
+
 mold (1.3.1+dfsg-1) unstable; urgency=medium
 
   * New upstream release
