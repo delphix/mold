@@ -19,5 +19,4 @@ export SYSTEM_TBB = 1
 	dh $@
 
 override_dh_auto_configure:
-	rm -rf third-party
 	dh_auto_configure
