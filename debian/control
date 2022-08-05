@@ -12,6 +12,7 @@ Build-Depends:
  libxxhash-dev,
  pkg-config,
  zlib1g-dev,
+ gdb
 Standards-Version: 4.6.0
 Homepage: https://github.com/rui314/mold
 Vcs-Browser: https://salsa.debian.org/pkg-llvm-team/mold

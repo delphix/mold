@@ -12,6 +12,9 @@ mold (1.4.0+dfsg-1) unstable; urgency=medium
 
   [ Sylvestre Ledru ]
   * New upstream release
+  * Add gdb as a build dep for tests
+  * For now, use TBB from the tree
+    See https://github.com/rui314/mold/issues/600
 
  -- Sylvestre Ledru <sylvestre@debian.org>  Fri, 05 Aug 2022 09:43:13 +0200
 
