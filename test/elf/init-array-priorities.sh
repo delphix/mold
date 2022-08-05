@@ -9,13 +9,11 @@ OBJDUMP="${OBJDUMP:-objdump}"
 MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
+t=out/test/elf/$MACHINE/$testname
 mkdir -p $t
 
 # musl does not support GNU-style init/fini priorities
-echo 'int main() {}' | $CC -o $t/exe -xc -
-readelf --dynamic $t/exe | grep -q ld-musl && { echo skipped; exit; }
+ldd --help 2>&1 | grep -q musl && { echo skipped; exit; }
 
 cat <<'EOF' | $CC -c -o $t/a.o -xc -
 #include <stdio.h>

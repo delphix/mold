@@ -9,13 +9,13 @@ OBJDUMP="${OBJDUMP:-objdump}"
 MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
+t=out/test/elf/$MACHINE/$testname
 mkdir -p $t
 
 [ $MACHINE = $(uname -m) ] || { echo skipped; exit; }
 
-which clang >& /dev/null || { echo skipped; exit; }
+echo 'int main() {}' | clang -flto -o /dev/null -xc - >& /dev/null \
+  || { echo skipped; exit; }
 
 cat <<EOF | clang -flto -c -o $t/a.o -xc -
 #include <stdio.h>

@@ -176,12 +176,9 @@ void InputSection<E>::dispatch(Context<E> &ctx, Action table[3][4], i64 i,
   case PLT:
     sym.flags |= NEEDS_PLT;
     return;
-  case CPLT: {
-    std::scoped_lock lock(sym.mu);
-    sym.flags |= NEEDS_PLT;
-    sym.is_canonical = true;
+  case CPLT:
+    sym.flags |= NEEDS_CPLT;
     return;
-  }
   case DYNREL:
     if (!is_writable) {
       if (ctx.arg.z_text) {
@@ -219,7 +216,7 @@ void InputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
     return;
 
   // Copy data
-  if constexpr (std::is_same_v<E, RISCV64>) {
+  if constexpr (std::is_same_v<E, RISCV64> || std::is_same_v<E, RISCV32>) {
     copy_contents_riscv(ctx, buf);
   } else if (compressed) {
     uncompress_to(ctx, buf);

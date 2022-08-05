@@ -48,6 +48,7 @@ struct Relocation {
   u8 type = -1;
   u8 p2size = 0;
   bool is_pcrel : 1 = false;
+  bool is_subtracted : 1 = false;
   bool needs_dynrel : 1 = false;
   i64 addend = 0;
   Symbol<E> *sym = nullptr;
@@ -123,6 +124,7 @@ public:
                          std::function<void(ObjectFile<E> *)> feeder);
   void convert_common_symbols(Context<E> &ctx);
   void check_duplicate_symbols(Context<E> &ctx);
+  std::string_view get_linker_optimization_hints(Context<E> &ctx);
 
   Relocation<E> read_reloc(Context<E> &ctx, const MachSection &hdr, MachRel r);
 
@@ -133,6 +135,7 @@ public:
   std::vector<Symbol<E>> local_syms;
   std::vector<UnwindRecord<E>> unwind_records;
   std::span<DataInCodeEntry> data_in_code_entries;
+  ObjcImageInfo *objc_image_info = nullptr;
   LTOModule *lto_module = nullptr;
 
   // For the internal file and LTO object files
@@ -242,6 +245,7 @@ public:
 
   std::atomic_uint8_t p2align = 0;
   std::atomic_bool is_alive = true;
+  bool is_cstring : 1 = false;
   bool is_coalesced : 1 = false;
   bool added_to_osec : 1 = false;
 };
@@ -287,9 +291,10 @@ struct Symbol {
   std::atomic_uint8_t flags = 0;
 
   u8 scope : 2 = SCOPE_LOCAL;
+  bool is_imported : 1 = false;
   bool is_common : 1 = false;
   bool is_weak : 1 = false;
-  bool is_imported : 1 = false;
+  bool no_dead_strip : 1 = false;
   bool referenced_dynamically : 1 = false;
 
   // For range extension thunks
@@ -588,18 +593,34 @@ public:
 };
 
 template <typename E>
+class ObjcImageInfoSection : public Chunk<E> {
+public:
+  static std::unique_ptr<ObjcImageInfoSection> create(Context<E> &ctx);
+
+  ObjcImageInfoSection(Context<E> &ctx, ObjcImageInfo contents)
+    : Chunk<E>(ctx, "__DATA", "__objc_imageinfo"),
+      contents(contents) {
+    this->hdr.p2align = 2;
+    this->hdr.size = sizeof(contents);
+  }
+
+  void copy_buf(Context<E> &ctx) override;
+
+private:
+  ObjcImageInfo contents;
+};
+
+template <typename E>
 class CodeSignatureSection : public Chunk<E> {
 public:
   CodeSignatureSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__LINKEDIT", "__code_signature") {
     this->is_hidden = true;
-    this->hdr.p2align = std::countr_zero(16U);
+    this->hdr.p2align = 3;
   }
 
   void compute_size(Context<E> &ctx) override;
   void write_signature(Context<E> &ctx);
-
-  static constexpr i64 BLOCK_SIZE = 4096;
 };
 
 template <typename E>
@@ -608,7 +629,7 @@ public:
   DataInCodeSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__LINKEDIT", "__data_in_code") {
     this->is_hidden = true;
-    this->hdr.p2align = std::countr_zero(alignof(DataInCodeEntry));
+    this->hdr.p2align = 3;
   }
 
   void compute_size(Context<E> &ctx) override;
@@ -621,7 +642,7 @@ template <typename E>
 class StubsSection : public Chunk<E> {
 public:
   StubsSection(Context<E> &ctx) : Chunk<E>(ctx, "__TEXT", "__stubs") {
-    this->hdr.p2align = std::countr_zero(2U);
+    this->hdr.p2align = 4;
     this->hdr.type = S_SYMBOL_STUBS;
     this->hdr.attr = S_ATTR_SOME_INSTRUCTIONS | S_ATTR_PURE_INSTRUCTIONS;
     this->hdr.reserved1 = 0;
@@ -640,7 +661,7 @@ class StubHelperSection : public Chunk<E> {
 public:
   StubHelperSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__TEXT", "__stub_helper") {
-    this->hdr.p2align = std::countr_zero(4U);
+    this->hdr.p2align = 4;
     this->hdr.attr = S_ATTR_SOME_INSTRUCTIONS | S_ATTR_PURE_INSTRUCTIONS;
   }
 
@@ -652,7 +673,7 @@ class UnwindInfoSection : public Chunk<E> {
 public:
   UnwindInfoSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__TEXT", "__unwind_info") {
-    this->hdr.p2align = std::countr_zero(4U);
+    this->hdr.p2align = 2;
   }
 
   void compute_size(Context<E> &ctx) override;
@@ -785,6 +806,7 @@ void do_lto(Context<E> &ctx);
 //
 
 void create_range_extension_thunks(Context<ARM64> &ctx, OutputSection<ARM64> &osec);
+void apply_linker_optimization_hints(Context<ARM64> &ctx);
 
 //
 // main.cc
@@ -820,11 +842,9 @@ struct Context {
     text = OutputSection<E>::get_instance(*this, "__TEXT", "__text");
     data = OutputSection<E>::get_instance(*this, "__DATA", "__data");
     bss = OutputSection<E>::get_instance(*this, "__DATA", "__bss");
-    cstring = OutputSection<E>::get_instance(*this, "__TEXT", "__cstring");
     common = OutputSection<E>::get_instance(*this, "__DATA", "__common");
 
     bss->hdr.type = S_ZEROFILL;
-    cstring->hdr.type = S_CSTRING_LITERALS;
     common->hdr.type = S_ZEROFILL;
   }
 
@@ -851,10 +871,12 @@ struct Context {
     bool dead_strip_dylibs = false;
     bool deduplicate = true;
     bool demangle = true;
-    bool dylib = false;
     bool dynamic = true;
     bool export_dynamic = false;
     bool fatal_warnings = false;
+    bool function_starts = true;
+    bool ignore_optimization_hints = false;
+    bool mark_dead_strippable_dylib = false;
     bool noinhibit_exec = false;
     bool perf = false;
     bool quick_exit = true;
@@ -872,7 +894,9 @@ struct Context {
     i64 platform_sdk_version = 0;
     i64 stack_size = 0;
     i64 thread_count = 0;
+    std::string bundle_loader;
     std::string chroot;
+    std::string dependency_info;
     std::string final_output;
     std::string install_name;
     std::string lto_library;
@@ -883,6 +907,7 @@ struct Context {
     std::vector<SectAlignOption> sectalign;
     std::vector<SectCreateOption> sectcreate;
     std::vector<std::string> U;
+    std::vector<std::string> add_ast_path;
     std::vector<std::string> framework_paths;
     std::vector<std::string> library_paths;
     std::vector<std::string> mllvm;
@@ -900,7 +925,7 @@ struct Context {
   bool hidden_l = false;
   bool weak_l = false;
   bool reexport_l = false;
-  std::unordered_set<std::string_view> loaded_archives;
+  std::set<std::string> missing_files; // for -dependency_info
 
   u8 uuid[16] = {};
   bool has_error = false;
@@ -925,6 +950,7 @@ struct Context {
 
   std::vector<ObjectFile<E> *> objs;
   std::vector<DylibFile<E> *> dylibs;
+  ObjectFile<E> *internal_obj = nullptr;
 
   OutputSegment<E> *text_seg = nullptr;
   OutputSegment<E> *data_const_seg = nullptr;
@@ -946,16 +972,16 @@ struct Context {
   BindSection<E> bind{*this};
   LazyBindSection<E> lazy_bind{*this};
   ExportSection<E> export_{*this};
-  FunctionStartsSection<E> function_starts{*this};
   SymtabSection<E> symtab{*this};
   StrtabSection<E> strtab{*this};
 
+  std::unique_ptr<FunctionStartsSection<E>> function_starts;
+  std::unique_ptr<ObjcImageInfoSection<E>> image_info;
   std::unique_ptr<CodeSignatureSection<E>> code_sig;
 
   OutputSection<E> *text = nullptr;
   OutputSection<E> *data = nullptr;
   OutputSection<E> *bss = nullptr;
-  OutputSection<E> *cstring = nullptr;
   OutputSection<E> *common = nullptr;
 };
 

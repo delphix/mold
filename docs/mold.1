@@ -529,6 +529,10 @@ options.
 .It Fl -dynamic-list Ns = Ns Ar file
 Read a list of dynamic symbols from
 .Ar file .
+Same as
+.Fl -export-dynamic-symbol-list ,
+except that it implies
+.Fl -Bsymbolic .
 .Pp
 .It Fl -eh-frame-hdr
 .It Fl -no-eh-frame-hdr
@@ -568,6 +572,20 @@ instead.
 Mark all symbols in the given
 .Ar libraries
 hidden.
+.Pp
+.It Fl -export-dynamic-symbol Ns = Ns Ar sym
+Put symbols matching
+.Ar sym
+in the dynamic symbol table.
+.Ar sym
+may be a glob, with the same syntax as the globs used in
+.Fl -export-dynamic-symbol-list
+or
+.Fl -version-script .
+.Pp
+.It Fl -export-dynamic-symbol-list Ns = Ns Ar file
+Read a list of dynamic symbols from
+.Ar file .
 .Pp
 .It Fl -fatal-warnings
 .It Fl -no-fatal-warnings
@@ -639,8 +657,8 @@ with something else without taking an address of a function.
 needs to be used with a compiler that supports
 .Sy .llvm_addrsig
 section which contains the information as to what symbols are address-taken. \
-LLVM/Clang supports that section by default. Since GCC does not suppor it yet, \
-you cannot use
+LLVM/Clang supports that section by default. Since GCC does not support it \
+yet, you cannot use
 .Fl -icf=safe
 with GCC (it doesn't do any harm but can't optimize at all.)
 .Pp

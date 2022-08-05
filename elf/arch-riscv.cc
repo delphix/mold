@@ -5,8 +5,6 @@
 
 namespace mold::elf {
 
-using E = RISCV64;
-
 static u32 itype(u32 val) {
   return val << 20;
 }
@@ -82,10 +80,11 @@ static void write_cjtype(u8 *loc, u32 val) {
   *(ul16 *)loc = (*(ul16 *)loc & mask) | cjtype(val);
 }
 
+template <typename E>
 static void write_plt_header(Context<E> &ctx) {
   u8 *buf = ctx.buf + ctx.plt->shdr.sh_offset;
 
-  static const u32 plt0[] = {
+  static const u32 plt0_64[] = {
     0x00000397, // auipc  t2, %pcrel_hi(.got.plt)
     0x41c30333, // sub    t1, t1, t3               # .plt entry + hdr + 12
     0x0003be03, // ld     t3, %pcrel_lo(1b)(t2)    # _dl_runtime_resolve
@@ -96,64 +95,85 @@ static void write_plt_header(Context<E> &ctx) {
     0x000e0067, // jr     t3
   };
 
+  static const u32 plt0_32[] = {
+    0x00000397, // auipc  t2, %pcrel_hi(.got.plt)
+    0x41c30333, // sub    t1, t1, t3               # .plt entry + hdr + 12
+    0x0003ae03, // lw     t3, %pcrel_lo(1b)(t2)    # _dl_runtime_resolve
+    0xfd430313, // addi   t1, t1, -44              # .plt entry
+    0x00038293, // addi   t0, t2, %pcrel_lo(1b)    # &.got.plt
+    0x00135313, // srli   t1, t1, 1                # .plt entry offset
+    0x0082a283, // lw     t0, 8(t0)                # link map
+    0x000e0067, // jr     t3
+  };
+
+  if constexpr (E::word_size == 8)
+    memcpy(buf, plt0_64, sizeof(plt0_64));
+  else
+    memcpy(buf, plt0_32, sizeof(plt0_32));
+
   u64 gotplt = ctx.gotplt->shdr.sh_addr;
   u64 plt = ctx.plt->shdr.sh_addr;
 
-  memcpy(buf, plt0, sizeof(plt0));
   write_utype(buf, gotplt - plt);
   write_itype(buf + 8, gotplt - plt);
   write_itype(buf + 16, gotplt - plt);
 }
 
-static void write_plt_entry(Context<E> &ctx, Symbol<E> &sym) {
-  u8 *ent = ctx.buf + ctx.plt->shdr.sh_offset + ctx.plt_hdr_size +
-            sym.get_plt_idx(ctx) * ctx.plt_size;
+static constexpr u32 plt_entry_64[] = {
+  0x00000e17, // auipc   t3, %pcrel_hi(function@.got.plt)
+  0x000e3e03, // ld      t3, %pcrel_lo(1b)(t3)
+  0x000e0367, // jalr    t1, t3
+  0x00000013, // nop
+};
 
-  static const u32 data[] = {
-    0x00000e17, // auipc   t3, %pcrel_hi(function@.got.plt)
-    0x000e3e03, // ld      t3, %pcrel_lo(1b)(t3)
-    0x000e0367, // jalr    t1, t3
-    0x00000013, // nop
-  };
+static constexpr u32 plt_entry_32[] = {
+  0x00000e17, // auipc   t3, %pcrel_hi(function@.got.plt)
+  0x000e2e03, // lw      t3, %pcrel_lo(1b)(t3)
+  0x000e0367, // jalr    t1, t3
+  0x00000013, // nop
+};
 
-  u64 gotplt = sym.get_gotplt_addr(ctx);
-  u64 plt = sym.get_plt_addr(ctx);
-
-  memcpy(ent, data, sizeof(data));
-  write_utype(ent, gotplt - plt);
-  write_itype(ent + 4, gotplt - plt);
-}
-
-template <>
+template <typename E>
 void PltSection<E>::copy_buf(Context<E> &ctx) {
+  u8 *buf = ctx.buf + ctx.plt->shdr.sh_offset;
+
   write_plt_header(ctx);
-  for (Symbol<E> *sym : symbols)
-    write_plt_entry(ctx, *sym);
+
+  for (Symbol<E> *sym : symbols) {
+    u8 *ent = buf + E::plt_hdr_size + sym->get_plt_idx(ctx) * E::plt_size;
+    u64 gotplt = sym->get_gotplt_addr(ctx);
+    u64 plt = sym->get_plt_addr(ctx);
+
+    if constexpr (E::word_size == 8)
+      memcpy(ent, plt_entry_64, sizeof(plt_entry_64));
+    else
+      memcpy(ent, plt_entry_32, sizeof(plt_entry_32));
+
+    write_utype(ent, gotplt - plt);
+    write_itype(ent + 4, gotplt - plt);
+  }
 }
 
-template <>
+template <typename E>
 void PltGotSection<E>::copy_buf(Context<E> &ctx) {
   u8 *buf = ctx.buf + this->shdr.sh_offset;
 
-  static const u32 data[] = {
-    0x00000e17, // auipc   t3, %pcrel_hi(function@.got.plt)
-    0x000e3e03, // ld      t3, %pcrel_lo(1b)(t3)
-    0x000e0367, // jalr    t1, t3
-    0x00000013, // nop
-  };
-
   for (Symbol<E> *sym : symbols) {
-    u8 *ent = buf + sym->get_pltgot_idx(ctx) * 16;
+    u8 *ent = buf + sym->get_pltgot_idx(ctx) * E::pltgot_size;
     u64 got = sym->get_got_addr(ctx);
     u64 plt = sym->get_plt_addr(ctx);
 
-    memcpy(ent, data, sizeof(data));
+    if constexpr (E::word_size == 8)
+      memcpy(ent, plt_entry_64, sizeof(plt_entry_64));
+    else
+      memcpy(ent, plt_entry_32, sizeof(plt_entry_32));
+
     write_utype(ent, got - plt);
     write_itype(ent + 4, got - plt);
   }
 }
 
-template <>
+template <typename E>
 void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
                                     u64 offset, u64 val) {
   u8 *loc = ctx.buf + this->shdr.sh_offset + offset;
@@ -183,6 +203,9 @@ void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
   case R_RISCV_SET16:
     *(ul16 *)loc = val;
     return;
+  case R_RISCV_SET32:
+    *(ul32 *)loc = val;
+    return;
   case R_RISCV_32_PCREL:
     *(ul32 *)loc = val - this->shdr.sh_addr - offset;
     return;
@@ -190,7 +213,7 @@ void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
   Fatal(ctx) << "unsupported relocation in .eh_frame: " << rel;
 }
 
-template <>
+template <typename E>
 void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
   ElfRel<E> *dynrel = nullptr;
   std::span<const ElfRel<E>> rels = get_rels(ctx);
@@ -203,8 +226,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_RISCV_NONE || rel.r_type == R_RISCV_RELAX ||
-        rel.r_type == R_RISCV_ALIGN)
+    if (rel.r_type == R_RISCV_NONE || rel.r_type == R_RISCV_RELAX)
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
@@ -236,14 +258,6 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
           *dynrel++ = {P, R_RISCV_RELATIVE, 0, (i64)(S + A)};
         *(ul64 *)loc = S + A;
       }
-      break;
-    case R_RISCV_TLS_DTPMOD32:
-    case R_RISCV_TLS_DTPMOD64:
-    case R_RISCV_TLS_DTPREL32:
-    case R_RISCV_TLS_DTPREL64:
-    case R_RISCV_TLS_TPREL32:
-    case R_RISCV_TLS_TPREL64:
-      Error(ctx) << *this << ": unsupported relocation: " << rel;
       break;
     case R_RISCV_BRANCH:
       write_btype(loc, S + A - P);
@@ -285,19 +299,9 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         *(ul32 *)loc = S + A - P;
       }
       break;
-    case R_RISCV_PCREL_LO12_I:
-      assert(sym.get_input_section() == this);
-      assert(sym.value < r_offset);
-      write_itype(loc, *(ul32 *)(base + sym.value));
-      break;
     case R_RISCV_LO12_I:
     case R_RISCV_TPREL_LO12_I:
       write_itype(loc, S + A);
-      break;
-    case R_RISCV_PCREL_LO12_S:
-      assert(sym.get_input_section() == this);
-      assert(sym.value < r_offset);
-      write_stype(loc, *(ul32 *)(base + sym.value));
       break;
     case R_RISCV_LO12_S:
     case R_RISCV_TPREL_LO12_S:
@@ -335,14 +339,24 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_RISCV_SUB64:
       *(ul64 *)loc -= S + A;
       break;
+    case R_RISCV_ALIGN:
+      // A R_RISCV_ALIGN is followed by nops. We sometimes have to not
+      // just remove nops but rewrite a nop with a c.nop. Here, we always
+      // rewrite all nops for the sake of simplicity.
+      if (i64 padding_size = align_to(P, bit_ceil(rel.r_addend)) - P) {
+        assert(padding_size % 2 == 0);
+        i64 i = 0;
+        for (; i <= padding_size - 4; i += 4)
+          *(ul32 *)(loc + i) = 0x00000013; // nop
+        if (i != padding_size)
+          *(ul16 *)(loc + i) = 0x0001;     // c.nop
+      }
+      break;
     case R_RISCV_RVC_BRANCH:
       write_cbtype(loc, S + A - P);
       break;
     case R_RISCV_RVC_JUMP:
       write_cjtype(loc, S + A - P);
-      break;
-    case R_RISCV_RVC_LUI:
-      Error(ctx) << *this << ": unsupported relocation: " << rel;
       break;
     case R_RISCV_SUB6:
       *loc = (*loc & 0b1100'0000) | ((*loc - (S + A)) & 0b0011'1111);
@@ -362,8 +376,12 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_RISCV_32_PCREL:
       *(ul32 *)loc = S + A - P;
       break;
+    case R_RISCV_PCREL_LO12_I:
+    case R_RISCV_PCREL_LO12_S:
+      // These relocations are handled in the next loop.
+      break;
     default:
-      Error(ctx) << *this << ": unknown relocation: " << rel;
+      unreachable();
     }
 
 #undef S
@@ -373,10 +391,27 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 #undef GOT
   }
 
-  // In the above loop, PC-relative HI20 relocations overwrote
-  // instructions with full 32-bit values to allow their corresponding
-  // PCREL_LO12 relocations to read their values. This loop restore
-  // the original instructions.
+  // Handle LO12 relocations. In the above loop, PC-relative HI20
+  // relocations overwrote instructions with full 32-bit values to allow
+  // their corresponding LO12 relocations to read their values.
+  for (i64 i = 0; i < rels.size(); i++) {
+    const ElfRel<E> &r = rels[i];
+    if (r.r_type != R_RISCV_PCREL_LO12_I && r.r_type != R_RISCV_PCREL_LO12_S)
+      continue;
+
+    Symbol<E> &sym = *file.symbols[r.r_sym];
+    assert(sym.get_input_section() == this);
+
+    u8 *loc = base + r.r_offset + extra.r_deltas[i];
+    u32 val = *(ul32 *)(base + sym.value);
+
+    if (r.r_type == R_RISCV_PCREL_LO12_I)
+      write_itype(loc, val);
+    else
+      write_stype(loc, val);
+  }
+
+  // Restore the original instructions HI20 relocations overwrote.
   for (i64 i = 0; i < rels.size(); i++) {
     switch (rels[i].r_type) {
     case R_RISCV_GOT_HI20:
@@ -392,7 +427,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
   }
 }
 
-template <>
+template <typename E>
 void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
   std::span<const ElfRel<E>> rels = get_rels(ctx);
 
@@ -479,7 +514,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
   }
 }
 
-template <>
+template <typename E>
 void InputSection<E>::copy_contents_riscv(Context<E> &ctx, u8 *buf) {
   // A non-alloc section isn't relaxed, so just copy it as one big chunk.
   if (!(shdr().sh_flags & SHF_ALLOC)) {
@@ -510,7 +545,7 @@ void InputSection<E>::copy_contents_riscv(Context<E> &ctx, u8 *buf) {
   memcpy(buf, contents.data() + pos, contents.size() - pos);
 }
 
-template <>
+template <typename E>
 void InputSection<E>::scan_relocations(Context<E> &ctx) {
   assert(shdr().sh_flags & SHF_ALLOC);
 
@@ -557,17 +592,6 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       dispatch(ctx, table, i, rel, sym);
       break;
     }
-    case R_RISCV_TLS_DTPMOD32:
-    case R_RISCV_TLS_DTPMOD64:
-    case R_RISCV_TLS_DTPREL32:
-    case R_RISCV_TLS_DTPREL64:
-    case R_RISCV_TLS_TPREL32:
-    case R_RISCV_TLS_TPREL64:
-      Error(ctx) << *this << ": unsupported relocation: " << rel;
-      break;
-    case R_RISCV_BRANCH:
-    case R_RISCV_JAL:
-      break;
     case R_RISCV_CALL:
     case R_RISCV_CALL_PLT:
       if (sym.is_imported)
@@ -583,6 +607,18 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_RISCV_TLS_GD_HI20:
       sym.flags |= NEEDS_TLSGD;
       break;
+    case R_RISCV_32_PCREL: {
+      Action table[][4] = {
+        // Absolute  Local  Imported data  Imported code
+        {  ERROR,    NONE,  ERROR,         ERROR },      // DSO
+        {  ERROR,    NONE,  COPYREL,       PLT   },      // PIE
+        {  NONE,     NONE,  COPYREL,       PLT   },      // PDE
+      };
+      dispatch(ctx, table, i, rel, sym);
+      break;
+    }
+    case R_RISCV_BRANCH:
+    case R_RISCV_JAL:
     case R_RISCV_PCREL_HI20:
     case R_RISCV_PCREL_LO12_I:
     case R_RISCV_PCREL_LO12_S:
@@ -601,13 +637,8 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_RISCV_SUB32:
     case R_RISCV_SUB64:
     case R_RISCV_ALIGN:
-      break;
     case R_RISCV_RVC_BRANCH:
     case R_RISCV_RVC_JUMP:
-      break;
-    case R_RISCV_RVC_LUI:
-      Error(ctx) << *this << ": unsupported relocation: " << rel;
-      break;
     case R_RISCV_RELAX:
     case R_RISCV_SUB6:
     case R_RISCV_SET6:
@@ -615,42 +646,29 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_RISCV_SET16:
     case R_RISCV_SET32:
       break;
-    case R_RISCV_32_PCREL: {
-      Action table[][4] = {
-        // Absolute  Local  Imported data  Imported code
-        {  ERROR,    NONE,  ERROR,         ERROR },      // DSO
-        {  ERROR,    NONE,  COPYREL,       PLT   },      // PIE
-        {  NONE,     NONE,  COPYREL,       PLT   },      // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
-      break;
-    }
     default:
       Error(ctx) << *this << ": unknown relocation: " << rel;
     }
   }
 }
 
+template <typename E>
 static bool is_resizable(Context<E> &ctx, InputSection<E> *isec) {
   return isec && (isec->shdr().sh_flags & SHF_ALLOC);
 }
 
-// Initializes sorted_symbols.
-static void sort_symbols(Context<E> &ctx) {
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    for (Symbol<E> *sym : file->symbols)
-      if (sym->file == file)
-        if (InputSection<E> *isec = sym->get_input_section())
-          isec->extra.sorted_symbols.push_back(sym);
-
-    for (std::unique_ptr<InputSection<E>> &isec : file->sections)
-      if (isec)
-        sort(isec->extra.sorted_symbols,
-             [](Symbol<E> *a, Symbol<E> *b) { return a->value < b->value; });
-  });
+template <typename E>
+static std::vector<Symbol<E> *> get_sorted_symbols(InputSection<E> &isec) {
+  std::vector<Symbol<E> *> vec;
+  for (Symbol<E> *sym : isec.file.symbols)
+    if (sym->file == &isec.file && sym->get_input_section() == &isec)
+      vec.push_back(sym);
+  sort(vec, [](Symbol<E> *a, Symbol<E> *b) { return a->value < b->value; });
+  return vec;
 }
 
 // Returns the distance between a relocated place and a symbol.
+template <typename E>
 static i64 compute_distance(Context<E> &ctx, Symbol<E> &sym,
                             InputSection<E> &isec, const ElfRel<E> &rel) {
   // We handle absolute symbols as if they were infinitely far away
@@ -672,8 +690,10 @@ static i64 compute_distance(Context<E> &ctx, Symbol<E> &sym,
 }
 
 // Relax R_RISCV_CALL and R_RISCV_CALL_PLT relocations.
+template <typename E>
 static void relax_section(Context<E> &ctx, InputSection<E> &isec) {
-  std::span<Symbol<E> *> syms = isec.extra.sorted_symbols;
+  std::vector<Symbol<E> *> vec = get_sorted_symbols(isec);
+  std::span<Symbol<E> *> syms = vec;
   i64 delta = 0;
 
   std::span<const ElfRel<E>> rels = isec.get_rels(ctx);
@@ -683,7 +703,7 @@ static void relax_section(Context<E> &ctx, InputSection<E> &isec) {
     const ElfRel<E> &r = rels[i];
     i64 delta2 = 0;
 
-    isec.extra.r_deltas[i] += delta;
+    isec.extra.r_deltas[i] = delta;
 
     switch (r.r_type) {
     case R_RISCV_ALIGN: {
@@ -697,6 +717,8 @@ static void relax_section(Context<E> &ctx, InputSection<E> &isec) {
       // instruction is r_addend away.
       u64 next_loc = loc + r.r_addend;
       u64 alignment = bit_ceil(r.r_addend);
+      assert(alignment <= (1 << isec.p2align));
+
       if (next_loc % alignment)
         delta2 = align_to(loc, alignment) - next_loc;
       break;
@@ -729,7 +751,7 @@ static void relax_section(Context<E> &ctx, InputSection<E> &isec) {
 
   for (Symbol<E> *sym : syms)
     sym->value += delta;
-  isec.extra.r_deltas[rels.size()] += delta;
+  isec.extra.r_deltas[rels.size()] = delta;
 
   isec.sh_size += delta;
 }
@@ -777,9 +799,9 @@ static void relax_section(Context<E> &ctx, InputSection<E> &isec) {
 // relocation to a specified byte boundary. We at least have to
 // interpret them satisfy the constraints imposed by R_RISCV_ALIGN
 // relocations.
+template <typename E>
 i64 riscv_resize_sections(Context<E> &ctx) {
   Timer t(ctx, "riscv_resize_sections");
-  sort_symbols(ctx);
 
   // Find R_RISCV_CALL AND R_RISCV_CALL_PLT that can be relaxed.
   // This step should only shrink sections.
@@ -793,5 +815,19 @@ i64 riscv_resize_sections(Context<E> &ctx) {
   compute_section_sizes(ctx);
   return set_osec_offsets(ctx);
 }
+
+#define INSTANTIATE_RISCV(E)                                                 \
+  template void PltSection<E>::copy_buf(Context<E> &);                       \
+  template void PltGotSection<E>::copy_buf(Context<E> &);                    \
+  template void                                                              \
+  EhFrameSection<E>::apply_reloc(Context<E> &, const ElfRel<E> &, u64, u64); \
+  template void InputSection<E>::apply_reloc_alloc(Context<E> &, u8 *);      \
+  template void InputSection<E>::apply_reloc_nonalloc(Context<E> &, u8 *);   \
+  template void InputSection<E>::copy_contents_riscv(Context<E> &, u8 *);    \
+  template void InputSection<E>::scan_relocations(Context<E> &);             \
+  template i64 riscv_resize_sections(Context<E> &);
+
+INSTANTIATE_RISCV(RISCV64);
+INSTANTIATE_RISCV(RISCV32);
 
 } // namespace mold::elf

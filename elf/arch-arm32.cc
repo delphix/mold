@@ -136,7 +136,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_ARM_NONE)
+    if (rel.r_type == R_ARM_NONE || rel.r_type == R_ARM_V4BX)
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
@@ -272,11 +272,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul32 *)loc = sym.get_gottp_addr(ctx) + A - P;
       continue;
     case R_ARM_TLS_LE32:
-      *(ul32 *)loc = S + A - ctx.tls_begin + 8;
+      *(ul32 *)loc = S + A - ctx.tls_begin + E::tls_offset;
       continue;
     case R_ARM_TLS_GOTDESC:
       if (sym.get_tlsdesc_idx(ctx) == -1)
-        *(ul32 *)loc = S - ctx.tls_begin + 8;
+        *(ul32 *)loc = S - ctx.tls_begin + E::tls_offset;
       else
         *(ul32 *)loc = sym.get_tlsdesc_addr(ctx) + A - P - 6;
       continue;
@@ -455,6 +455,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_ARM_TLS_LDO32:
     case R_ARM_TLS_LE32:
     case R_ARM_THM_TLS_CALL:
+    case R_ARM_V4BX:
       break;
     default:
       Error(ctx) << *this << ": unknown relocation: " << rel;
@@ -515,6 +516,14 @@ void TlsTrampolineSection::copy_buf(Context<E> &ctx) {
   memcpy(ctx.buf + this->shdr.sh_offset, insn, sizeof(insn));
 }
 
+template <typename E>
+static OutputSection<E> *find_exidx_section(Context<E> &ctx) {
+  for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections)
+    if (osec->shdr.sh_type == SHT_ARM_EXIDX)
+      return osec.get();
+  return nullptr;
+}
+
 // ARM executables use an .ARM.exidx section to look up an exception
 // handling record for the current instruction pointer. The table needs
 // to be sorted by their addresses.
@@ -527,14 +536,7 @@ void TlsTrampolineSection::copy_buf(Context<E> &ctx) {
 void sort_arm_exidx(Context<E> &ctx) {
   Timer t(ctx, "sort_arm_exidx");
 
-  auto find_exidx = [&]() -> OutputSection<E> * {
-    for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections)
-      if (osec->shdr.sh_type == SHT_ARM_EXIDX)
-        return osec.get();
-    return nullptr;
-  };
-
-  OutputSection<E> *osec = find_exidx();
+  OutputSection<E> *osec = find_exidx_section(ctx);
   if (!osec)
     return;
 
@@ -548,8 +550,10 @@ void sort_arm_exidx(Context<E> &ctx) {
   // 3. a 31-bit relative address which points to a larger record in
   //    the .ARM.extab section.
   //
-  // CANTUNWIND is value 1. The most significant is set in (2) but not
-  // in (3). So they can be distinguished just by looking at a value.
+  // CANTUNWIND is value 1. The most significant bit is set in (2) but
+  // not in (3). So we can distinguished them just by looking at a value.
+  const u32 EXIDX_CANTUNWIND = 1;
+
   struct Entry {
     ul32 addr;
     ul32 val;
@@ -558,38 +562,36 @@ void sort_arm_exidx(Context<E> &ctx) {
   if (osec->shdr.sh_size % sizeof(Entry))
     Fatal(ctx) << "invalid .ARM.exidx section size";
 
-  Entry *begin = (Entry *)(ctx.buf + osec->shdr.sh_offset);
-  Entry *end = (Entry *)(ctx.buf + osec->shdr.sh_offset + osec->shdr.sh_size);
+  Entry *ent = (Entry *)(ctx.buf + osec->shdr.sh_offset);
+  i64 num_entries = osec->shdr.sh_size / sizeof(Entry);
 
-  struct Entry2 {
-    u32 addr;
-    u32 val;
-    u32 idx;
+  // Entry's addresses are relative to the beginning of their entries.
+  // We first translate them so that they are relative to the
+  // beginning of the section. We then sort the records and then
+  // translate them back to be relative to each record.
+
+  auto is_relative = [](u32 val) {
+    return val != EXIDX_CANTUNWIND && !(val & 0x8000'0000);
   };
 
-  // Read section contents
-  std::vector<Entry2> vec;
-  vec.reserve(end - begin);
-  for (Entry *it = begin; it < end; it++)
-    vec.push_back({it->addr, it->val, (u32)(it - begin)});
+  tbb::parallel_for((i64)0, num_entries, [&](i64 i) {
+    i64 offset = sizeof(Entry) * i;
+    ent[i].addr = sign_extend(ent[i].addr, 30) - offset;
+    if (is_relative(ent[i].val))
+      ent[i].val = 0x7fff'ffff & (sign_extend(ent[i].val, 30) - offset);
+  });
 
-  // Sort the records
-  tbb::parallel_sort(vec.begin(), vec.end(), [](const Entry2 &a, const Entry2 &b) {
-    return sign_extend(a.addr, 30) + a.idx * sizeof(Entry) <
-           sign_extend(b.addr, 30) + b.idx * sizeof(Entry);
+  tbb::parallel_sort(ent, ent + num_entries, [](const Entry &a, const Entry &b) {
+    return a.addr < b.addr;
   });
 
   // Write back the sorted records while adjusting relative addresses
-  for (i64 i = 0; i < vec.size(); i++) {
-    u32 offset = (vec[i].idx - i) * sizeof(Entry);
-    begin[i].addr = 0x7fff'ffff & (sign_extend(vec[i].addr, 30) + offset);
-
-    const u32 EXIDX_CANTUNWIND = 1;
-    if (vec[i].val == EXIDX_CANTUNWIND || (vec[i].val & 0x8000'0000))
-      begin[i].val = vec[i].val;
-    else
-      begin[i].val = 0x7fff'ffff & (sign_extend(vec[i].val, 30) + offset);
-  }
+  tbb::parallel_for((i64)0, num_entries, [&](i64 i) {
+    i64 offset = sizeof(Entry) * i;
+    ent[i].addr = 0x7fff'ffff & (ent[i].addr + offset);
+    if (is_relative(ent[i].val))
+      ent[i].val = 0x7fff'ffff & (ent[i].val + offset);
+  });
 }
 
 } // namespace mold::elf

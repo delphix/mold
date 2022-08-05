@@ -9,8 +9,7 @@ OBJDUMP="${OBJDUMP:-objdump}"
 MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/macho/$testname
+t=out/test/macho/$MACHINE/$testname
 mkdir -p $t
 
 cat <<EOF | $CC -o $t/a.o -c -xc - -flto

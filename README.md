@@ -61,7 +61,7 @@ necessary packages. You may want to run it as root.
 ```shell
 git clone https://github.com/rui314/mold.git
 cd mold
-git checkout v1.3.1
+git checkout v1.4.0
 make -j$(nproc) CXX=clang++
 sudo make install
 ```
@@ -214,3 +214,16 @@ it. A legally-binding commercial license contract addresses the
 concern. By purchasing a license, you are guaranteed that mold will be
 maintained for you. Please [contact us](mailto:contact@bluewhale.systems)
 for a commercial license inquiry.
+
+## Acknowledgement
+
+We accept donations via [GitHub Sponsors](https://github.com/sponsors/rui314)
+and [OpenCollective](https://opencollective.com/mold-linker).
+We thank you to everybody who sponsors our project. In particular,
+we'd like to acknowledge the following people and organizations who
+have sponsored $128/month or more:
+
+- [300baud](https://github.com/300baud)
+- [Mercury](https://github.com/MercuryTechnologies)
+- [Wei Wu](https://github.com/lazyparser)
+- [Signal Slot Inc.](https://github.com/signal-slot)

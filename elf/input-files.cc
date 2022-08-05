@@ -324,7 +324,7 @@ void ObjectFile<E>::initialize_ehframe_sections(Context<E> &ctx) {
 // This function parses an input .eh_frame section.
 template <typename E>
 void ObjectFile<E>::read_ehframe(Context<E> &ctx, InputSection<E> &isec) {
-  std::span<const ElfRel<E>> rels = isec.get_rels(ctx);
+  std::span<ElfRel<E>> rels = isec.get_rels(ctx);
   i64 cies_begin = cies.size();
   i64 fdes_begin = fdes.size();
 
@@ -498,10 +498,9 @@ void ObjectFile<E>::initialize_symbols(Context<E> &ctx) {
 // We expect them to be sorted, so sort them if necessary.
 template <typename E>
 void ObjectFile<E>::sort_relocations(Context<E> &ctx) {
-  if constexpr (std::is_same_v<E, RISCV64>) {
+  if constexpr (std::is_same_v<E, RISCV64> || std::is_same_v<E, RISCV32>) {
     auto less = [&](const ElfRel<E> &a, const ElfRel<E> &b) {
-      return a.r_type != E::R_NONE && b.r_type != E::R_NONE &&
-             a.r_offset < b.r_offset;
+      return a.r_offset < b.r_offset;
     };
 
     for (i64 i = 1; i < sections.size(); i++) {
@@ -509,12 +508,9 @@ void ObjectFile<E>::sort_relocations(Context<E> &ctx) {
       if (!isec || !isec->is_alive || !(isec->shdr().sh_flags & SHF_ALLOC))
         continue;
 
-      std::span<const ElfRel<E>> rels = isec->get_rels(ctx);
-      if (std::is_sorted(rels.begin(), rels.end(), less))
-        continue;
-
-      isec->extra.sorted_rels = {rels.begin(), rels.end()};
-      sort(isec->extra.sorted_rels, less);
+      std::span<ElfRel<E>> rels = isec->get_rels(ctx);
+      if (!std::is_sorted(rels.begin(), rels.end(), less))
+        sort(rels, less);
     }
   }
 }
@@ -681,7 +677,7 @@ void ObjectFile<E>::register_section_pieces(Context<E> &ctx) {
     if (!isec || !isec->is_alive || !(isec->shdr().sh_flags & SHF_ALLOC))
       continue;
 
-    std::span<const ElfRel<E>> rels = isec->get_rels(ctx);
+    std::span<ElfRel<E>> rels = isec->get_rels(ctx);
     if (rels.empty())
       continue;
 
@@ -755,31 +751,29 @@ void ObjectFile<E>::register_section_pieces(Context<E> &ctx) {
 
 template <typename E>
 void ObjectFile<E>::fill_addrsig(Context<E> &ctx) {
+  // Parse a .llvm_addrsig section.
   if (llvm_addrsig) {
-    const u8 *start = reinterpret_cast<const u8 *>(llvm_addrsig->contents.data());
-    const u8 *end = start + llvm_addrsig->contents.size();
-    const u8 *cur = start;
+    u8 *cur = (u8 *)llvm_addrsig->contents.data();
+    u8 *end = cur + llvm_addrsig->contents.size();
+
     while (cur != end) {
-      u64 symIndex = read_uleb(cur);
-      if (this->symbols[symIndex]->file != this) continue;
-      InputSection<E> *section = this->symbols[symIndex]->get_input_section();
-      if (section)
-        section->address_significant = true;
+      Symbol<E> &sym = *this->symbols[read_uleb(cur)];
+      if (sym.file == this)
+        if (InputSection<E> *isec = sym.get_input_section())
+          isec->address_significant = true;
     }
   }
 
-  for (Symbol<E> *sym : this->symbols) {
-    if (sym->file != this) continue;
-    InputSection<E> *section = sym->get_input_section();
-    if (
-        section &&
-            (!llvm_addrsig // We don't have address significance information and needs to be safe
-                || (sym->is_imported || sym->is_exported)) // The symbol might be referenced from the
-                                                           // outside in an address-significant manner
-        ) {
-      section->address_significant = true;
-    }
-  }
+  // We treat a symbol's address as significant if
+  //
+  // 1. we have no address significance information for the symbol, or
+  // 2. the symbol could be referenced from the outside in an address-
+  //    significant manner.
+  for (Symbol<E> *sym : this->symbols)
+    if (sym->file == this)
+      if (InputSection<E> *isec = sym->get_input_section())
+        if (!llvm_addrsig || sym->is_imported || sym->is_exported)
+          isec->address_significant = true;
 }
 
 template <typename E>
@@ -1094,7 +1088,7 @@ void ObjectFile<E>::scan_relocations(Context<E> &ctx) {
 
   // Scan relocations against exception frames
   for (CieRecord<E> &cie : cies) {
-    for (const ElfRel<E> &rel : cie.get_rels()) {
+    for (ElfRel<E> &rel : cie.get_rels()) {
       Symbol<E> &sym = *this->symbols[rel.r_sym];
 
       if (sym.is_imported) {
@@ -1123,9 +1117,9 @@ void ObjectFile<E>::scan_relocations(Context<E> &ctx) {
 // definition, the tentative definition gets the default initial value 0.
 //
 // Tentative definitions are represented as "common symbols" in an object
-// file. In this function, we allocate spaces in .bss for remaining common
-// symbols that were not resolved to usual defined symbols in previous
-// passes.
+// file. In this function, we allocate spaces in .common or .tls_common
+// for remaining common symbols that were not resolved to usual defined
+// symbols in previous passes.
 template <typename E>
 void ObjectFile<E>::convert_common_symbols(Context<E> &ctx) {
   if (!has_common_symbol)
@@ -1241,56 +1235,49 @@ void ObjectFile<E>::compute_symtab(Context<E> &ctx) {
     if (sym.file == this && is_alive(sym) &&
         (!ctx.arg.retain_symbols_file || sym.write_to_symtab)) {
       this->strtab_size += sym.name().size() + 1;
-      this->num_global_symtab++;
+      // Global symbols can be demoted to local symbols based on visibility,
+      // version scripts etc.
+      if (sym.is_local())
+        this->num_local_symtab++;
+      else
+        this->num_global_symtab++;
       sym.write_to_symtab = true;
     }
   }
 }
 
 template <typename E>
-void ObjectFile<E>::write_symtab(Context<E> &ctx) {
+void ObjectFile<E>::export_to_symtab(Context<E> &ctx) {
   ElfSym<E> *symtab_base = (ElfSym<E> *)(ctx.buf + ctx.symtab->shdr.sh_offset);
-  i64 symtab_idx;
 
   u8 *strtab_base = ctx.buf + ctx.strtab->shdr.sh_offset;
   i64 strtab_off = this->strtab_offset;
 
-  auto write_sym = [&](Symbol<E> &sym) {
+  auto write_sym = [&](Symbol<E> &sym, i64 &symtab_idx) {
     ElfSym<E> &esym = symtab_base[symtab_idx++];
 
-    esym = sym.esym();
-    esym.st_name = strtab_off;
-
-    if (sym.get_type() == STT_TLS)
-      esym.st_value = sym.get_addr(ctx, false) - ctx.tls_begin;
-    else
-      esym.st_value = sym.get_addr(ctx, false);
-
-    if (InputSection<E> *isec = sym.get_input_section())
-      esym.st_shndx = isec->output_section->shndx;
-    else if (sym.shndx < 0)
-      esym.st_shndx = -sym.shndx;
-    else if (esym.is_undef())
-      esym.st_shndx = SHN_UNDEF;
-    else
-      esym.st_shndx = SHN_ABS;
+    get_output_esym(ctx, sym, strtab_off, esym);
 
     write_string(strtab_base + strtab_off, sym.name());
     strtab_off += sym.name().size() + 1;
   };
 
-  symtab_idx = this->local_symtab_idx;
+  i64 local_symtab_idx = this->local_symtab_idx;
+  i64 global_symtab_idx = this->global_symtab_idx;
   for (i64 i = 1; i < this->first_global; i++) {
     Symbol<E> &sym = *this->symbols[i];
     if (sym.write_to_symtab)
-      write_sym(sym);
+      write_sym(sym, local_symtab_idx);
   }
 
-  symtab_idx = this->global_symtab_idx;
   for (i64 i = this->first_global; i < this->elf_syms.size(); i++) {
     Symbol<E> &sym = *this->symbols[i];
-    if (sym.file == this && sym.write_to_symtab)
-      write_sym(sym);
+    if (sym.file == this && sym.write_to_symtab) {
+      if (sym.is_local())
+        write_sym(sym, local_symtab_idx);
+      else
+        write_sym(sym, global_symtab_idx);
+    }
   }
 }
 
@@ -1506,7 +1493,7 @@ void SharedFile<E>::compute_symtab(Context<E> &ctx) {
 }
 
 template <typename E>
-void SharedFile<E>::write_symtab(Context<E> &ctx) {
+void SharedFile<E>::export_to_symtab(Context<E> &ctx) {
   ElfSym<E> *symtab =
     (ElfSym<E> *)(ctx.buf + ctx.symtab->shdr.sh_offset) + this->global_symtab_idx;
 

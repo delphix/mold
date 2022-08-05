@@ -9,16 +9,14 @@ OBJDUMP="${OBJDUMP:-objdump}"
 MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
+t=out/test/elf/$MACHINE/$testname
 mkdir -p $t
 
 # IFUNC is not supported on RISC-V yet
 [ $MACHINE = riscv64 ] && { echo skipped; exit; }
 
 # Skip if libc is musl because musl does not support GNU FUNC
-echo 'int main() {}' | $CC -o $t/exe -xc -
-readelf --dynamic $t/exe | grep -q ld-musl && { echo OK; exit; }
+ldd --help 2>&1 | grep -q musl && { echo skipped; exit; }
 
 cat <<EOF | $CC -o $t/a.o -c -xc -
 #include <stdio.h>

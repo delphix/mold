@@ -20,6 +20,7 @@ Options:
   -U <SYMBOL>                 Allow a symbol to be undefined
   -Z                          Do not search the standard directories when
                               searching for libraries and frameworks
+  -add_ast_path <FILE>        Add a N_AST symbol with the given filename
   -add_empty_section <SEGNAME> <SECTNAME>
                               Add an empty section
   -adhoc_codesign             Add ad-hoc code signature to the output file
@@ -30,6 +31,7 @@ Options:
     -no_application_extension
   -arch <ARCH_NAME>           Specify target architecture
   -bundle                     Produce a mach-o bundle
+  -bundle_loader <EXECUTABLE> Resolve undefined symbols using the given executable
   -compatibility_version <VERSION>
                               Specifies the compatibility version number of the library
   -current_version <VERSION>  Specifies the current version number of the library.
@@ -61,15 +63,18 @@ Options:
                               Allocate MAXPATHLEN byte padding after load commands
   -help                       Report usage information
   -hidden-l<LIB>
+  -ignore_optimization_hints  Do not rewrite instructions as optimization
   -install_name <NAME>
   -l<LIB>                     Search for a given library
   -lto_library <FILE>         Ignored
   -macos_version_min <VERSION>
   -map <FILE>                 Write map file to a given file
+  -mark_dead_strippable_dylib Mark the output as dead-strippable
   -needed-l<LIB>              Search for a given library
   -needed-framework <NAME>[,<SUFFIX>]
                               Search for a given framework
   -no_deduplicate             Ignored
+  -no_function_starts         Do not generate an LC_FUNCTION_STARTS load command
   -no_uuid                    Do not generate an LC_UUID load command
   -o <FILE>                   Set output filename
   -objc_abi_version <VERSION> Ignored
@@ -92,7 +97,7 @@ Options:
   -t                          Print out each file the linker loads
   -thread_count <NUMBER>      Use given number of threads
   -u <SYMBOL>                 Force load a given symbol from archive if necessary
-  -uexported_symbol <SYMBOL>  Export all but a given symbol
+  -unexported_symbol <SYMBOL> Export all but a given symbol
   -unexported_symbols_list <FILE>
                               Read a list of unexported symbols from a given file
   -v                          Report version information
@@ -297,6 +302,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.ObjC = true;
     } else if (read_arg("-U")) {
       ctx.arg.U.push_back(std::string(arg));
+    } else if (read_arg("-add_ast_path")) {
+      ctx.arg.add_ast_path.push_back(std::string(arg));
     } else if (read_arg2("-add_empty_section")) {
       ctx.arg.add_empty_section.push_back({arg, arg2});
     } else if (read_flag("-adhoc_codesign")) {
@@ -320,6 +327,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
         Fatal(ctx) << "unknown -arch: " << arg;
     } else if (read_flag("-bundle")) {
       ctx.output_type = MH_BUNDLE;
+    } else if (read_arg("-bundle_loader")) {
+      ctx.arg.bundle_loader = arg;
     } else if (read_arg("-compatibility_version") ||
                read_arg("-dylib_compatibility_version")) {
       ctx.arg.compatibility_version = parse_version(ctx, arg);
@@ -337,6 +346,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("-demangle")) {
       ctx.arg.demangle = true;
     } else if (read_arg("-dependency_info")) {
+      ctx.arg.dependency_info = arg;
     } else if (read_flag("-dylib")) {
       ctx.output_type = MH_DYLIB;
     } else if (read_hex("-headerpad")) {
@@ -379,6 +389,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_joined("-hidden-l")) {
       remaining.push_back("-hidden-l");
       remaining.push_back(std::string(arg));
+    } else if (read_flag("-ignore_optimization_hints")) {
+      ctx.arg.ignore_optimization_hints = true;
     } else if (read_arg("-install_name") || read_arg("-dylib_install_name")) {
       ctx.arg.install_name = arg;
     } else if (read_joined("-l")) {
@@ -386,6 +398,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       remaining.push_back(std::string(arg));
     } else if (read_arg("-map")) {
       ctx.arg.map = arg;
+    } else if (read_flag("-mark_dead_strippable_dylib")) {
+      ctx.arg.mark_dead_strippable_dylib = true;
     } else if (read_arg("-mllvm")) {
       ctx.arg.mllvm.push_back(std::string(arg));
     } else if (read_joined("-needed-l")) {
@@ -395,6 +409,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       remaining.push_back("-needed_framework");
       remaining.push_back(std::string(arg));
     } else if (read_flag("-no_deduplicate")) {
+    } else if (read_flag("-no_function_starts")) {
+      ctx.arg.function_starts = false;
     } else if (read_flag("-no_uuid")) {
       ctx.arg.uuid = UUID_NONE;
     } else if (read_arg("-o")) {
@@ -478,6 +494,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if (ctx.arg.thread_count == 0)
     ctx.arg.thread_count = get_default_thread_count();
 
+  if (!ctx.arg.bundle_loader.empty() && ctx.output_type != MH_BUNDLE)
+    Fatal(ctx) << "-bundle_loader cannot be specified without -bundle";
+
   auto add_search_path = [&](std::vector<std::string> &vec, std::string path) {
     if (!path.starts_with('/') || ctx.arg.syslibroot.empty()) {
       if (is_directory(path))
@@ -531,9 +550,6 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
 
   if (ctx.arg.uuid == UUID_RANDOM)
     memcpy(ctx.uuid, get_uuid_v4().data(), 16);
-
-  ctx.arg.exported_symbols_list.compile();
-  ctx.arg.unexported_symbols_list.compile();
 
   return remaining;
 }

@@ -1,15 +1,16 @@
 #include "mold.h"
 #include "../archive-file.h"
-#include "../cmdline.h"
 #include "../output-file.h"
 #include "../sha.h"
 
 #include <cstdlib>
 #include <fcntl.h>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <tbb/concurrent_vector.h>
 #include <tbb/global_control.h>
@@ -114,6 +115,7 @@ static void create_internal_file(Context<E> &ctx) {
   obj->mach_syms = obj->mach_syms2;
   ctx.obj_pool.emplace_back(obj);
   ctx.objs.push_back(obj);
+  ctx.internal_obj = obj;
 
   auto add = [&](std::string_view name) {
     Symbol<E> *sym = get_symbol(ctx, name);
@@ -143,6 +145,27 @@ static void create_internal_file(Context<E> &ctx) {
   }
 
   add("___dso_handle");
+
+  // Add start stop symbols.
+  std::set<std::string_view> start_stop_symbols;
+  std::mutex mu;
+
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    std::set<std::string_view> set;
+    for (Symbol<E> *sym : file->syms)
+      if (!sym->file)
+        if (sym->name.starts_with("segment$start$") ||
+            sym->name.starts_with("segment$end$") ||
+            sym->name.starts_with("section$start$") ||
+            sym->name.starts_with("section$end$"))
+          set.insert(sym->name);
+
+    std::scoped_lock lock(mu);
+    start_stop_symbols.merge(set);
+  });
+
+  for (std::string_view name : start_stop_symbols)
+    add(name);
 }
 
 // Remove unreferenced subsections to eliminate code and data
@@ -204,7 +227,6 @@ static bool compare_chunks(const Chunk<E> *a, const Chunk<E> *b) {
     // __TEXT
     "__mach_header",
     "__text",
-    "__StaticInit",
     "__stubs",
     "__stub_helper",
     "__gcc_except_tab",
@@ -288,107 +310,6 @@ static void claim_unresolved_symbols(Context<E> &ctx) {
 }
 
 template <typename E>
-static void merge_cstring_sections(Context<E> &ctx) {
-  Timer t(ctx, "merge_cstring_sections");
-
-  struct Entry {
-    Entry(Subsection<E> *subsec) : owner(subsec) {}
-
-    Entry(const Entry &other) :
-      owner(other.owner.load()), p2align(other.p2align.load()) {}
-
-    std::atomic<Subsection<E> *> owner = nullptr;
-    std::atomic_uint8_t p2align = 0;
-  };
-
-  struct SubsecRef {
-    Subsection<E> &subsec;
-    u64 hash = 0;
-    Entry *ent = nullptr;
-  };
-
-  std::vector<std::vector<SubsecRef>> vec(ctx.objs.size());
-
-  // Estimate the number of unique strings.
-  HyperLogLog estimator;
-
-  tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
-    ObjectFile<E> *file = ctx.objs[i];
-    HyperLogLog e;
-
-    for (Subsection<E> *subsec : file->subsections) {
-      if (&subsec->isec.osec == ctx.cstring) {
-        std::string_view str = subsec->get_contents();
-        u64 h = hash_string(str);
-        vec[i].push_back({*subsec, h, nullptr});
-        estimator.insert(h);
-      }
-    }
-    estimator.merge(e);
-  });
-
-  // Create a hash map large enough to hold all strings.
-  ConcurrentMap<Entry> map(estimator.get_cardinality() * 3 / 2);
-
-  // Insert all strings into the hash table.
-  tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
-    ObjectFile<E> *file = ctx.objs[i];
-
-    for (i64 j = 0; j < vec[i].size(); j++) {
-      SubsecRef &ref = vec[i][j];
-      std::string_view s = ref.subsec.get_contents();
-      ref.ent = map.insert(s, ref.hash, {&ref.subsec}).first;
-
-      Subsection<E> *existing = ref.ent->owner;
-      while (existing->isec.file.priority < file->priority &&
-             !ref.ent->owner.compare_exchange_weak(existing, &ref.subsec));
-
-      update_maximum(ref.ent->p2align, ref.subsec.p2align.load());
-    }
-  });
-
-  // Decide who will become the owner for each subsection.
-  tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
-    ObjectFile<E> *file = ctx.objs[i];
-
-    for (i64 j = 0; j < vec[i].size(); j++) {
-      SubsecRef &ref = vec[i][j];
-      if (ref.ent->owner != &ref.subsec) {
-        ref.subsec.is_coalesced = true;
-        ref.subsec.replacer = ref.ent->owner;
-
-        static Counter counter("num_merged_strings");
-        counter++;
-      }
-    }
-  });
-
-  // Merge strings
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    for (std::unique_ptr<InputSection<E>> &isec : file->sections)
-      if (isec)
-        for (Relocation<E> &r : isec->rels)
-          if (r.subsec && r.subsec->is_coalesced)
-            r.subsec = r.subsec->replacer;
-  });
-
-  auto replace = [&](InputFile<E> *file) {
-    for (Symbol<E> *sym : file->syms)
-      if (sym->subsec && sym->subsec->is_coalesced)
-        sym->subsec = sym->subsec->replacer;
-  };
-
-  tbb::parallel_for_each(ctx.objs, replace);
-  tbb::parallel_for_each(ctx.dylibs, replace);
-
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    std::erase_if(file->subsections, [](Subsection<E> *subsec) {
-      return subsec->is_coalesced;
-    });
-  });
-}
-
-template <typename E>
 static Chunk<E> *find_section(Context<E> &ctx, std::string_view segname,
                               std::string_view sectname) {
   for (Chunk<E> *chunk : ctx.chunks)
@@ -400,6 +321,13 @@ static Chunk<E> *find_section(Context<E> &ctx, std::string_view segname,
 template <typename E>
 static void create_synthetic_chunks(Context<E> &ctx) {
   Timer t(ctx, "create_synthetic_chunks");
+
+  // Create a __DATA,__objc_imageinfo section.
+  ctx.image_info = ObjcImageInfoSection<E>::create(ctx);
+
+  // Create a __LINKEDIT,__func_starts section.
+  if (ctx.arg.function_starts)
+    ctx.function_starts.reset(new FunctionStartsSection(ctx));
 
   // Handle -sectcreate
   for (SectCreateOption arg : ctx.arg.sectcreate) {
@@ -446,6 +374,109 @@ static void create_synthetic_chunks(Context<E> &ctx) {
 
   for (std::unique_ptr<OutputSegment<E>> &seg : ctx.segments)
     sort(seg->chunks, compare_chunks<E>);
+}
+
+template <typename E>
+static void uniquify_cstrings(Context<E> &ctx, OutputSection<E> &osec) {
+  Timer t(ctx, "uniquify_cstrings");
+
+  struct Entry {
+    Entry(Subsection<E> *subsec) : owner(subsec) {}
+
+    Entry(const Entry &other) :
+      owner(other.owner.load()), p2align(other.p2align.load()) {}
+
+    std::atomic<Subsection<E> *> owner = nullptr;
+    std::atomic_uint8_t p2align = 0;
+  };
+
+  struct SubsecRef {
+    Subsection<E> *subsec = nullptr;
+    u64 hash = 0;
+    Entry *ent = nullptr;
+  };
+
+  std::vector<SubsecRef> vec(osec.members.size());
+
+  // Estimate the number of unique strings.
+  tbb::enumerable_thread_specific<HyperLogLog> estimators;
+
+  tbb::parallel_for((i64)0, (i64)osec.members.size(), [&](i64 i) {
+    Subsection<E> *subsec = osec.members[i];
+    if (subsec->is_cstring) {
+      u64 h = hash_string(subsec->get_contents());
+      vec[i].subsec = subsec;
+      vec[i].hash = h;
+      estimators.local().insert(h);
+    }
+  });
+
+  HyperLogLog estimator;
+  for (HyperLogLog &e : estimators)
+    estimator.merge(e);
+
+  // Create a hash map large enough to hold all strings.
+  ConcurrentMap<Entry> map(estimator.get_cardinality() * 3 / 2);
+
+  // Insert all strings into the hash table.
+  tbb::parallel_for_each(vec, [&](SubsecRef &ref) {
+    if (ref.subsec) {
+      std::string_view s = ref.subsec->get_contents();
+      ref.ent = map.insert(s, ref.hash, {ref.subsec}).first;
+
+      Subsection<E> *existing = ref.ent->owner;
+      while (existing->isec.file.priority < ref.subsec->isec.file.priority &&
+             !ref.ent->owner.compare_exchange_weak(existing, ref.subsec));
+
+      update_maximum(ref.ent->p2align, ref.subsec->p2align.load());
+    }
+  });
+
+  // Decide who will become the owner for each subsection.
+  tbb::parallel_for_each(vec, [&](SubsecRef &ref) {
+    if (ref.subsec && ref.subsec != ref.ent->owner) {
+      ref.subsec->is_coalesced = true;
+      ref.subsec->replacer = ref.ent->owner;
+    }
+  });
+
+  static Counter counter("num_merged_strings");
+  counter += std::erase_if(osec.members, [](Subsection<E> *subsec) {
+    return subsec->is_coalesced;
+  });
+}
+
+template <typename E>
+static void merge_cstring_sections(Context<E> &ctx) {
+  Timer t(ctx, "merge_cstring_sections");
+
+  for (Chunk<E> *chunk : ctx.chunks)
+    if (chunk->is_output_section && chunk->hdr.type == S_CSTRING_LITERALS)
+      uniquify_cstrings(ctx, *(OutputSection<E> *)chunk);
+
+  // Rewrite relocations and symbols.
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    for (std::unique_ptr<InputSection<E>> &isec : file->sections)
+      if (isec)
+        for (Relocation<E> &r : isec->rels)
+          if (r.subsec && r.subsec->is_coalesced)
+            r.subsec = r.subsec->replacer;
+  });
+
+  std::vector<InputFile<E> *> files;
+  append(files, ctx.objs);
+  append(files, ctx.dylibs);
+
+  for (InputFile<E> *file: files)
+    for (Symbol<E> *sym : file->syms)
+      if (sym && sym->subsec && sym->subsec->is_coalesced)
+        sym->subsec = sym->subsec->replacer;
+
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    std::erase_if(file->subsections, [](Subsection<E> *subsec) {
+      return subsec->is_coalesced;
+    });
+  });
 }
 
 template <typename E>
@@ -529,6 +560,59 @@ static void fix_synthetic_symbol_values(Context<E> &ctx) {
   get_symbol(ctx, "__mh_dylib_header")->value = ctx.data->hdr.addr;
   get_symbol(ctx, "__mh_bundle_header")->value = ctx.data->hdr.addr;
   get_symbol(ctx, "___dso_handle")->value = ctx.data->hdr.addr;
+
+  auto find_segment = [&](std::string_view name) -> SegmentCommand * {
+    for (std::unique_ptr<OutputSegment<E>> &seg : ctx.segments)
+      if (seg->cmd.get_segname() == name)
+        return &seg->cmd;
+    return nullptr;
+  };
+
+  auto find_section = [&](std::string_view name) -> MachSection * {
+    size_t pos = name.find('$');
+    if (pos == name.npos)
+      return nullptr;
+
+    std::string_view segname = name.substr(0, pos);
+    std::string_view sectname = name.substr(pos + 1);
+
+    for (std::unique_ptr<OutputSegment<E>> &seg : ctx.segments)
+      for (Chunk<E> *chunk : seg->chunks)
+        if (chunk->hdr.match(segname, sectname))
+          return &chunk->hdr;
+    return nullptr;
+  };
+
+  for (Symbol<E> *sym : ctx.internal_obj->syms) {
+    std::string_view name = sym->name;
+
+    if (remove_prefix(name, "segment$start$")) {
+      sym->value = ctx.text->hdr.addr;
+      if (SegmentCommand *cmd = find_segment(name))
+        sym->value = cmd->vmaddr;
+      continue;
+    }
+
+    if (remove_prefix(name, "segment$end$")) {
+      sym->value = ctx.text->hdr.addr;
+      if (SegmentCommand *cmd = find_segment(name))
+        sym->value = cmd->vmaddr + cmd->vmsize;
+      continue;
+    }
+
+    if (remove_prefix(name, "section$start$")) {
+      sym->value = ctx.text->hdr.addr;
+      if (MachSection *hdr = find_section(name))
+        sym->value = hdr->addr;
+      continue;
+    }
+
+    if (remove_prefix(name, "section$end$")) {
+      sym->value = ctx.text->hdr.addr;
+      if (MachSection *hdr = find_section(name))
+        sym->value = hdr->addr + hdr->size;
+    }
+  }
 }
 
 template <typename E>
@@ -579,50 +663,6 @@ static void compute_uuid(Context<E> &ctx) {
 }
 
 template <typename E>
-MappedFile<Context<E>> *find_framework(Context<E> &ctx, std::string name) {
-  std::string suffix;
-  std::tie(name, suffix) = split_string(name, ',');
-
-  for (std::string path : ctx.arg.framework_paths) {
-    path = get_realpath(path + "/" + name + ".framework/" + name);
-
-    if (!suffix.empty())
-      if (auto *mf = MappedFile<Context<E>>::open(ctx, path + suffix))
-        return mf;
-
-    if (auto *mf = MappedFile<Context<E>>::open(ctx, path + ".tbd"))
-      return mf;
-
-    if (auto *mf = MappedFile<Context<E>>::open(ctx, path))
-      return mf;
-  }
-  Fatal(ctx) << "-framework not found: " << name;
-}
-
-template <typename E>
-MappedFile<Context<E>> *find_library(Context<E> &ctx, std::string name) {
-  auto search = [&](std::vector<std::string> extn) -> MappedFile<Context<E>> * {
-    for (std::string dir : ctx.arg.library_paths) {
-      for (std::string e : extn) {
-        std::string path = dir + "/lib" + name + e;
-        if (MappedFile<Context<E>> *mf = MappedFile<Context<E>>::open(ctx, path))
-          return mf;
-      }
-    }
-    return nullptr;
-  };
-
-  // -search_paths_first
-  if (ctx.arg.search_paths_first)
-    return search({".tbd", ".dylib", ".a"});
-
-  // -search_dylibs_first
-  if (MappedFile<Context<E>> *mf = search({".tbd", ".dylib"}))
-    return mf;
-  return search({".a"});
-}
-
-template <typename E>
 static MappedFile<Context<E>> *
 strip_universal_header(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   FatHeader &hdr = *(FatHeader *)mf->data;
@@ -643,6 +683,7 @@ static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   switch (get_file_type(mf)) {
   case FileType::TAPI:
   case FileType::MACH_DYLIB:
+  case FileType::MACH_EXE:
     ctx.dylibs.push_back(DylibFile<E>::create(ctx, mf));
     break;
   case FileType::MACH_OBJ:
@@ -650,12 +691,6 @@ static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
     ctx.objs.push_back(ObjectFile<E>::create(ctx, mf, ""));
     break;
   case FileType::AR:
-    if (!ctx.all_load && !ctx.loaded_archives.insert(mf->name).second) {
-      // If the same .a file is specified more than once, ignore all
-      // but the first one because they would be ignored anyway.
-      break;
-    }
-
     for (MappedFile<Context<E>> *child : read_archive_members(ctx, mf))
       if (get_file_type(child) == FileType::MACH_OBJ)
         ctx.objs.push_back(ObjectFile<E>::create(ctx, child, mf->name));
@@ -704,11 +739,71 @@ template <typename E>
 static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
   Timer t(ctx, "read_input_files");
 
-  auto must_find_library = [&](std::string arg) {
-    MappedFile<Context<E>> *mf = find_library(ctx, arg);
+  std::unordered_set<std::string> libs;
+  std::unordered_set<std::string> frameworks;
+
+  auto search = [&](std::vector<std::string> names)
+      -> MappedFile<Context<E>> * {
+    for (std::string dir : ctx.arg.library_paths) {
+      for (std::string name : names) {
+        std::string path = dir + "/lib" + name;
+        if (MappedFile<Context<E>> *mf = MappedFile<Context<E>>::open(ctx, path))
+          return mf;
+        ctx.missing_files.insert(path);
+      }
+    }
+    return nullptr;
+  };
+
+  auto find_library = [&](std::string name) -> MappedFile<Context<E>> * {
+    // -search_paths_first
+    if (ctx.arg.search_paths_first)
+      return search({name + ".tbd", name + ".dylib", name + ".a"});
+
+    // -search_dylibs_first
+    if (MappedFile<Context<E>> *mf = search({name + ".tbd", name + ".dylib"}))
+      return mf;
+    return search({name + ".a"});
+  };
+
+  auto read_library = [&](std::string name) {
+    if (!libs.insert(name).second)
+      return;
+
+    MappedFile<Context<E>> *mf = find_library(name);
     if (!mf)
-      Fatal(ctx) << "library not found: -l" << arg;
-    return mf;
+      Fatal(ctx) << "library not found: -l" << name;
+    read_file(ctx, mf);
+  };
+
+  auto find_framework = [&](std::string name) -> MappedFile<Context<E>> * {
+    std::string suffix;
+    std::tie(name, suffix) = split_string(name, ',');
+
+    for (std::string path : ctx.arg.framework_paths) {
+      path = get_realpath(path + "/" + name + ".framework/" + name);
+
+      if (!suffix.empty())
+        if (auto *mf = MappedFile<Context<E>>::open(ctx, path + suffix))
+          return mf;
+
+      if (auto *mf = MappedFile<Context<E>>::open(ctx, path + ".tbd"))
+        return mf;
+
+      if (auto *mf = MappedFile<Context<E>>::open(ctx, path))
+        return mf;
+    }
+    return nullptr;
+  };
+
+  auto read_framework = [&](std::string name) {
+    if (!frameworks.insert(name).second)
+      return;
+
+    MappedFile<Context<E>> *mf = find_framework(name);
+    if (!mf)
+      Fatal(ctx) << "-framework not found: " << name;
+    read_file(ctx, mf);
   };
 
   while (!args.empty()) {
@@ -749,27 +844,27 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
       read_file(ctx, MappedFile<Context<E>>::must_open(ctx, arg));
       ctx.all_load = orig;
     } else if (opt == "-framework") {
-      read_file(ctx, find_framework(ctx, arg));
+      read_framework(arg);
     } else if (opt == "-needed_framework") {
       ctx.needed_l = true;
-      read_file(ctx, find_framework(ctx, arg));
+      read_framework(arg);
     } else if (opt == "-weak_framework") {
       ctx.weak_l = true;
-      read_file(ctx, find_framework(ctx, arg));
+      read_framework(arg);
     } else if (opt == "-l") {
-      read_file(ctx, must_find_library(arg));
+      read_library(arg);
     } else if (opt == "-needed-l") {
       ctx.needed_l = true;
-      read_file(ctx, must_find_library(arg));
+      read_library(arg);
     } else if (opt == "-hidden-l") {
       ctx.hidden_l = true;
-      read_file(ctx, must_find_library(arg));
+      read_library(arg);
     } else if (opt == "-weak-l") {
       ctx.weak_l = true;
-      read_file(ctx, must_find_library(arg));
+      read_library(arg);
     } else if (opt == "-reexport-l") {
       ctx.reexport_l = true;
-      read_file(ctx, must_find_library(arg));
+      read_library(arg);
     } else {
       unreachable();
     }
@@ -780,17 +875,25 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
     ctx.reexport_l = false;
   }
 
+  // With -bundle_loader, we can import symbols from a main executable.
+  if (!ctx.arg.bundle_loader.empty())
+    read_library(ctx.arg.bundle_loader);
+
   // An object file can contain linker directives to load other object
   // files or libraries, so process them if any.
-  for (ObjectFile<E> *file : ctx.objs) {
+  for (i64 i = 0; i < ctx.objs.size(); i++) {
+    ObjectFile<E> *file = ctx.objs[i];
     std::vector<std::string> opts = file->get_linker_options(ctx);
 
     for (i64 j = 0; j < opts.size();) {
       if (opts[j] == "-framework") {
-        read_file(ctx, find_framework(ctx, opts[j + 1]));
+        read_framework(opts[j + 1]);
         j += 2;
       } else if (opts[j].starts_with("-l")) {
-        read_file(ctx, must_find_library(opts[j].substr(2)));
+        std::string name = opts[j].substr(2);
+        if (libs.insert(name).second)
+          if (MappedFile<Context<E>> *mf = find_library(name))
+            read_file(ctx, mf);
         j++;
       } else {
         Fatal(ctx) << *file << ": unknown LC_LINKER_OPTION command: " << opts[j];
@@ -806,8 +909,9 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
   for (DylibFile<E> *dylib : ctx.dylibs)
     dylib->priority = ctx.file_priority++;
 
-  for (i64 i = 0; i < ctx.dylibs.size(); i++)
-    ctx.dylibs[i]->dylib_idx = i + 1;
+  for (i64 i = 1; DylibFile<E> *file : ctx.dylibs)
+    if (file->dylib_idx != BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE)
+      file->dylib_idx = i++;
 }
 
 template <typename E>
@@ -817,6 +921,36 @@ static void parse_object_files(Context<E> &ctx) {
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     file->parse(ctx);
   });
+}
+
+template <typename E>
+static void write_dependency_info(Context<E> &ctx) {
+  static constexpr u8 LINKER_VERSION = 0;
+  static constexpr u8 INPUT_FILE = 0x10;
+  static constexpr u8 NOT_FOUND_FILE = 0x11;
+  static constexpr u8 OUTPUT_FILE = 0x40;
+
+  std::ofstream out;
+  out.open(std::string(ctx.arg.dependency_info).c_str());
+  if (!out.is_open())
+    Fatal(ctx) << "cannot open " << ctx.arg.dependency_info
+               << ": " << errno_string();
+
+  out << LINKER_VERSION << mold_version << '\0';
+
+  std::set<std::string_view> input_files;
+  for (std::unique_ptr<MappedFile<Context<E>>> &mf : ctx.mf_pool)
+    if (!mf->parent)
+      input_files.insert(mf->name);
+
+  for (std::string_view s : input_files)
+    out << INPUT_FILE << s << '\0';
+
+  for (std::string_view s : ctx.missing_files)
+    out << NOT_FOUND_FILE << s << '\0';
+
+  out << OUTPUT_FILE << ctx.arg.output << '\0';
+  out.close();
 }
 
 template <typename E>
@@ -900,12 +1034,11 @@ static int do_main(int argc, char **argv) {
 
   claim_unresolved_symbols(ctx);
 
-  merge_cstring_sections(ctx);
-
   if (ctx.arg.dead_strip)
     dead_strip(ctx);
 
   create_synthetic_chunks(ctx);
+  merge_cstring_sections(ctx);
 
   for (ObjectFile<E> *file : ctx.objs)
     file->check_duplicate_symbols(ctx);
@@ -935,12 +1068,20 @@ static int do_main(int argc, char **argv) {
 
   copy_sections_to_output_file(ctx);
 
+  if constexpr (std::is_same_v<E, ARM64>)
+    if (!ctx.arg.ignore_optimization_hints)
+      apply_linker_optimization_hints(ctx);
+
   if (ctx.code_sig)
     ctx.code_sig->write_signature(ctx);
   else if (ctx.arg.uuid == UUID_HASH)
     compute_uuid(ctx);
 
   ctx.output_file->close(ctx);
+
+  if (!ctx.arg.dependency_info.empty())
+    write_dependency_info(ctx);
+
   ctx.checkpoint();
   t.stop();
 
