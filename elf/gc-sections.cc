@@ -73,10 +73,9 @@ static void visit(Context<E> &ctx, InputSection<E> *isec,
 }
 
 template <typename E>
-static tbb::concurrent_vector<InputSection<E> *>
-collect_root_set(Context<E> &ctx) {
+static void collect_root_set(Context<E> &ctx,
+                             tbb::concurrent_vector<InputSection<E> *> &rootset) {
   Timer t(ctx, "collect_root_set");
-  tbb::concurrent_vector<InputSection<E> *> rootset;
 
   auto enqueue_section = [&](InputSection<E> *isec) {
     if (mark_section(isec))
@@ -136,8 +135,6 @@ collect_root_set(Context<E> &ctx) {
       for (const ElfRel<E> &rel : cie.get_rels())
         enqueue_symbol(file->symbols[rel.r_sym]);
   });
-
-  return rootset;
 }
 
 // Mark all reachable sections
@@ -191,7 +188,8 @@ void gc_sections(Context<E> &ctx) {
 
   mark_nonalloc_fragments(ctx);
 
-  tbb::concurrent_vector<InputSection<E> *> rootset = collect_root_set(ctx);
+  tbb::concurrent_vector<InputSection<E> *> rootset;
+  collect_root_set(ctx, rootset);
   mark(ctx, rootset);
   sweep(ctx);
 }

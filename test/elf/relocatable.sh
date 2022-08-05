@@ -9,12 +9,11 @@ OBJDUMP="${OBJDUMP:-objdump}"
 MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
+t=out/test/elf/$MACHINE/$testname
 mkdir -p $t
 
 # https://gcc.gnu.org/bugzilla/show_bug.cgi?id=98667
-[ $MACHINE = i386 ] && { echo skipped; exit; }
+[ $MACHINE = i386 -o $MACHINE = i686 ] && { echo skipped; exit; }
 
 cat <<EOF | $CXX -c -o $t/a.o -xc++ -
 int one() { return 1; }

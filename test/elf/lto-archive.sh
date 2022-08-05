@@ -9,11 +9,13 @@ OBJDUMP="${OBJDUMP:-objdump}"
 MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
+t=out/test/elf/$MACHINE/$testname
 mkdir -p $t
 
 [ "$CC" = cc ] || { echo skipped; exit; }
+
+echo 'int main() {}' | $CC -flto -o /dev/null -xc - >& /dev/null \
+  || { echo skipped; exit; }
 
 cat <<EOF | $CC -o $t/a.o -c -flto -xc -
 #include <stdio.h>

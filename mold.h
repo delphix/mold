@@ -27,7 +27,7 @@
 #include <vector>
 
 #define XXH_INLINE_ALL 1
-#include <xxhash.h>
+#include <xxhash/xxhash.h>
 
 #ifdef NDEBUG
 #  define unreachable() __builtin_unreachable()
@@ -310,8 +310,16 @@ inline u64 read_uleb(u8 const*&buf) {
   return read_uleb(const_cast<u8 *&>(buf));
 }
 
+inline u64 read_uleb(std::string_view &str) {
+  u8 *start = (u8 *)&str[0];
+  u8 *ptr = start;
+  u64 val = read_uleb(ptr);
+  str = str.substr(ptr - start);
+  return val;
+}
+
 inline i64 uleb_size(u64 val) {
-#pragma unroll
+#pragma GCC unroll 8
   for (int i = 1; i < 9; i++)
     if (val < ((u64)1 << (7 * i)))
       return i;
@@ -325,6 +333,14 @@ std::string_view save_string(C &ctx, const std::string &str) {
   buf[str.size()] = '\0';
   ctx.string_pool.push_back(std::unique_ptr<u8[]>(buf));
   return {(char *)buf, str.size()};
+}
+
+inline bool remove_prefix(std::string_view &s, std::string_view prefix) {
+  if (s.starts_with(prefix)) {
+    s = s.substr(prefix.size());
+    return true;
+  }
+  return false;
 }
 
 //
@@ -508,7 +524,6 @@ private:
 class MultiGlob {
 public:
   bool add(std::string_view pat, u32 val);
-  void compile();
   bool empty() const { return strings.empty(); }
   std::optional<u32> find(std::string_view str);
 
@@ -519,6 +534,7 @@ private:
     std::unique_ptr<TrieNode> children[256];
   };
 
+  void compile();
   void fix_suffix_links(TrieNode &node);
   void fix_values();
 
@@ -526,7 +542,8 @@ private:
   std::unique_ptr<TrieNode> root;
   std::vector<std::pair<Glob, u32>> globs;
   std::vector<u32> values;
-  bool compiled = false;
+  std::once_flag once;
+  bool is_compiled = false;
 };
 
 //
@@ -553,6 +570,7 @@ std::filesystem::path to_abs_path(std::filesystem::path path);
 //
 
 std::string_view demangle(std::string_view name);
+std::optional<std::string_view> cpp_demangle(std::string_view name);
 
 //
 // compress.cc
@@ -763,7 +781,8 @@ MappedFile<C> *MappedFile<C>::open(C &ctx, std::string path) {
 #endif
 
   if (st.st_size > 0) {
-    mf->data = (u8 *)mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    mf->data = (u8 *)mmap(nullptr, st.st_size, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE, fd, 0);
     if (mf->data == MAP_FAILED)
       Fatal(ctx) << path << ": mmap failed: " << errno_string();
   }

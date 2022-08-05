@@ -49,16 +49,16 @@ u64 get_eflags(Context<E> &ctx) {
   if constexpr (std::is_same_v<E, ARM32>)
     return EF_ARM_EABI_VER5;
 
-  if constexpr (std::is_same_v<E, RISCV64>) {
-    std::vector<ObjectFile<RISCV64> *> objs = ctx.objs;
+  if constexpr (std::is_same_v<E, RISCV64> || std::is_same_v<E, RISCV32>) {
+    std::vector<ObjectFile<E> *> objs = ctx.objs;
     std::erase(objs, ctx.internal_obj);
 
     if (objs.empty())
       return 0;
 
     u32 ret = objs[0]->get_ehdr().e_flags;
-    for (ObjectFile<RISCV64> *file : std::span(objs).subspan(1))
-      if (file->get_ehdr().e_flags & EF_RISCV_RVC)
+    for (i64 i = 1; i < objs.size(); i++)
+      if (objs[i]->get_ehdr().e_flags & EF_RISCV_RVC)
         ret |= EF_RISCV_RVC;
     return ret;
   }
@@ -356,8 +356,10 @@ void RelDynSection<E>::update_shdr(Context<E> &ctx) {
 
 template <typename E>
 static ElfRel<E> reloc(u64 offset, u32 type, u32 sym, i64 addend = 0) {
-  if constexpr (std::is_same_v<E, I386> || std::is_same_v<E, ARM32>)
+  if constexpr (E::is_rel)
     return {(u32)offset, (u8)type, sym};
+  else if constexpr (E::word_size == 4)
+    return {offset, (u8)type, sym, addend};
   else
     return {offset, type, sym, addend};
 }
@@ -570,11 +572,11 @@ void SymtabSection<E>::copy_buf(Context<E> &ctx) {
 
   // Copy symbols and symbol names from input files
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    file->write_symtab(ctx);
+    file->export_to_symtab(ctx);
   });
 
   tbb::parallel_for_each(ctx.dsos, [&](SharedFile<E> *file) {
-    file->write_symtab(ctx);
+    file->export_to_symtab(ctx);
   });
 }
 
@@ -904,6 +906,7 @@ static std::vector<T> encode_relr(const std::vector<T> &pos) {
 
   for (i64 i = 0; i < pos.size();) {
     assert(i == 0 || pos[i - 1] <= pos[i]);
+    assert(pos[i] % sizeof(T) == 0);
 
     vec.push_back(pos[i]);
     u64 base = pos[i] + sizeof(T);
@@ -1076,17 +1079,18 @@ std::vector<GotEntry<E>> GotSection<E>::get_entries(Context<E> &ctx) const {
       continue;
     }
 
-    // Otherwise, we know the offset at link-time, so fill the GOT entry.
+    // Otherwise, we know the offset from the thread pointer (TP) at
+    // link-time, so we can fill the GOT entry directly.
+    //
+    // On x86, TP (%gs for 32-bit, %fs for 64-bit) points to the end of
+    // all thread-local variables for a historical reason, so the offset
+    // we calculate here will be negative. On other architectures, TP
+    // points to an optional padding whose size is architecture-dependent
+    // followed by thread-local variables.
     if constexpr (std::is_same_v<E, X86_64> || std::is_same_v<E, I386>)
       entries.push_back({idx, sym->get_addr(ctx) - ctx.tls_end});
-    else if constexpr (std::is_same_v<E, ARM32>)
-      entries.push_back({idx, sym->get_addr(ctx) - ctx.tls_begin + 8});
-    else if constexpr (std::is_same_v<E, ARM64>)
-      entries.push_back({idx, sym->get_addr(ctx) - ctx.tls_begin + 16});
-    else if constexpr (std::is_same_v<E, RISCV64>)
-      entries.push_back({idx, sym->get_addr(ctx) - ctx.tls_begin});
     else
-      unreachable();
+      entries.push_back({idx, sym->get_addr(ctx) - ctx.tls_begin + E::tls_offset});
   }
 
   if (tlsld_idx != -1)
@@ -1136,24 +1140,12 @@ void GotPltSection<E>::copy_buf(Context<E> &ctx) {
   buf[1] = 0;
   buf[2] = 0;
 
-  auto get_plt_resolver_addr = [&](Symbol<E> &sym) -> u64 {
-    if constexpr (std::is_same_v<E, ARM64> || std::is_same_v<E, ARM32> ||
-                  std::is_same_v<E, RISCV64>)
-      return ctx.plt->shdr.sh_addr;
-
-    if constexpr (std::is_same_v<E, X86_64>) {
-      if (ctx.arg.z_ibtplt)
-        return ctx.plt->shdr.sh_addr;
-      return sym.get_plt_addr(ctx) + 6;
-    }
-
+  for (Symbol<E> *sym : ctx.plt->symbols) {
     if constexpr (std::is_same_v<E, I386>)
-      return sym.get_plt_addr(ctx) + 6;
-    unreachable();
-  };
-
-  for (Symbol<E> *sym : ctx.plt->symbols)
-    buf[sym->get_gotplt_idx(ctx)] = get_plt_resolver_addr(*sym);
+      buf[sym->get_gotplt_idx(ctx)] = sym->get_plt_addr(ctx) + 6;
+    else
+      buf[sym->get_gotplt_idx(ctx)] = ctx.plt->shdr.sh_addr;
+  }
 }
 
 template <typename E>
@@ -1161,10 +1153,10 @@ void PltSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
   assert(!sym->has_plt(ctx));
 
   if (this->shdr.sh_size == 0)
-    this->shdr.sh_size = ctx.plt_hdr_size;
+    this->shdr.sh_size = E::plt_hdr_size;
 
   sym->set_plt_idx(ctx, symbols.size());
-  this->shdr.sh_size += ctx.plt_size;
+  this->shdr.sh_size += E::plt_size;
   symbols.push_back(sym);
 
   sym->set_gotplt_idx(ctx, ctx.gotplt->shdr.sh_size / E::word_size);
@@ -1197,6 +1189,52 @@ void RelPltSection<E>::copy_buf(Context<E> &ctx) {
   for (Symbol<E> *sym : ctx.plt->symbols)
     buf[relplt_idx++] = reloc<E>(sym->get_gotplt_addr(ctx), E::R_JUMP_SLOT,
                                  sym->get_dynsym_idx(ctx));
+}
+
+template<typename E>
+void get_output_esym(Context<E> &ctx, const Symbol<E> &sym, i64 strtab_offset,
+                     ElfSym<E> &out_esym) {
+  memset(&out_esym, 0, sizeof(out_esym));
+  out_esym.st_type = sym.esym().st_type;
+  out_esym.st_size = sym.esym().st_size;
+
+  if (sym.is_local())
+    out_esym.st_bind = STB_LOCAL;
+  else if (sym.is_weak)
+    out_esym.st_bind = STB_WEAK;
+  else if (sym.file->is_dso)
+    out_esym.st_bind = STB_GLOBAL;
+  else
+    out_esym.st_bind = sym.esym().st_bind;
+
+  out_esym.st_name = strtab_offset;
+
+  if (sym.has_copyrel) {
+    out_esym.st_shndx = sym.copyrel_readonly
+                    ? ctx.copyrel_relro->shndx : ctx.copyrel->shndx;
+    out_esym.st_value = sym.get_addr(ctx);
+  } else if (sym.file->is_dso || sym.esym().is_undef()) {
+    out_esym.st_shndx = SHN_UNDEF;
+    out_esym.st_size = 0;
+    out_esym.st_value = sym.is_canonical ? sym.get_plt_addr(ctx) : 0;
+  } else if (sym.shndx < 0) {
+    // Internal file
+    out_esym.st_shndx = -sym.shndx;
+    out_esym.st_value = sym.get_addr(ctx);
+  } else {
+    InputSection<E> *isec = sym.get_input_section();
+    if (!isec) {
+      out_esym.st_shndx = SHN_ABS;
+      out_esym.st_value = sym.get_addr(ctx);
+    } else if (sym.get_type() == STT_TLS) {
+      out_esym.st_shndx = isec->output_section->shndx;
+      out_esym.st_value = sym.get_addr(ctx) - ctx.tls_begin;
+    } else {
+      out_esym.st_shndx = isec->output_section->shndx;
+      out_esym.st_value = sym.get_addr(ctx, false);
+      out_esym.st_visibility = sym.visibility;
+    }
+  }
 }
 
 template <typename E>
@@ -1249,13 +1287,9 @@ void DynsymSection<E>::finalize(Context<E> &ctx) {
     vec[i].idx = i;
   });
 
-  auto is_local = [](Symbol<E> *sym) {
-    return !sym->is_imported && !sym->is_exported;
-  };
-
   tbb::parallel_sort(vec.begin() + 1, vec.end(), [&](const T &a, const T &b) {
-    return std::tuple(!is_local(a.sym), (bool)a.sym->is_exported, a.hash, a.idx) <
-           std::tuple(!is_local(b.sym), (bool)b.sym->is_exported, b.hash, b.idx);
+    return std::tuple(!a.sym->is_local(), (bool)a.sym->is_exported, a.hash, a.idx) <
+           std::tuple(!b.sym->is_local(), (bool)b.sym->is_exported, b.hash, b.idx);
   });
 
   ctx.dynstr->dynsym_offset = ctx.dynstr->shdr.sh_size;
@@ -1268,7 +1302,9 @@ void DynsymSection<E>::finalize(Context<E> &ctx) {
 
   // ELF's symbol table sh_info holds the offset of the first global symbol.
   auto first_global =
-    std::partition_point(symbols.begin() + 1, symbols.end(), is_local);
+    std::partition_point(symbols.begin() + 1, symbols.end(), [](Symbol<E> *sym) {
+      return sym->is_local();
+    });
   this->shdr.sh_info = first_global - symbols.begin();
 }
 
@@ -1289,44 +1325,11 @@ void DynsymSection<E>::copy_buf(Context<E> &ctx) {
     ElfSym<E> &esym =
       *(ElfSym<E> *)(base + sym.get_dynsym_idx(ctx) * sizeof(ElfSym<E>));
 
-    memset(&esym, 0, sizeof(esym));
-    esym.st_type = sym.esym().st_type;
-    esym.st_size = sym.esym().st_size;
-
-    if (i < this->shdr.sh_info)
-      esym.st_bind = STB_LOCAL;
-    else if (sym.is_weak)
-      esym.st_bind = STB_WEAK;
-    else if (sym.file->is_dso)
-      esym.st_bind = STB_GLOBAL;
-    else
-      esym.st_bind = sym.esym().st_bind;
-
-    esym.st_name = name_offset;
+    get_output_esym(ctx, sym, name_offset, esym);
     name_offset += sym.name().size() + 1;
 
-    if (sym.has_copyrel) {
-      esym.st_shndx = sym.copyrel_readonly
-        ? ctx.copyrel_relro->shndx : ctx.copyrel->shndx;
-      esym.st_value = sym.get_addr(ctx);
-    } else if (sym.file->is_dso || sym.esym().is_undef()) {
-      esym.st_shndx = SHN_UNDEF;
-      esym.st_size = 0;
-      esym.st_value = sym.is_canonical ? sym.get_plt_addr(ctx) : 0;
-    } else {
-      InputSection<E> *isec = sym.get_input_section();
-      if (!isec) {
-        esym.st_shndx = SHN_ABS;
-        esym.st_value = sym.get_addr(ctx);
-      } else if (sym.get_type() == STT_TLS) {
-        esym.st_shndx = isec->output_section->shndx;
-        esym.st_value = sym.get_addr(ctx) - ctx.tls_begin;
-      } else {
-        esym.st_shndx = isec->output_section->shndx;
-        esym.st_value = sym.get_addr(ctx, false);
-        esym.st_visibility = sym.visibility;
-      }
-    }
+    if (esym.st_bind == STB_LOCAL)
+      assert(i < this->shdr.sh_info);
   }
 }
 

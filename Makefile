@@ -1,4 +1,4 @@
-VERSION = 1.3.1
+VERSION = 1.4.0
 
 PREFIX = /usr/local
 BINDIR = $(PREFIX)/bin
@@ -9,6 +9,15 @@ MANDIR = $(PREFIX)/share/man
 INSTALL = install
 INSTALL_PROGRAM = $(INSTALL)
 INSTALL_DATA = $(INSTALL) -m 644
+
+OS := $(shell uname -s)
+ARCH := $(shell uname -m)
+
+ifeq ($(OS), Darwin)
+  TESTS := $(wildcard test/macho/*.sh)
+else
+  TESTS := $(wildcard test/elf/*.sh)
+endif
 
 D = $(DESTDIR)
 
@@ -23,10 +32,7 @@ endif
 STRIP = strip
 
 SRCS = $(wildcard *.cc elf/*.cc macho/*.cc)
-OBJS = $(SRCS:%.cc=out/%.o)
-
-OS := $(shell uname -s)
-ARCH := $(shell uname -m)
+OBJS = $(SRCS:%.cc=out/%.o) out/rust-demangle.o
 
 IS_ANDROID = 0
 ifneq ($(findstring -android,$(shell $(CC) -dumpmachine)),)
@@ -39,7 +45,7 @@ CFLAGS = -O2
 CXXFLAGS = -O2
 
 MOLD_CXXFLAGS := -std=c++20 -fno-exceptions -fno-unwind-tables \
-                 -fno-asynchronous-unwind-tables -Ithird-party/xxhash \
+                 -fno-asynchronous-unwind-tables -Ithird-party \
                  -DMOLD_VERSION=\"$(VERSION)\" -DLIBDIR="\"$(LIBDIR)\""
 
 MOLD_LDFLAGS := -pthread -lz -lm -ldl
@@ -132,6 +138,9 @@ mold: $(OBJS) $(MIMALLOC_LIB) $(TBB_LIB)
 mold-wrapper.so: elf/mold-wrapper.c
 	$(CC) $(DEPFLAGS) $(CFLAGS) -fPIC -shared -o $@ $< $(MOLD_WRAPPER_LDFLAGS) $(LDFLAGS)
 
+out/rust-demangle.o: third-party/rust-demangle/rust-demangle.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 out/%.o: %.cc out/elf/.keep out/macho/.keep
 	$(CXX) $(MOLD_CXXFLAGS) $(DEPFLAGS) $(CXXFLAGS) -c -o $@ $<
 
@@ -152,10 +161,11 @@ $(TBB_LIB):
 
 test tests check: all
 ifeq ($(OS), Darwin)
-	$(MAKE) -C test -f Makefile.darwin --no-print-directory
+	@$(MAKE) $(TESTS) --no-print-directory
 else
-	$(MAKE) -C test -f Makefile.linux --no-print-directory --output-sync
+	@$(MAKE) $(TESTS) --no-print-directory --output-sync
 endif
+
 	@if test -t 1; then \
 	  printf '\e[32mPassed all tests\e[0m\n'; \
 	else \
@@ -178,6 +188,20 @@ test-all: all
 	$(MAKE) test-arch TRIPLE=aarch64-linux-gnu MACHINE=aarch64
 	$(MAKE) test-arch TRIPLE=arm-linux-gnueabihf MACHINE=arm
 	$(MAKE) test-arch TRIPLE=riscv64-linux-gnu MACHINE=riscv64
+
+# macOS's GNU make hasn't been updated since 3.8.1 perhaps due a concern
+# of GPLv3. The --output-sync flag was introduced in GNU Make 4.0, so we
+# can't use that flag on macOS.
+#
+# `tail -r | tail -r` is a poor-man's way to enable full buffering on a
+# command output. `tail -r` outputs an input from the last line to the
+# first.
+$(TESTS):
+ifeq ($(OS), Darwin)
+	@set -o pipefail; ./$@ 2>&1 | tail -r | tail -r
+else
+	@./$@
+endif
 
 install: all
 	$(INSTALL) -d $D$(BINDIR)
@@ -216,4 +240,4 @@ test-tsan:
 clean:
 	rm -rf *~ mold mold-wrapper.so out ld ld64 mold-*-linux.tar.gz
 
-.PHONY: all test tests check clean test-arch test-all test-asan test-ubsan test-tsan
+.PHONY: all test tests check clean test-arch test-all test-asan test-ubsan test-tsan $(TESTS)

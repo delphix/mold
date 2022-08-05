@@ -406,11 +406,13 @@ ObjectFile<E> *create_internal_file(Context<E> &ctx) {
     ctx.etext = add("etext");
   if (!get_symbol(ctx, "edata")->file)
     ctx.edata = add("edata");
+  if (!get_symbol(ctx, "__dso_handle")->file)
+    ctx.__dso_handle = add("__dso_handle");
 
   if constexpr (E::supports_tlsdesc)
     ctx._TLS_MODULE_BASE_ = add("_TLS_MODULE_BASE_");
 
-  if constexpr (std::is_same_v<E, RISCV64>)
+  if constexpr (std::is_same_v<E, RISCV64> || std::is_same_v<E, RISCV32>)
     if (!ctx.arg.shared)
       ctx.__global_pointer = add("__global_pointer$");
 
@@ -920,21 +922,21 @@ void scan_rels(Context<E> &ctx) {
     if (sym->flags & NEEDS_GOT)
       ctx.got->add_got_symbol(ctx, sym);
 
-    if (sym->flags & NEEDS_PLT) {
-      if (sym->is_canonical) {
-        // A canonical PLT needs to be visible from DSOs.
-        sym->is_exported = true;
+    if (sym->flags & NEEDS_CPLT) {
+      sym->is_canonical = true;
 
-        // We can't use .plt.got for a canonical PLT because otherwise
-        // .plt.got and .got would refer each other, resulting in an
-        // infinite loop at runtime.
+      // A canonical PLT needs to be visible from DSOs.
+      sym->is_exported = true;
+
+      // We can't use .plt.got for a canonical PLT because otherwise
+      // .plt.got and .got would refer each other, resulting in an
+      // infinite loop at runtime.
+      ctx.plt->add_symbol(ctx, sym);
+    } else if (sym->flags & NEEDS_PLT) {
+      if (sym->flags & NEEDS_GOT)
+        ctx.pltgot->add_symbol(ctx, sym);
+      else
         ctx.plt->add_symbol(ctx, sym);
-      } else {
-        if (sym->flags & NEEDS_GOT)
-          ctx.pltgot->add_symbol(ctx, sym);
-        else
-          ctx.plt->add_symbol(ctx, sym);
-      }
     }
 
     if (sym->flags & NEEDS_GOTTP)
@@ -1079,9 +1081,6 @@ void apply_version_script(Context<E> &ctx) {
     }
   }
 
-  matcher.compile();
-  cpp_matcher.compile();
-
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     for (Symbol<E> *sym : file->get_global_syms()) {
       if (sym->file != file)
@@ -1094,9 +1093,12 @@ void apply_version_script(Context<E> &ctx) {
         continue;
       }
 
-      if (!cpp_matcher.empty())
-        if (std::optional<u16> ver = cpp_matcher.find(demangle(name)))
+      if (!cpp_matcher.empty()) {
+        if (std::optional<std::string_view> s = cpp_demangle(name))
+          name = *s;
+        if (std::optional<u16> ver = cpp_matcher.find(name))
           sym->ver_idx = *ver;
+      }
     }
   });
 }
@@ -1459,7 +1461,6 @@ void fix_synthetic_symbols(Context<E> &ctx) {
   if (Chunk<E> *chunk = find(".bss"))
     start(ctx.__bss_start, chunk);
 
-  // __ehdr_start and __executable_start
   if (ctx.ehdr) {
     for (Chunk<E> *chunk : ctx.chunks) {
       if (chunk->shndx == 1) {
@@ -1467,6 +1468,11 @@ void fix_synthetic_symbols(Context<E> &ctx) {
         ctx.__ehdr_start->value = ctx.ehdr->shdr.sh_addr;
         ctx.__executable_start->shndx = -1;
         ctx.__executable_start->value = ctx.ehdr->shdr.sh_addr;
+
+        if (ctx.__dso_handle) {
+          ctx.__dso_handle->shndx = -1;
+          ctx.__dso_handle->value = ctx.ehdr->shdr.sh_addr;
+        }
         break;
       }
     }
@@ -1567,7 +1573,7 @@ void fix_synthetic_symbols(Context<E> &ctx) {
   start(ctx.__GNU_EH_FRAME_HDR, ctx.eh_frame_hdr);
 
   // RISC-V's __global_pointer$
-  if constexpr (std::is_same_v<E, RISCV64>) {
+  if constexpr (std::is_same_v<E, RISCV64> || std::is_same_v<E, RISCV32>) {
     if (!ctx.arg.shared) {
       if (Chunk<E> *chunk = find(".sdata"))
         ctx.__global_pointer->shndx = -chunk->shndx;

@@ -191,8 +191,8 @@ static std::vector<u8> create_function_starts_cmd(Context<E> &ctx) {
 
   cmd.cmd = LC_FUNCTION_STARTS;
   cmd.cmdsize = buf.size();
-  cmd.dataoff = ctx.function_starts.hdr.offset;
-  cmd.datasize = ctx.function_starts.hdr.size;
+  cmd.dataoff = ctx.function_starts->hdr.offset;
+  cmd.datasize = ctx.function_starts->hdr.size;
   return buf;
 }
 
@@ -275,10 +275,12 @@ static std::vector<std::vector<u8>> create_load_commands(Context<E> &ctx) {
     vec.push_back(create_uuid_cmd(ctx));
   vec.push_back(create_build_version_cmd(ctx));
   vec.push_back(create_source_version_cmd(ctx));
-  vec.push_back(create_function_starts_cmd(ctx));
+  if (ctx.arg.function_starts)
+    vec.push_back(create_function_starts_cmd(ctx));
 
-  for (DylibFile<E> *dylib : ctx.dylibs)
-    vec.push_back(create_load_dylib_cmd(ctx, *dylib));
+  for (DylibFile<E> *file : ctx.dylibs)
+    if (file->dylib_idx != BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE)
+      vec.push_back(create_load_dylib_cmd(ctx, *file));
 
   for (std::string_view rpath : ctx.arg.rpath)
     vec.push_back(create_rpath_cmd(ctx, rpath));
@@ -348,6 +350,9 @@ void OutputMachHeader<E>::copy_buf(Context<E> &ctx) {
 
   if (ctx.output_type == MH_DYLIB && !has_reexported_lib(ctx))
     mhdr.flags |= MH_NO_REEXPORTED_DYLIBS;
+
+  if (ctx.arg.mark_dead_strippable_dylib)
+    mhdr.flags |= MH_DEAD_STRIPPABLE_DYLIB;
 
   write_vector(buf + sizeof(mhdr), flatten(cmds));
 }
@@ -666,7 +671,8 @@ void RebaseSection<E>::compute_size(Context<E> &ctx) {
       if (chunk->is_output_section && !chunk->hdr.match("__TEXT", "__eh_frame"))
         for (Subsection<E> *subsec : ((OutputSection<E> *)chunk)->members)
           for (Relocation<E> &rel : subsec->get_rels())
-            if (!rel.is_pcrel && rel.type == E::abs_rel && !refers_tls(rel.sym))
+            if (!rel.is_pcrel && !rel.is_subtracted && rel.type == E::abs_rel &&
+                !refers_tls(rel.sym))
               enc.add(seg->seg_idx,
                       subsec->get_addr(ctx) + rel.offset - seg->cmd.vmaddr);
 
@@ -944,7 +950,7 @@ template <typename E>
 void ExportSection<E>::compute_size(Context<E> &ctx) {
   for (ObjectFile<E> *file : ctx.objs)
     for (Symbol<E> *sym : file->syms)
-      if (sym && sym->file == file & sym->scope == SCOPE_EXTERN)
+      if (sym && sym->file == file && sym->scope == SCOPE_EXTERN)
         enc.entries.push_back({
             sym->name,
             sym->is_weak ? EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION : 0,
@@ -966,6 +972,9 @@ void ExportSection<E>::copy_buf(Context<E> &ctx) {
   enc.write_trie(buf, enc.root);
 }
 
+// LC_FUNCTION_STARTS contains function start addresses encoded in
+// ULEB128. I don't know what tools consume this table, but we create
+// it anyway by default for the sake of compatibility.
 template <typename E>
 void FunctionStartsSection<E>::compute_size(Context<E> &ctx) {
   std::vector<std::vector<u64>> vec(ctx.objs.size());
@@ -1003,15 +1012,23 @@ void FunctionStartsSection<E>::copy_buf(Context<E> &ctx) {
 template <typename E>
 void SymtabSection<E>::compute_size(Context<E> &ctx) {
   symtab_offsets.clear();
-  strtab_offsets.clear();
-
   symtab_offsets.resize(ctx.objs.size() + ctx.dylibs.size() + 1);
+
+  strtab_offsets.clear();
   strtab_offsets.resize(ctx.objs.size() + ctx.dylibs.size() + 1);
+  strtab_offsets[0] = 1;
 
   tbb::enumerable_thread_specific<i64> locals;
   tbb::enumerable_thread_specific<i64> globals;
   tbb::enumerable_thread_specific<i64> undefs;
 
+  // Calculate the sizes for -add_ast_path symbols.
+  locals.local() += ctx.arg.add_ast_path.size();
+  symtab_offsets[0] += ctx.arg.add_ast_path.size();
+  for (std::string_view s : ctx.arg.add_ast_path)
+    strtab_offsets[0] += s.size() + 1;
+
+  // Calculate the sizes required for symbols in input files.
   auto count = [&](Symbol<E> *sym) {
     if (sym->is_imported)
       undefs.local() += 1;
@@ -1051,7 +1068,6 @@ void SymtabSection<E>::compute_size(Context<E> &ctx) {
   for (i64 i = 1; i < symtab_offsets.size(); i++)
     symtab_offsets[i] += symtab_offsets[i - 1];
 
-  strtab_offsets[0] = 1;
   for (i64 i = 1; i < strtab_offsets.size(); i++)
     strtab_offsets[i] += strtab_offsets[i - 1];
 
@@ -1066,6 +1082,21 @@ void SymtabSection<E>::copy_buf(Context<E> &ctx) {
   u8 *strtab = ctx.buf + ctx.strtab.hdr.offset;
   strtab[0] = '\0';
 
+  // Create symbols for -add_ast_path
+  {
+    i64 symoff = 0;
+    i64 stroff = 1;
+    for (std::string_view s : ctx.arg.add_ast_path) {
+      MachSym &msym = buf[symoff++];
+      msym.stroff = stroff;
+      msym.n_type = N_AST;
+
+      write_string(strtab + stroff, s);
+      stroff += s.size() + 1;
+    }
+  }
+
+  // Copy symbols from input files to an output file
   Symbol<E> *mh_execute_header = get_symbol(ctx, "__mh_execute_header");
   Symbol<E> *dyld_private = get_symbol(ctx, "__dyld_private");
   Symbol<E> *mh_dylib_header = get_symbol(ctx, "__mh_dylib_header");
@@ -1148,18 +1179,75 @@ void SymtabSection<E>::copy_buf(Context<E> &ctx) {
 }
 
 template <typename E>
+static bool has_objc_image_info_section(Context<E> &ctx) {
+  return false;
+}
+
+// Create __DATA,__objc_imageinfo section contents by merging input
+// __objc_imageinfo sections.
+template <typename E>
+std::unique_ptr<ObjcImageInfoSection<E>>
+ObjcImageInfoSection<E>::create(Context<E> &ctx) {
+  ObjcImageInfo *first = nullptr;
+
+  for (ObjectFile<E> *file : ctx.objs) {
+    if (file->objc_image_info) {
+      first = file->objc_image_info;
+      break;
+    }
+  }
+
+  if (!first)
+    return nullptr;
+
+  ObjcImageInfo info;
+  info.flags = (first->flags & OBJC_IMAGE_HAS_CATEGORY_CLASS_PROPERTIES);
+
+  for (ObjectFile<E> *file : ctx.objs) {
+    if (!file->objc_image_info)
+      continue;
+
+    ObjcImageInfo &info2 = *file->objc_image_info;
+
+    // Make sure that all object files have the same flag.
+    if ((info.flags & OBJC_IMAGE_HAS_CATEGORY_CLASS_PROPERTIES) !=
+        (info2.flags & OBJC_IMAGE_HAS_CATEGORY_CLASS_PROPERTIES))
+      Error(ctx) << *file << ": incompatible __objc_imageinfo flag";
+
+    // Make sure that all object files have the same Swift version.
+    if (info.swift_version == 0)
+      info.swift_version = info2.swift_version;
+
+    if (info.swift_version != info2.swift_version && info2.swift_version != 0)
+      Error(ctx) << *file << ": incompatible __objc_imageinfo swift version"
+                 << (u32)info.swift_version << " " << (u32)info2.swift_version;
+
+    // swift_lang_version is set to the newest.
+    info.swift_lang_version =
+      std::max<u32>(info.swift_lang_version, info2.swift_lang_version);
+  }
+
+  return std::make_unique<ObjcImageInfoSection<E>>(ctx, info);
+}
+
+template <typename E>
+void ObjcImageInfoSection<E>::copy_buf(Context<E> &ctx) {
+  memcpy(ctx.buf + this->hdr.offset, &contents, sizeof(contents));
+}
+
+template <typename E>
 void CodeSignatureSection<E>::compute_size(Context<E> &ctx) {
   std::string filename = filepath(ctx.arg.final_output).filename();
   i64 filename_size = align_to(filename.size() + 1, 16);
-  i64 num_blocks = align_to(this->hdr.offset, BLOCK_SIZE) / BLOCK_SIZE;
+  i64 num_blocks = align_to(this->hdr.offset, E::page_size) / E::page_size;
   this->hdr.size = sizeof(CodeSignatureHeader) + sizeof(CodeSignatureBlobIndex) +
                    sizeof(CodeSignatureDirectory) + filename_size +
                    num_blocks * SHA256_SIZE;
 }
 
 // A __code_signature section is optional for x86 macOS but mandatory
-// for ARM macOS. The section contains a cryptographic hash for each 4
-// KiB block of an executable or a dylib file. The program loader
+// for ARM macOS. The section contains a cryptographic hash for each
+// memory page of an executable or a dylib file. The program loader
 // verifies the hash values on the initial execution of a binary and
 // will reject it if a hash value does not match.
 template <typename E>
@@ -1171,7 +1259,7 @@ void CodeSignatureSection<E>::write_signature(Context<E> &ctx) {
 
   std::string filename = filepath(ctx.arg.final_output).filename();
   i64 filename_size = align_to(filename.size() + 1, 16);
-  i64 num_blocks = align_to(this->hdr.offset, BLOCK_SIZE) / BLOCK_SIZE;
+  i64 num_blocks = align_to(this->hdr.offset, E::page_size) / E::page_size;
 
   // Fill code-sign header fields
   CodeSignatureHeader &sighdr = *(CodeSignatureHeader *)buf;
@@ -1200,7 +1288,7 @@ void CodeSignatureSection<E>::write_signature(Context<E> &ctx) {
   dir.code_limit = this->hdr.offset;
   dir.hash_size = SHA256_SIZE;
   dir.hash_type = CS_HASHTYPE_SHA256;
-  dir.page_size = std::countr_zero<u64>(BLOCK_SIZE);
+  dir.page_size = std::countr_zero(E::page_size);
   dir.exec_seg_base = ctx.text_seg->cmd.fileoff;
   dir.exec_seg_limit = ctx.text_seg->cmd.filesize;
   if (ctx.output_type == MH_EXECUTE)
@@ -1209,12 +1297,10 @@ void CodeSignatureSection<E>::write_signature(Context<E> &ctx) {
   memcpy(buf, filename.data(), filename.size());
   buf += filename_size;
 
-  // Compute a hash value for each 4 KiB block. The block size must be
-  // 4 KiB, as the macOS kernel supports only that block size for the
-  // ad-hoc code signatures.
+  // Compute a hash value for each block.
   auto compute_hash = [&](i64 i) {
-    u8 *start = ctx.buf + i * BLOCK_SIZE;
-    u8 *end = ctx.buf + std::min<i64>((i + 1) * BLOCK_SIZE, this->hdr.offset);
+    u8 *start = ctx.buf + i * E::page_size;
+    u8 *end = ctx.buf + std::min<i64>((i + 1) * E::page_size, this->hdr.offset);
     SHA256(start, end - start, buf + i * SHA256_SIZE);
   };
 
@@ -1225,7 +1311,7 @@ void CodeSignatureSection<E>::write_signature(Context<E> &ctx) {
 #if __APPLE__
     // Calling msync() with MS_ASYNC speeds up the following msync()
     // with MS_INVALIDATE.
-    msync(ctx.buf + i * BLOCK_SIZE, 1024 * BLOCK_SIZE, MS_ASYNC);
+    msync(ctx.buf + i * E::page_size, 1024 * E::page_size, MS_ASYNC);
 #endif
   }
 
@@ -1245,7 +1331,7 @@ void CodeSignatureSection<E>::write_signature(Context<E> &ctx) {
     // recompute code signatures for the updated blocks.
     ctx.mach_hdr.copy_buf(ctx);
 
-    for (i64 i = 0; i * BLOCK_SIZE < ctx.mach_hdr.hdr.size; i++)
+    for (i64 i = 0; i * E::page_size < ctx.mach_hdr.hdr.size; i++)
       compute_hash(i);
   }
 
@@ -1556,6 +1642,7 @@ void SectCreateSection<E>::copy_buf(Context<E> &ctx) {
   template class SymtabSection<E>;                      \
   template class StrtabSection<E>;                      \
   template class CodeSignatureSection<E>;               \
+  template class ObjcImageInfoSection<E>;               \
   template class DataInCodeSection<E>;                  \
   template class StubsSection<E>;                       \
   template class StubHelperSection<E>;                  \
