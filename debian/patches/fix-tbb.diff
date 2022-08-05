@@ -1,0 +1,14 @@
+Index: mold/Makefile
+===================================================================
+--- mold.orig/Makefile
++++ mold/Makefile
+@@ -155,7 +155,8 @@ $(MIMALLOC_LIB):
+ 
+ $(TBB_LIB):
+ 	mkdir -p out/tbb
+-	(cd out/tbb; cmake -G'Unix Makefiles' -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_SHARED_LIBS=OFF -DTBB_TEST=OFF -DCMAKE_CXX_FLAGS="$(CXXFLAGS) -D__TBB_DYNAMIC_LOAD_ENABLED=0" -DTBB_STRICT=OFF ../../third-party/tbb)
++	CXXFLAGS_TBB:=$(filter-out -Werror=format-security,$(CXXFLAGS)); \
++	(cd out/tbb; cmake -G'Unix Makefiles' -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_SHARED_LIBS=OFF -DTBB_TEST=OFF -DCMAKE_CXX_FLAGS="$$CXXFLAGS_TBB -D__TBB_DYNAMIC_LOAD_ENABLED=0" -DTBB_STRICT=OFF ../../third-party/tbb)
+ 	$(MAKE) -C out/tbb tbb
+ 	(cd out/tbb; ln -sf *_relwithdebinfo libs)
+ 
