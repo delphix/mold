@@ -26,9 +26,9 @@ read_compunits(Context<E> &ctx, ObjectFile<E> &file) {
   while (!data.empty()) {
     if (data.size() < 4)
       Fatal(ctx) << *file.debug_info << ": corrupted .debug_info";
-    if (*(u32 *)data.data() == 0xffffffff)
+    if (*(ul32 *)data.data() == 0xffffffff)
       Fatal(ctx) << *file.debug_info << ": --gdb-index: DWARF64 not supported";
-    i64 len = *(u32 *)data.data() + 4;
+    i64 len = *(ul32 *)data.data() + 4;
     vec.push_back(data.substr(0, len));
     data = data.substr(len);
   }
@@ -65,15 +65,15 @@ std::vector<GdbIndexName> read_pubnames(Context<E> &ctx, ObjectFile<E> &file) {
       if (contents.size() < 14)
         Fatal(ctx) << isec << ": corrupted header";
 
-      u32 len = *(u32 *)contents.data() + 4;
-      u32 debug_info_offset = *(u32 *)(contents.data() + 6);
+      u32 len = *(ul32 *)contents.data() + 4;
+      u32 debug_info_offset = *(ul32 *)(contents.data() + 6);
       u32 cu_idx = get_cu_idx(isec, debug_info_offset);
 
       std::string_view data = contents.substr(14, len - 14);
       contents = contents.substr(len);
 
       while (!data.empty()) {
-        u32 offset = *(u32 *)data.data();
+        u32 offset = *(ul32 *)data.data();
         data = data.substr(4);
         if (offset == 0)
           break;
@@ -96,19 +96,18 @@ std::vector<GdbIndexName> read_pubnames(Context<E> &ctx, ObjectFile<E> &file) {
 
   // Uniquify elements because GCC 11 seems to emit one record for each
   // comdat group which results in having a lot of duplicate records.
-  std::sort(vec.begin(), vec.end(),
-            [](const GdbIndexName &a, const GdbIndexName &b) {
+  auto less = [](const GdbIndexName &a, const GdbIndexName &b) {
     return std::tuple{a.hash, a.attr, a.name} <
            std::tuple{b.hash, b.attr, b.name};
-  });
+  };
 
-  auto last = std::unique(vec.begin(), vec.end(),
-                          [](const GdbIndexName &a, const GdbIndexName &b) {
+  auto equal = [](const GdbIndexName &a, const GdbIndexName &b) {
     return std::tuple{a.hash, a.attr, a.name} ==
            std::tuple{b.hash, b.attr, b.name};
-  });
+  };
 
-  vec.erase(last, vec.end());
+  std::sort(vec.begin(), vec.end(), less);
+  vec.erase(std::unique(vec.begin(), vec.end(), equal), vec.end());
   return vec;
 }
 
@@ -126,7 +125,7 @@ static std::tuple<u8 *, u8 *, u32>
 find_compunit(Context<E> &ctx, ObjectFile<E> &file, i64 offset) {
   // Read .debug_info to find the record at a given offset.
   u8 *cu = get_buffer(ctx, ctx.debug_info) + offset;
-  u32 dwarf_version = *(u16 *)(cu + 4);
+  u32 dwarf_version = *(ul16 *)(cu + 4);
   u32 abbrev_offset;
 
   // Skip a header.
@@ -134,14 +133,14 @@ find_compunit(Context<E> &ctx, ObjectFile<E> &file, i64 offset) {
   case 2:
   case 3:
   case 4:
-    abbrev_offset = *(u32 *)(cu + 6);
+    abbrev_offset = *(ul32 *)(cu + 6);
     if (u32 address_size = cu[10]; address_size != E::word_size)
       Fatal(ctx) << file << ": --gdb-index: unsupported address size "
                  << address_size;
     cu += 11;
     break;
   case 5: {
-    abbrev_offset = *(u32 *)(cu + 8);
+    abbrev_offset = *(ul32 *)(cu + 8);
     if (u32 address_size = cu[7]; address_size != E::word_size)
       Fatal(ctx) << file << ": --gdb-index: unsupported address size "
                  << address_size;
@@ -259,14 +258,13 @@ inline u64 DebugInfoReader<E>::read(u64 form) {
   case DW_FORM_strx2:
   case DW_FORM_addrx2:
   case DW_FORM_ref2: {
-    u64 val = *(u16 *)cu;
+    u64 val = *(ul16 *)cu;
     cu += 2;
     return val;
   }
   case DW_FORM_strx3:
   case DW_FORM_addrx3: {
-    u64 val = 0;
-    memcpy(&val, cu, 3); // This assumes little-endian.
+    u64 val = *(ul24 *)cu;
     cu += 3;
     return val;
   }
@@ -277,13 +275,13 @@ inline u64 DebugInfoReader<E>::read(u64 form) {
   case DW_FORM_strx4:
   case DW_FORM_addrx4:
   case DW_FORM_ref4: {
-    u64 val = *(u32 *)cu;
+    u64 val = *(ul32 *)cu;
     cu += 4;
     return val;
   }
   case DW_FORM_data8:
   case DW_FORM_ref8: {
-    u64 val = *(u64 *)cu;
+    u64 val = *(ul64 *)cu;
     cu += 8;
     return val;
   }
@@ -319,7 +317,7 @@ read_debug_range(Context<E> &ctx, ObjectFile<E> &file, typename E::WordTy *range
   u64 base = 0;
 
   for (i64 i = 0; range[i] || range[i + 1]; i += 2) {
-    if (range[i] == (typename E::WordTy)-1) {
+    if (range[i] + 1 == 0) {
       // base address selection entry
       base = range[i + 1];
     } else {
@@ -437,7 +435,7 @@ read_address_areas(Context<E> &ctx, ObjectFile<E> &file, i64 offset) {
   // Handle non-contiguous address ranges.
   if (ranges.form) {
     if (dwarf_version <= 4) {
-      typename E::WordTy *range_begin =
+       typename E::WordTy *range_begin =
         (typename E::WordTy *)(get_buffer(ctx, ctx.debug_ranges) + ranges.value);
       return read_debug_range(ctx, file, range_begin);
     }
@@ -452,7 +450,7 @@ read_address_areas(Context<E> &ctx, ObjectFile<E> &file, i64 offset) {
       Fatal(ctx) << file << ": --gdb-index: missing DW_AT_rnglists_base";
 
     u8 *base = buf + *rnglists_base;
-    return read_rnglist_range(ctx, file, base + *(u32 *)base, addrx);
+    return read_rnglist_range(ctx, file, base + *(ul32 *)base, addrx);
   }
 
   // Handle a contiguous address range.

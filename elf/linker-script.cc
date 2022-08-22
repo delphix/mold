@@ -146,8 +146,9 @@ read_output_format(Context<E> &ctx, std::span<std::string_view> tok) {
 
 template <typename E>
 static bool is_in_sysroot(Context<E> &ctx, std::string path) {
-  std::string rel =
-    to_abs_path(path).lexically_relative(to_abs_path(ctx.arg.sysroot));
+  std::string rel = to_abs_path(path)
+                        .lexically_relative(to_abs_path(ctx.arg.sysroot))
+                        .string();
   return rel != "." && !rel.starts_with("../");
 }
 
@@ -225,6 +226,10 @@ void parse_linker_script(Context<E> &ctx, MappedFile<Context<E>> *mf) {
       tok = skip(ctx, tok, "{");
       read_version_script(ctx, tok);
       tok = skip(ctx, tok, "}");
+    } else if (tok.size() > 3 && tok[1] == "=" && tok[3] == ";") {
+      ctx.arg.defsyms.emplace_back(get_symbol(ctx, unquote(tok[0])),
+                                   get_symbol(ctx, unquote(tok[2])));
+      tok = tok.subspan(4);
     } else if (tok[0] == ";") {
       tok = tok.subspan(1);
     } else {
@@ -234,7 +239,7 @@ void parse_linker_script(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 }
 
 template <typename E>
-i64 get_script_output_type(Context<E> &ctx, MappedFile<Context<E>> *mf) {
+MachineType get_script_output_type(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   current_file<E> = mf;
 
   std::vector<std::string_view> vec = tokenize(ctx, mf->get_contents());
@@ -242,11 +247,11 @@ i64 get_script_output_type(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 
   if (tok.size() >= 3 && tok[0] == "OUTPUT_FORMAT" && tok[1] == "(") {
     if (tok[2] == "elf64-x86-64")
-      return EM_X86_64;
+      return MachineType::X86_64;
     if (tok[2] == "elf32-i386")
-      return EM_386;
+      return MachineType::I386;
   }
-  return -1;
+  return MachineType::NONE;
 }
 
 static bool read_label(std::span<std::string_view> &tok,
@@ -267,6 +272,7 @@ template <typename E>
 static void
 read_version_script_commands(Context<E> &ctx, std::span<std::string_view> &tok,
                              u16 ver_idx, bool is_cpp) {
+  ctx.version_specified = true;
   bool is_global = true;
 
   while (!tok.empty() && tok[0] != "}") {
@@ -351,6 +357,8 @@ void parse_version_script(Context<E> &ctx, std::string path) {
 template <typename E>
 void read_dynamic_list_commands(Context<E> &ctx, std::span<std::string_view> &tok,
                                 bool is_cpp) {
+  ctx.version_specified = true;
+
   while (!tok.empty() && tok[0] != "}") {
     if (tok[0] == "extern") {
       tok = tok.subspan(1);
@@ -395,15 +403,15 @@ void parse_dynamic_list(Context<E> &ctx, std::string path) {
     SyntaxError(ctx, tok[0]) << "trailing garbage token";
 }
 
-#define INSTANTIATE(E)                                                  \
-  template                                                              \
-  void parse_linker_script(Context<E> &ctx, MappedFile<Context<E>> *mf); \
-  template                                                              \
-  i64 get_script_output_type(Context<E> &ctx, MappedFile<Context<E>> *mf); \
-  template                                                              \
-  void parse_version_script(Context<E> &ctx, std::string path);         \
-  template                                                              \
-  void parse_dynamic_list(Context<E> &ctx, std::string path)
+#define INSTANTIATE(E)                                                          \
+  template                                                                      \
+  void parse_linker_script(Context<E> &, MappedFile<Context<E>> *);             \
+  template                                                                      \
+  MachineType get_script_output_type(Context<E> &, MappedFile<Context<E>> *);   \
+  template                                                                      \
+  void parse_version_script(Context<E> &, std::string);                         \
+  template                                                                      \
+  void parse_dynamic_list(Context<E> &, std::string);
 
 INSTANTIATE_ALL;
 

@@ -1,17 +1,15 @@
 #!/bin/bash
 export LC_ALL=C
 set -e
-CC="${CC:-cc}"
-CXX="${CXX:-c++}"
-GCC="${GCC:-gcc}"
-GXX="${GXX:-g++}"
+CC="${TEST_CC:-cc}"
+CXX="${TEST_CXX:-c++}"
+GCC="${TEST_GCC:-gcc}"
+GXX="${TEST_GXX:-g++}"
 OBJDUMP="${OBJDUMP:-objdump}"
 MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-mold="$(pwd)/mold"
-t=out/test/elf/$testname
+t=out/test/elf/$MACHINE/$testname
 mkdir -p $t
 
 [ $MACHINE = x86_64 ] || { echo skipped; exit; }
@@ -30,6 +28,7 @@ cat <<EOF | $CC -c -o $t/b.o -xc -
 
 extern char __ehdr_start[];
 extern char __executable_start[];
+extern char __dso_handle[];
 extern char _end[];
 extern char end[];
 extern char _etext[];
@@ -49,6 +48,7 @@ int main() {
 
   printf("__ehdr_start=%p\n", &__ehdr_start);
   printf("__executable_start=%p\n", &__executable_start);
+  printf("__dso_handle=%p\n", &__dso_handle);
   printf("%.*s\n", (int)(__stop_foo - __start_foo), __start_foo);
 }
 EOF
@@ -59,6 +59,7 @@ $QEMU $t/exe > $t/log
 
 grep -q '^__ehdr_start=0x40000$' $t/log
 grep -q '^__executable_start=0x40000$' $t/log
+grep -q '^__dso_handle=' $t/log
 grep -q '^section foo$' $t/log
 
 # Make sure that synthetic symbols overwrite existing ones

@@ -1,17 +1,15 @@
 #!/bin/bash
 export LC_ALL=C
 set -e
-CC="${CC:-cc}"
-CXX="${CXX:-c++}"
-GCC="${GCC:-gcc}"
-GXX="${GXX:-g++}"
+CC="${TEST_CC:-cc}"
+CXX="${TEST_CXX:-c++}"
+GCC="${TEST_GCC:-gcc}"
+GXX="${TEST_GXX:-g++}"
 OBJDUMP="${OBJDUMP:-objdump}"
 MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-mold="$(pwd)/mold"
-t=out/test/elf/$testname
+t=out/test/elf/$MACHINE/$testname
 mkdir -p $t
 
 [ $MACHINE = x86_64 ] || { echo skipped; exit; }
@@ -68,7 +66,7 @@ _start:
 .ascii ".rodata.foo "
 EOF
 
-"$mold" -o $t/exe $t/a.o -z keep-text-section-prefix
+./mold -o $t/exe $t/a.o -z keep-text-section-prefix
 
 readelf -p .text.hot $t/exe | fgrep -q '.text.hot .text.hot.foo'
 readelf -p .text.unknown $t/exe | fgrep -q '.text.unknown .text.unknown.foo'
@@ -80,10 +78,10 @@ readelf -p .data.rel.ro $t/exe | fgrep -q '.data.rel.ro .data.rel.ro.foo'
 readelf -p .data $t/exe | fgrep -q '.data .data.foo'
 readelf -p .rodata $t/exe | fgrep -q '.rodata .rodata.foo'
 
-"$mold" -o $t/exe $t/a.o
+./mold -o $t/exe $t/a.o
 ! readelf --sections $t/exe | fgrep -q .text.hot || false
 
-"$mold" -o $t/exe $t/a.o -z nokeep-text-section-prefix
+./mold -o $t/exe $t/a.o -z nokeep-text-section-prefix
 ! readelf --sections $t/exe | fgrep -q .text.hot || false
 
 echo OK

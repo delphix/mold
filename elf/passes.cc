@@ -82,6 +82,7 @@ void create_synthetic_sections(Context<E> &ctx) {
 
   ctx.versym = push(new VersymSection<E>);
   ctx.verneed = push(new VerneedSection<E>);
+  ctx.note_package = push(new NotePackageSection<E>);
   ctx.note_property = push(new NotePropertySection<E>);
 
   if constexpr (std::is_same_v<E, ARM32>) {
@@ -350,28 +351,55 @@ void bin_sections(Context<E> &ctx) {
 // Create a dummy object file containing linker-synthesized
 // symbols.
 template <typename E>
-ObjectFile<E> *create_internal_file(Context<E> &ctx) {
+void create_internal_file(Context<E> &ctx) {
   ObjectFile<E> *obj = new ObjectFile<E>;
   ctx.obj_pool.emplace_back(obj);
+  ctx.internal_obj = obj;
+  ctx.objs.push_back(obj);
 
   // Create linker-synthesized symbols.
-  auto *esyms = new std::vector<ElfSym<E>>(1);
+  ctx.internal_esyms.resize(1);
+
   obj->symbols.push_back(new Symbol<E>);
   obj->first_global = 1;
   obj->is_alive = true;
   obj->features = -1;
   obj->priority = 1;
 
-  auto add = [&](std::string_view name, u8 st_type = STT_NOTYPE) {
-    ElfSym<E> esym = {};
-    esym.st_type = st_type;
+  // Add symbols for --defsym.
+  for (i64 i = 0; i < ctx.arg.defsyms.size(); i++) {
+    Symbol<E> *sym = ctx.arg.defsyms[i].first;
+    obj->symbols.push_back(sym);
+
+    ElfSym<E> esym;
+    memset(&esym, 0, sizeof(esym));
+    esym.st_type = STT_NOTYPE;
+    esym.st_shndx = SHN_ABS;
+    esym.st_bind = STB_GLOBAL;
+    esym.st_visibility = STV_DEFAULT;
+    ctx.internal_esyms.push_back(esym);
+  };
+
+  obj->elf_syms = ctx.internal_esyms;
+  obj->sym_fragments.resize(ctx.internal_esyms.size());
+  obj->symvers.resize(ctx.internal_esyms.size() - 1);
+}
+
+template <typename E>
+void add_synthetic_symbols(Context<E> &ctx) {
+  ObjectFile<E> &obj = *ctx.internal_obj;
+
+  auto add = [&](std::string_view name) {
+    ElfSym<E> esym;
+    memset(&esym, 0, sizeof(esym));
+    esym.st_type = STT_NOTYPE;
     esym.st_shndx = SHN_ABS;
     esym.st_bind = STB_GLOBAL;
     esym.st_visibility = STV_HIDDEN;
-    esyms->push_back(esym);
+    ctx.internal_esyms.push_back(esym);
 
     Symbol<E> *sym = get_symbol(ctx, name);
-    obj->symbols.push_back(sym);
+    obj.symbols.push_back(sym);
     return sym;
   };
 
@@ -404,11 +432,13 @@ ObjectFile<E> *create_internal_file(Context<E> &ctx) {
     ctx.etext = add("etext");
   if (!get_symbol(ctx, "edata")->file)
     ctx.edata = add("edata");
+  if (!get_symbol(ctx, "__dso_handle")->file)
+    ctx.__dso_handle = add("__dso_handle");
 
   if constexpr (E::supports_tlsdesc)
     ctx._TLS_MODULE_BASE_ = add("_TLS_MODULE_BASE_");
 
-  if constexpr (std::is_same_v<E, RISCV64>)
+  if constexpr (std::is_same_v<E, RISCV64> || std::is_same_v<E, RISCV32>)
     if (!ctx.arg.shared)
       ctx.__global_pointer = add("__global_pointer$");
 
@@ -418,52 +448,30 @@ ObjectFile<E> *create_internal_file(Context<E> &ctx) {
   }
 
   for (Chunk<E> *chunk : ctx.chunks) {
-    if (!is_c_identifier(chunk->name))
-      continue;
-
-    add(save_string(ctx, "__start_" + std::string(chunk->name)));
-    add(save_string(ctx, "__stop_" + std::string(chunk->name)));
+    if (is_c_identifier(chunk->name)) {
+      add(save_string(ctx, "__start_" + std::string(chunk->name)));
+      add(save_string(ctx, "__stop_" + std::string(chunk->name)));
+    }
   }
 
-  i64 first_defsym = obj->symbols.size();
+  obj.elf_syms = ctx.internal_esyms;
+  obj.sym_fragments.resize(ctx.internal_esyms.size());
+  obj.symvers.resize(ctx.internal_esyms.size() - 1);
 
-  for (i64 i = 0; i < ctx.arg.defsyms.size(); i++) {
-    Symbol<E> *sym = ctx.arg.defsyms[i].first;
-    ElfSym<E> esym = {};
-    esym.st_type = STT_NOTYPE;
-    esym.st_shndx = SHN_ABS;
-    esym.st_bind = STB_GLOBAL;
-    esym.st_visibility = STV_DEFAULT;
-    esyms->push_back(esym);
-    obj->symbols.push_back(sym);
-  };
+  obj.resolve_symbols(ctx);
 
-  obj->elf_syms = *esyms;
-  obj->sym_fragments.resize(obj->elf_syms.size());
+  // Make all synthetic symbols relative ones.
+  for (Symbol<E> *sym : obj.symbols)
+    sym->shndx = -1; // dummy value to make it a relative symbol
 
-  i64 num_globals = obj->elf_syms.size() - obj->first_global;
-  obj->symvers.resize(num_globals);
-
-  obj->resolve_symbols(ctx);
-
-  for (i64 i = obj->first_global; i < first_defsym; i++)
-    obj->symbols[i]->shndx = -1; // dummy value to make it a relative symbol
-
+  // Make defsym symbols absolute if necessary.
   for (i64 i = 0; i < ctx.arg.defsyms.size(); i++) {
     Symbol<E> *sym = ctx.arg.defsyms[i].first;
     std::variant<Symbol<E> *, u64> val = ctx.arg.defsyms[i].second;
-
-    if (Symbol<E> **sym2 = std::get_if<Symbol<E> *>(&val))
-      if ((*sym2)->is_relative())
-        sym->shndx = -1; // dummy value to make it a relative symbol
+    if (std::holds_alternative<u64>(val) ||
+        std::get<Symbol<E> *>(val)->is_absolute())
+        sym->shndx = 0;
   }
-
-  ctx.on_exit.push_back([=] {
-    delete esyms;
-    delete obj->symbols[0];
-  });
-
-  return obj;
 }
 
 template <typename E>
@@ -548,7 +556,7 @@ R"(# This is an output of the mold linker's --print-dependencies=full option.
 
       std::unordered_set<void *> visited;
 
-      for (ElfRel<E> &r : isec->get_rels(ctx)) {
+      for (const ElfRel<E> &r : isec->get_rels(ctx)) {
         if (r.r_type == E::R_NONE)
           continue;
 
@@ -577,7 +585,7 @@ static std::string create_response_file(Context<E> &ctx) {
   std::string buf;
   std::stringstream out;
 
-  std::string cwd = std::filesystem::current_path();
+  std::string cwd = std::filesystem::current_path().string();
   out << "-C " << cwd.substr(1) << "\n";
 
   if (cwd != "/") {
@@ -611,7 +619,7 @@ void write_repro_file(Context<E> &ctx) {
   std::unordered_set<std::string> seen;
   for (std::unique_ptr<MappedFile<Context<E>>> &mf : ctx.mf_pool) {
     if (!mf->parent) {
-      std::string path = to_abs_path(mf->name);
+      std::string path = to_abs_path(mf->name).string();
       if (seen.insert(path).second)
         tar->append(path, mf->get_contents());
     }
@@ -651,15 +659,16 @@ void sort_init_fini(Context<E> &ctx) {
 
   auto get_priority = [](InputSection<E> *isec) {
     static std::regex re(R"(\.(\d+)$)", std::regex_constants::optimize);
-    std::string name = isec->name().begin();
-    std::smatch m;
-    if (std::regex_search(name, m, re))
+    std::string_view name = isec->name();
+    std::cmatch m;
+    if (std::regex_search(name.data(), name.data() + name.size(), m, re))
       return std::stoi(m[1]);
     return 65536;
   };
 
   for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections) {
-    if (osec->name == ".init_array" || osec->name == ".fini_array") {
+    if (osec->name == ".init_array" || osec->name == ".preinit_array" ||
+        osec->name == ".fini_array") {
       if (ctx.arg.shuffle_sections == SHUFFLE_SECTIONS_REVERSE)
         std::reverse(osec->members.begin(), osec->members.end());
 
@@ -739,8 +748,9 @@ void shuffle_sections(Context<E> &ctx) {
 
   auto is_eligible = [](OutputSection<E> &osec) {
     return osec.name != ".init" && osec.name != ".fini" &&
-           osec.name != ".init_array" && osec.name != ".fini_array" &&
-           osec.name != ".ctors" && osec.name != ".dtors";
+           osec.name != ".ctors" && osec.name != ".dtors" &&
+           osec.name != ".init_array" && osec.name != ".preinit_array" &&
+           osec.name != ".fini_array";
   };
 
   switch (ctx.arg.shuffle_sections) {
@@ -751,7 +761,7 @@ void shuffle_sections(Context<E> &ctx) {
     if (ctx.arg.shuffle_sections_seed)
       seed = *ctx.arg.shuffle_sections_seed;
     else
-      seed = std::random_device()();
+      seed = ((u64)std::random_device()() << 32) | std::random_device()();
 
     tbb::parallel_for_each(ctx.output_sections,
                            [&](std::unique_ptr<OutputSection<E>> &osec) {
@@ -804,6 +814,11 @@ void compute_section_sizes(Context<E> &ctx) {
 
   tbb::parallel_for_each(ctx.output_sections,
                          [&](std::unique_ptr<OutputSection<E>> &osec) {
+    // This pattern will be processed in the next loop.
+    if constexpr (std::is_same_v<E, ARM64>)
+      if (osec->shdr.sh_flags & SHF_EXECINSTR)
+        return;
+
     // Since one output section may contain millions of input sections,
     // we first split input sections into groups and assign offsets to
     // groups.
@@ -843,6 +858,16 @@ void compute_section_sizes(Context<E> &ctx) {
       }
     });
   });
+
+  // On ARM64, we may need to create so-called "range extension thunks" to
+  // extend branch instructions reach, as they can jump only to ±128 MiB.
+  // In this case, we compute the sizes of sections while inserting thunks.
+  // This pass cannot be parallelized (`create_range_extension_thunks` is
+  // parallelized internally, but the function itself is not thread-safe.
+  if constexpr (std::is_same_v<E, ARM64>)
+    for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections)
+      if (osec->shdr.sh_flags & SHF_EXECINSTR)
+        create_range_extension_thunks(ctx, *osec);
 }
 
 template <typename E>
@@ -900,21 +925,21 @@ void scan_rels(Context<E> &ctx) {
     if (sym->flags & NEEDS_GOT)
       ctx.got->add_got_symbol(ctx, sym);
 
-    if (sym->flags & NEEDS_PLT) {
-      if (sym->is_canonical) {
-        // A canonical PLT needs to be visible from DSOs.
-        sym->is_exported = true;
+    if (sym->flags & NEEDS_CPLT) {
+      sym->is_canonical = true;
 
-        // We can't use .plt.got for a canonical PLT because otherwise
-        // .plt.got and .got would refer each other, resulting in an
-        // infinite loop at runtime.
+      // A canonical PLT needs to be visible from DSOs.
+      sym->is_exported = true;
+
+      // We can't use .plt.got for a canonical PLT because otherwise
+      // .plt.got and .got would refer each other, resulting in an
+      // infinite loop at runtime.
+      ctx.plt->add_symbol(ctx, sym);
+    } else if (sym->flags & NEEDS_PLT) {
+      if (sym->flags & NEEDS_GOT)
+        ctx.pltgot->add_symbol(ctx, sym);
+      else
         ctx.plt->add_symbol(ctx, sym);
-      } else {
-        if (sym->flags & NEEDS_GOT)
-          ctx.pltgot->add_symbol(ctx, sym);
-        else
-          ctx.plt->add_symbol(ctx, sym);
-      }
     }
 
     if (sym->flags & NEEDS_GOTTP)
@@ -1046,8 +1071,8 @@ void apply_version_script(Context<E> &ctx) {
   }
 
   // Otherwise, use glob pattern matchers.
-  VersionMatcher matcher;
-  VersionMatcher cpp_matcher;
+  MultiGlob matcher;
+  MultiGlob cpp_matcher;
 
   for (VersionPattern &v : ctx.version_patterns) {
     if (v.is_cpp) {
@@ -1071,9 +1096,12 @@ void apply_version_script(Context<E> &ctx) {
         continue;
       }
 
-      if (!cpp_matcher.empty())
-        if (std::optional<u16> ver = cpp_matcher.find(demangle(name)))
+      if (!cpp_matcher.empty()) {
+        if (std::optional<std::string_view> s = cpp_demangle(name))
+          name = *s;
+        if (std::optional<u16> ver = cpp_matcher.find(name))
           sym->ver_idx = *ver;
+      }
     }
   });
 }
@@ -1136,18 +1164,23 @@ template <typename E>
 void compute_import_export(Context<E> &ctx) {
   Timer t(ctx, "compute_import_export");
 
-  // Export symbols referenced by DSOs.
+  // If we are creating an executable, we want to export symbols referenced
+  // by DSOs unless they are explicitly marked as local by a version script.
   if (!ctx.arg.shared) {
     tbb::parallel_for_each(ctx.dsos, [&](SharedFile<E> *file) {
       for (Symbol<E> *sym : file->symbols) {
         if (sym->file && !sym->file->is_dso && sym->visibility != STV_HIDDEN) {
-          std::scoped_lock lock(sym->mu);
-          sym->is_exported = true;
+          if (sym->ver_idx != VER_NDX_LOCAL || !ctx.version_specified) {
+            std::scoped_lock lock(sym->mu);
+            sym->is_exported = true;
+          }
         }
       }
     });
   }
 
+  // Export symbols that are not hidden or marked as local.
+  // We also want to mark imported symbols as such.
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     for (Symbol<E> *sym : file->get_global_syms()) {
       if (!sym->file || sym->visibility == STV_HIDDEN ||
@@ -1172,6 +1205,14 @@ void compute_import_export(Context<E> &ctx) {
           sym->is_imported = true;
       }
     }
+  });
+}
+
+template <typename E>
+void mark_addrsig(Context<E> &ctx) {
+  Timer t(ctx, "mark_addrsig");
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    file->fill_addrsig(ctx);
   });
 }
 
@@ -1428,7 +1469,6 @@ void fix_synthetic_symbols(Context<E> &ctx) {
   if (Chunk<E> *chunk = find(".bss"))
     start(ctx.__bss_start, chunk);
 
-  // __ehdr_start and __executable_start
   if (ctx.ehdr) {
     for (Chunk<E> *chunk : ctx.chunks) {
       if (chunk->shndx == 1) {
@@ -1436,6 +1476,11 @@ void fix_synthetic_symbols(Context<E> &ctx) {
         ctx.__ehdr_start->value = ctx.ehdr->shdr.sh_addr;
         ctx.__executable_start->shndx = -1;
         ctx.__executable_start->value = ctx.ehdr->shdr.sh_addr;
+
+        if (ctx.__dso_handle) {
+          ctx.__dso_handle->shndx = -1;
+          ctx.__dso_handle->value = ctx.ehdr->shdr.sh_addr;
+        }
         break;
       }
     }
@@ -1466,6 +1511,10 @@ void fix_synthetic_symbols(Context<E> &ctx) {
       start(ctx.__init_array_start, chunk);
       stop(ctx.__init_array_end, chunk);
       break;
+    case SHT_PREINIT_ARRAY:
+      start(ctx.__preinit_array_start, chunk);
+      stop(ctx.__preinit_array_end, chunk);
+      break;
     case SHT_FINI_ARRAY:
       start(ctx.__fini_array_start, chunk);
       stop(ctx.__fini_array_end, chunk);
@@ -1475,7 +1524,7 @@ void fix_synthetic_symbols(Context<E> &ctx) {
 
   // _end, _etext, _edata and the like
   for (Chunk<E> *chunk : ctx.chunks) {
-    if (chunk->is_header())
+    if (chunk->kind() == HEADER)
       continue;
 
     if (chunk->shdr.sh_flags & SHF_ALLOC) {
@@ -1532,7 +1581,7 @@ void fix_synthetic_symbols(Context<E> &ctx) {
   start(ctx.__GNU_EH_FRAME_HDR, ctx.eh_frame_hdr);
 
   // RISC-V's __global_pointer$
-  if constexpr (std::is_same_v<E, RISCV64>) {
+  if constexpr (std::is_same_v<E, RISCV64> || std::is_same_v<E, RISCV32>) {
     if (!ctx.arg.shared) {
       if (Chunk<E> *chunk = find(".sdata"))
         ctx.__global_pointer->shndx = -chunk->shndx;
@@ -1650,6 +1699,7 @@ void write_dependency_file(Context<E> &ctx) {
 }
 
 #define INSTANTIATE(E)                                                  \
+  template void create_internal_file(Context<E> &);                     \
   template void apply_exclude_libs(Context<E> &);                       \
   template void create_synthetic_sections(Context<E> &);                \
   template void resolve_symbols(Context<E> &);                          \
@@ -1658,7 +1708,7 @@ void write_dependency_file(Context<E> &ctx) {
   template void convert_common_symbols(Context<E> &);                   \
   template void compute_merged_section_sizes(Context<E> &);             \
   template void bin_sections(Context<E> &);                             \
-  template ObjectFile<E> *create_internal_file(Context<E> &);           \
+  template void add_synthetic_symbols(Context<E> &);                    \
   template void check_cet_errors(Context<E> &);                         \
   template void print_dependencies(Context<E> &);                       \
   template void print_dependencies_full(Context<E> &);                  \
@@ -1677,6 +1727,7 @@ void write_dependency_file(Context<E> &ctx) {
   template void apply_version_script(Context<E> &);                     \
   template void parse_symbol_version(Context<E> &);                     \
   template void compute_import_export(Context<E> &);                    \
+  template void mark_addrsig(Context<E> &);                                   \
   template void clear_padding(Context<E> &);                            \
   template i64 get_section_rank(Context<E> &, Chunk<E> *);              \
   template i64 set_osec_offsets(Context<E> &);                          \

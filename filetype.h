@@ -11,7 +11,9 @@ enum class FileType {
   ELF_OBJ,
   ELF_DSO,
   MACH_OBJ,
+  MACH_EXE,
   MACH_DYLIB,
+  MACH_BUNDLE,
   MACH_UNIVERSAL,
   AR,
   THIN_AR,
@@ -73,7 +75,7 @@ FileType get_file_type(MappedFile<C> *mf) {
     return FileType::EMPTY;
 
   if (data.starts_with("\177ELF")) {
-    switch (*(u16 *)(data.data() + 16)) {
+    switch (*(ul16 *)(data.data() + 16)) {
     case 1: {
       // ET_REL
       elf::Elf32Ehdr &ehdr = *(elf::Elf32Ehdr *)data.data();
@@ -95,11 +97,15 @@ FileType get_file_type(MappedFile<C> *mf) {
   }
 
   if (data.starts_with("\xcf\xfa\xed\xfe")) {
-    switch (*(u32 *)(data.data() + 12)) {
+    switch (*(ul32 *)(data.data() + 12)) {
     case 1: // MH_OBJECT
       return FileType::MACH_OBJ;
+    case 2: // MH_EXECUTE
+      return FileType::MACH_EXE;
     case 6: // MH_DYLIB
       return FileType::MACH_DYLIB;
+    case 8: // MH_BUNDLE
+      return FileType::MACH_BUNDLE;
     }
     return FileType::UNKNOWN;
   }
@@ -127,8 +133,10 @@ inline std::string filetype_to_string(FileType type) {
   case FileType::EMPTY: return "EMPTY";
   case FileType::ELF_OBJ: return "ELF_OBJ";
   case FileType::ELF_DSO: return "ELF_DSO";
+  case FileType::MACH_EXE: return "MACH_EXE";
   case FileType::MACH_OBJ: return "MACH_OBJ";
   case FileType::MACH_DYLIB: return "MACH_DYLIB";
+  case FileType::MACH_BUNDLE: return "MACH_BUNDLE";
   case FileType::MACH_UNIVERSAL: return "MACH_UNIVERSAL";
   case FileType::AR: return "AR";
   case FileType::THIN_AR: return "THIN_AR";

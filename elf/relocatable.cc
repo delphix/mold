@@ -28,6 +28,7 @@
 
 #include "mold.h"
 #include "../archive-file.h"
+#include "../output-file.h"
 
 #include <unordered_map>
 #include <unordered_set>
@@ -413,36 +414,38 @@ std::span<T> RObjectFile<E>::get_data(Context<E> &ctx, const ElfShdr<E> &shdr) {
 
 template <typename E>
 static std::vector<std::unique_ptr<RObjectFile<E>>>
-open_files(Context<E> &ctx, std::span<std::string_view> args) {
+open_files(Context<E> &ctx, std::span<std::string> args) {
   std::vector<std::unique_ptr<RObjectFile<E>>> files;
   bool whole_archive = false;
 
   while (!args.empty()) {
-    if (read_flag(args, "whole-archive")) {
+    const std::string &arg = args[0];
+    args = args.subspan(1);
+
+    if (arg == "--whole-archive") {
       whole_archive = true;
       continue;
     }
 
-    if (read_flag(args, "no-whole-archive")) {
+    if (arg == "--no-whole-archive") {
       whole_archive = false;
       continue;
     }
 
-    std::string_view arg;
-    if (read_arg(ctx, args, arg, "version-script") ||
-        read_arg(ctx, args, arg, "dynamic-list"))
+    if (arg.starts_with("--version-script=") ||
+        arg.starts_with("--dynamic-list=") ||
+        arg.starts_with("--export-dynamic-symbol=") ||
+        arg.starts_with("--export-dynamic-symbol-list="))
       continue;
 
     MappedFile<Context<E>> *mf = nullptr;
 
-    if (read_arg(ctx, args, arg, "l")) {
-      mf = find_library(ctx, std::string(arg));
+    if (arg == "-l") {
+      mf = find_library(ctx, arg.substr(2));
     } else {
       if (arg.starts_with('-'))
         continue;
-      arg = args[0];
-      args = args.subspan(1);
-      mf = MappedFile<Context<E>>::must_open(ctx, std::string(arg));
+      mf = MappedFile<Context<E>>::must_open(ctx, arg);
     }
 
     switch (get_file_type(mf)) {
@@ -482,7 +485,7 @@ static bool contains(std::unordered_set<std::string_view> &a,
 }
 
 template <typename E>
-void combine_objects(Context<E> &ctx, std::span<std::string_view> file_args) {
+void combine_objects(Context<E> &ctx, std::span<std::string> file_args) {
   // Read object files
   std::vector<std::unique_ptr<RObjectFile<E>>> files = open_files(ctx, file_args);
 
@@ -574,8 +577,8 @@ void combine_objects(Context<E> &ctx, std::span<std::string_view> file_args) {
 
   // Open an output file
   i64 filesize = assign_offsets(ctx);
-  std::unique_ptr<OutputFile<E>> out =
-    OutputFile<E>::open(ctx, ctx.arg.output, filesize, 0666);
+  std::unique_ptr<OutputFile<Context<E>>> out =
+    OutputFile<Context<E>>::open(ctx, ctx.arg.output, filesize, 0666);
   memset(out->buf, 0, filesize);
   ctx.buf = out->buf;
 
@@ -586,7 +589,7 @@ void combine_objects(Context<E> &ctx, std::span<std::string_view> file_args) {
 }
 
 #define INSTANTIATE(E)                                                  \
-  template void combine_objects(Context<E> &, std::span<std::string_view>);
+  template void combine_objects(Context<E> &, std::span<std::string>);
 
 INSTANTIATE_ALL;
 

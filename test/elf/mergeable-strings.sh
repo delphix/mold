@@ -1,17 +1,15 @@
 #!/bin/bash
 export LC_ALL=C
 set -e
-CC="${CC:-cc}"
-CXX="${CXX:-c++}"
-GCC="${GCC:-gcc}"
-GXX="${GXX:-g++}"
+CC="${TEST_CC:-cc}"
+CXX="${TEST_CXX:-c++}"
+GCC="${TEST_GCC:-gcc}"
+GXX="${TEST_GXX:-g++}"
 OBJDUMP="${OBJDUMP:-objdump}"
 MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-mold="$(pwd)/mold"
-t=out/test/elf/$testname
+t=out/test/elf/$MACHINE/$testname
 mkdir -p $t
 
 # Skip if target is not x86-64
@@ -35,11 +33,14 @@ main:
   .section .rodata.str1.1, "aMS", @progbits, 1
   .string "bar"
 .L.str:
+foo:
   .string "xyzHello"
   .string "foo world\n"
 EOF
 
 $CC -B. -static -o $t/exe $t/a.o
 $QEMU $t/exe | grep -q 'Hello world'
+
+readelf -sW $t/exe | grep -Eq '[0-9] foo$'
 
 echo OK

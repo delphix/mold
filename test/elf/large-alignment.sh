@@ -1,20 +1,19 @@
 #!/bin/bash
 export LC_ALL=C
 set -e
-CC="${CC:-cc}"
-CXX="${CXX:-c++}"
-GCC="${GCC:-gcc}"
-GXX="${GXX:-g++}"
+CC="${TEST_CC:-cc}"
+CXX="${TEST_CXX:-c++}"
+GCC="${TEST_GCC:-gcc}"
+GXX="${TEST_GXX:-g++}"
 OBJDUMP="${OBJDUMP:-objdump}"
 MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-mold="$(pwd)/mold"
-t=out/test/elf/$testname
+t=out/test/elf/$MACHINE/$testname
 mkdir -p $t
 
-[ $MACHINE = i386 -o $MACHINE = arm ] && { echo skipped; exit; }
+[ $MACHINE = i386 -o $MACHINE = i686 ] && { echo skipped; exit; }
+[ $MACHINE = arm ] && { echo skipped; exit; }
 
 cat <<EOF | $CC -o $t/a.o -c -xc - -ffunction-sections
 #include <stdio.h>
@@ -34,13 +33,18 @@ void world() {
 int main() {
   hello();
   world();
-  printf(" %lu %lu\n",
-         (unsigned long)((uintptr_t)hello % 32768),
-         (unsigned long)((uintptr_t)world % 32768));
+
+  // Linux kernel may ignore a riduculously large alignment requirement,
+  // but we still want to verify that an executable with a large
+  // alignment requirement can still run.
+  //
+  // printf(" %lu %lu\n",
+  //       (unsigned long)((uintptr_t)hello % 32768),
+  //       (unsigned long)((uintptr_t)world % 32768));
 }
 EOF
 
 $CC -B. -o $t/exe $t/a.o
-$QEMU $t/exe | grep -q 'Hello world 0 0'
+$QEMU $t/exe | grep -q 'Hello world'
 
 echo OK

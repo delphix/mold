@@ -352,7 +352,7 @@ or
 .Pf Sy lib Ar libname Ns Sy \.a
 from library search paths.
 .Pp
-.It Fl m Op Sy elf_x86_64 | elf_i386 | aarch64linux
+.It Fl m Op Ar target
 Choose a target.
 .Pp
 .It Fl o Ar file , Fl -output Ns = Ns Ar file
@@ -529,6 +529,10 @@ options.
 .It Fl -dynamic-list Ns = Ns Ar file
 Read a list of dynamic symbols from
 .Ar file .
+Same as
+.Fl -export-dynamic-symbol-list ,
+except that it implies
+.Fl -Bsymbolic .
 .Pp
 .It Fl -eh-frame-hdr
 .It Fl -no-eh-frame-hdr
@@ -569,6 +573,20 @@ Mark all symbols in the given
 .Ar libraries
 hidden.
 .Pp
+.It Fl -export-dynamic-symbol Ns = Ns Ar sym
+Put symbols matching
+.Ar sym
+in the dynamic symbol table.
+.Ar sym
+may be a glob, with the same syntax as the globs used in
+.Fl -export-dynamic-symbol-list
+or
+.Fl -version-script .
+.Pp
+.It Fl -export-dynamic-symbol-list Ns = Ns Ar file
+Read a list of dynamic symbols from
+.Ar file .
+.Pp
 .It Fl -fatal-warnings
 .It Fl -no-fatal-warnings
 Treat warnings as errors.
@@ -603,9 +621,56 @@ compiler flag.
 .It Fl -hash-style Ns = Ns Op Sy sysv | gnu | both
 Set hash style.
 .Pp
-.It Fl -icf Ns = Ns Sy all
+.It Fl -icf Ns = Ns Op Sy none | safe | all
 .It Fl -no-icf
-Fold identical code.
+It is not uncommon for a program to contain many identical functions that differ \
+only in name. For example, a C++ template
+.Sy std::vector
+is very likely to be instantiated to the identical code for
+.Sy std::vector<int>
+and
+.Sy std::vector<unsigned>
+because the container cares only about the size of the parameter type. \
+Identical Code Folding (ICF) is a size optimization to identify and merge \
+such identical functions.
+.Pp
+If
+.Fl -icf=all
+is given,
+.Nm
+tries to merge all identical functions. This reduces the size of the output \
+most, but it is not
+.Dq safe
+optimization. It is guaranteed in C and C++ that two pointeres pointing two \
+different functions will never be equal, but
+.Fl -icf=all
+breaks that assumption as two functions have the same address after merging. \
+So a care must be taken when you use that flag that your program does not \
+depend on the function pointer uniqueness.
+.Pp
+.Fl -icf=safe
+is a flag to merge functions only when it is safe to do so. That is, if a \
+program does not take an address of a function, it is safe to merge that \
+function with other function, as you cannot compare a function pointer \
+with something else without taking an address of a function.
+.FL -icf=safe
+needs to be used with a compiler that supports
+.Sy .llvm_addrsig
+section which contains the information as to what symbols are address-taken. \
+LLVM/Clang supports that section by default. Since GCC does not support it \
+yet, you cannot use
+.Fl -icf=safe
+with GCC (it doesn't do any harm but can't optimize at all.)
+.Pp
+.Fl -icf=none
+and
+.Fl -no-icf
+disables ICF.
+.Pp
+.It Fl -ignore-data-address-equality
+Make ICF to merge not only functions but also data. This option should be \
+used in combination with
+.Fl -icf=all .
 .Pp
 .It Fl -image-base Ns = Ns Ar addr
 Set the base address to
@@ -645,6 +710,14 @@ Note that a runtime loader has to support
 to run executables or shared libraries linked with
 .Fl -pack-dyn-relocs=relr ,
 and only ChromeOS, Android and Fuchsia support it as of now in 2022.
+.Pp
+.It Fl -package-metadata Ns = Ns Ar string
+Embed
+.Ar string
+to a .note.package section. This option in intended to be used by a \
+package management command such as
+.Cm rpm
+to embed metadata regarding a package to each executable file.
 .Pp
 .It Fl -perf
 Print performance statistics.
@@ -924,23 +997,7 @@ section to indicate that the output uses IBT-enabled PLT. This option implies
 .Fl z Cm ibtplt .
 .Pp
 .It Fl z Cm ibtplt
-Generate Intel Branch Tracking (IBT)-enabled PLT.
-.Pp
-IBT is part of Intel Control-flow Enforcement Technology (CET).
-IBT is a new x86 feature available since Tiger Lake which is released in 2020.
-If IBT is enabled, all indirect branch instructions have to branch to a \
-so-called "landing pad" instruction. Landing pad itself is a no-op, but \
-it works as a marker that branching to that instruction is expected.
-If there's no landing pad after branch, the CPU raises an exception.
-This mechanism makes ROP attacks difficult.
-.Pp
-Since PLT can be used as an indirect branch target, we need a different \
-instruction sequence for IBT-enabled PLT. If
-.Sy -z Cm ibtplt
-is specified,
-.Nm
-generates PLT entries that start with a landing pad. The size of IBT-enabled \
-PLT is 24 bytes as opposed to 16 bytes regular PLT.
+Generate Intel Branch Tracking (IBT)-enabled PLT which is the default on x86-64.
 .Pp
 .It Fl z Cm execstack
 .It Fl z Cm noexecstack
@@ -974,15 +1031,13 @@ As a security mitigation,
 it is preferred to make such segments read-only during program execution.
 .Pp
 .Fl z Cm relro
-puts such sections into a special section called
+puts such sections into a special segment called
 .Dv relro .
 The dynamic linker make a relro segment read-only after it finishes its job.
 .Pp
 By default,
 .Nm
-generates a
-.Sy relro
-segment.
+generates a relro segment.
 .Fl z Cm norelro
 disables the feature.
 .Pp
