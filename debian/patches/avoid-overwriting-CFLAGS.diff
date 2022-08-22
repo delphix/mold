@@ -2,7 +2,7 @@ Index: mold/Makefile
 ===================================================================
 --- mold.orig/Makefile
 +++ mold/Makefile
-@@ -39,10 +39,10 @@ ifneq ($(findstring -android,$(shell $(C
+@@ -40,10 +40,10 @@ ifneq ($(findstring -android,$(shell $(C
    IS_ANDROID = 1
  endif
  
@@ -16,4 +16,4 @@ Index: mold/Makefile
 +#CXXFLAGS = -O2
  
  MOLD_CXXFLAGS := -std=c++20 -fno-exceptions -fno-unwind-tables \
-                  -fno-asynchronous-unwind-tables -Ithird-party \
+                  -fno-asynchronous-unwind-tables \

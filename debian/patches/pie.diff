@@ -2,8 +2,8 @@ Index: mold/Makefile
 ===================================================================
 --- mold.orig/Makefile
 +++ mold/Makefile
-@@ -125,7 +125,7 @@ all: mold mold-wrapper.so
- -include $(SRCS:%.cc=out/%.d)
+@@ -135,7 +135,7 @@ out/git-hash.o: out/git-hash.cc
+ 	$(CXX) $(MOLD_CXXFLAGS) $(CXXFLAGS) -c -o $@ $<
  
  mold: $(OBJS) $(MIMALLOC_LIB) $(TBB_LIB)
 -	$(CXX) $(OBJS) -o $@ $(MOLD_LDFLAGS) $(LDFLAGS)
