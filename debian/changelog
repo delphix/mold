@@ -1,6 +1,9 @@
-mold (1.4.1+dfsg-1) UNRELEASED; urgency=medium
+mold (1.4.1+dfsg-1) unstable; urgency=medium
 
   * New upstream release
+  * Silent 
+    source-contains-prebuilt-ms-help-file third-party/zlib/contrib/dotzlib/DotZLib.chm
+    will be removed at the next release
 
  -- Sylvestre Ledru <sylvestre@debian.org>  Mon, 22 Aug 2022 17:39:41 +0200
 

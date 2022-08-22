@@ -7,6 +7,7 @@ Files-Excluded: third-party/mimalloc/docs/jquery.js
                 third-party/mimalloc/bin/mimalloc-redirect32.dll
                 third-party/mimalloc/bin/minject.exe
                 third-party/mimalloc/bin/minject32.exe
+                third-party/zlib/contrib/dotzlib/
 
 Files: *
 Copyright: 2020-2021 Rui Ueyama <ruiu@cs.stanford.edu>
