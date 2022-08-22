@@ -4,6 +4,7 @@
 #include "lto.h"
 #include "../mold.h"
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -18,8 +19,6 @@
 
 #if MOLD_DEBUG_X86_64_ONLY
 # define INSTANTIATE_ALL INSTANTIATE(X86_64)
-#elif MOLD_DEBUG_ARM64_ONLY
-# define INSTANTIATE_ALL INSTANTIATE(ARM64)
 #else
 # define INSTANTIATE_ALL                        \
   INSTANTIATE(X86_64);                          \
@@ -29,7 +28,6 @@
 namespace mold::macho {
 
 static constexpr i64 COMMON_PAGE_SIZE = 0x4000;
-static constexpr i64 SHA256_SIZE = 32;
 
 template <typename E> class Chunk;
 template <typename E> class InputSection;
@@ -114,7 +112,7 @@ public:
   static ObjectFile *create(Context<E> &ctx, MappedFile<Context<E>> *mf,
                             std::string archive_name);
   void parse(Context<E> &ctx);
-  Subsection<E> *find_subsection(Context<E> &ctx, u32 addr);
+  Subsection<E> *find_subsection(Context<E> &ctx, u32 section_idx, u32 addr);
   Symbol<E> *find_symbol(Context<E> &ctx, u32 addr);
   std::vector<std::string> get_linker_options(Context<E> &ctx);
   void parse_compact_unwind(Context<E> &ctx, MachSection &hdr);
@@ -196,11 +194,13 @@ std::ostream &operator<<(std::ostream &out, const InputFile<E> &file);
 template <typename E>
 class InputSection {
 public:
-  InputSection(Context<E> &ctx, ObjectFile<E> &file, const MachSection &hdr);
+  InputSection(Context<E> &ctx, ObjectFile<E> &file, const MachSection &hdr,
+               u32 secidx);
   void parse_relocations(Context<E> &ctx);
 
   ObjectFile<E> &file;
   const MachSection &hdr;
+  u32 secidx = 0;
   OutputSection<E> &osec;
   std::string_view contents;
   std::vector<Symbol<E> *> syms;
@@ -236,7 +236,7 @@ public:
   u32 input_offset = 0;
   u32 input_size = 0;
   u32 input_addr = 0;
-  u32 output_offset = -1;
+  u32 output_offset = (u32)-1;
   u32 rel_offset = 0;
   u32 nrels = 0;
   u32 unwind_offset = 0;
@@ -875,7 +875,7 @@ struct Context {
     bool export_dynamic = false;
     bool fatal_warnings = false;
     bool function_starts = true;
-    bool ignore_optimization_hints = false;
+    bool ignore_optimization_hints = true;
     bool mark_dead_strippable_dylib = false;
     bool noinhibit_exec = false;
     bool perf = false;

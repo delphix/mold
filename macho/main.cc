@@ -8,13 +8,16 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/time.h>
 #include <sys/types.h>
 #include <tbb/concurrent_vector.h>
 #include <tbb/global_control.h>
 #include <tbb/parallel_for_each.h>
+
+#ifndef _WIN32
+# include <sys/mman.h>
+# include <sys/time.h>
+#endif
 
 namespace mold::macho {
 
@@ -38,12 +41,16 @@ template <typename E>
 static void resolve_symbols(Context<E> &ctx) {
   Timer t(ctx, "resolve_symbols");
 
-  auto for_each_file = [&](std::function<void(InputFile<E> *)> fn) {
-    tbb::parallel_for_each(ctx.objs, fn);
-    tbb::parallel_for_each(ctx.dylibs, fn);
-  };
+  std::vector<InputFile<E> *> files;
+  append(files, ctx.objs);
+  append(files, ctx.dylibs);
 
-  for_each_file([&](InputFile<E> *file) { file->resolve_symbols(ctx); });
+  tbb::parallel_for_each(files, [&](InputFile<E> *file) {
+    file->resolve_symbols(ctx);
+  });
+
+  if (has_lto_obj(ctx))
+    do_lto(ctx);
 
   for (std::string_view name : ctx.arg.u)
     if (InputFile<E> *file = get_symbol(ctx, name)->file)
@@ -64,18 +71,13 @@ static void resolve_symbols(Context<E> &ctx) {
   }
 
   // Remove symbols of eliminated files.
-  for_each_file([&](InputFile<E> *file) {
+  tbb::parallel_for_each(files, [&](InputFile<E> *file) {
     if (!file->is_alive)
       file->clear_symbols();
   });
 
   std::erase_if(ctx.objs, [](InputFile<E> *file) { return !file->is_alive; });
   std::erase_if(ctx.dylibs, [](InputFile<E> *file) { return !file->is_alive; });
-
-  for_each_file([&](InputFile<E> *file) { file->resolve_symbols(ctx); });
-
-  if (has_lto_obj(ctx))
-    do_lto(ctx);
 }
 
 template <typename E>
@@ -653,11 +655,11 @@ static void compute_uuid(Context<E> &ctx) {
   tbb::parallel_for((i64)0, num_shards, [&](i64 i) {
     u8 *begin = ctx.buf + shard_size * i;
     u8 *end = (i == num_shards - 1) ? ctx.buf + filesize : begin + shard_size;
-    SHA256(begin, end - begin, shards.data() + i * SHA256_SIZE);
+    sha256_hash(begin, end - begin, shards.data() + i * SHA256_SIZE);
   });
 
   u8 buf[SHA256_SIZE];
-  SHA256(shards.data(), shards.size(), buf);
+  sha256_hash(shards.data(), shards.size(), buf);
   memcpy(ctx.uuid, buf, 16);
   ctx.mach_hdr.copy_buf(ctx);
 }
@@ -887,7 +889,9 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
 
     for (i64 j = 0; j < opts.size();) {
       if (opts[j] == "-framework") {
-        read_framework(opts[j + 1]);
+        if (frameworks.insert(opts[j + 1]).second)
+          if (MappedFile<Context<E>> *mf = find_framework(opts[j + 1]))
+            read_file(ctx, mf);
         j += 2;
       } else if (opts[j].starts_with("-l")) {
         std::string name = opts[j].substr(2);
@@ -981,7 +985,7 @@ static int do_main(int argc, char **argv) {
   std::vector<std::string> file_args = parse_nonpositional_args(ctx);
 
   if (ctx.arg.arch != E::cputype) {
-#if !defined(MOLD_DEBUG_X86_64_ONLY) && !defined(MOLD_DEBUG_ARM64_ONLY)
+#ifndef MOLD_DEBUG_X86_64_ONLY
     switch (ctx.arg.arch) {
     case CPU_TYPE_X86_64:
       return do_main<X86_64>(argc, argv);
@@ -1104,15 +1108,6 @@ static int do_main(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
-  if (!getenv("MOLD_SUPPRESS_MACHO_WARNING")) {
-    std::cerr <<
-R"(********************************************************************************
-mold for macOS is pre-alpha. Do not use unless you know what you are doing.
-Do not report bugs because it's too early to manage missing features as bugs.
-********************************************************************************
-)";
-  }
-
 #ifdef MOLD_DEBUG_X86_64_ONLY
   return do_main<X86_64>(argc, argv);
 #else

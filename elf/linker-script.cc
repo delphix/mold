@@ -146,8 +146,9 @@ read_output_format(Context<E> &ctx, std::span<std::string_view> tok) {
 
 template <typename E>
 static bool is_in_sysroot(Context<E> &ctx, std::string path) {
-  std::string rel =
-    to_abs_path(path).lexically_relative(to_abs_path(ctx.arg.sysroot));
+  std::string rel = to_abs_path(path)
+                        .lexically_relative(to_abs_path(ctx.arg.sysroot))
+                        .string();
   return rel != "." && !rel.starts_with("../");
 }
 
@@ -225,6 +226,10 @@ void parse_linker_script(Context<E> &ctx, MappedFile<Context<E>> *mf) {
       tok = skip(ctx, tok, "{");
       read_version_script(ctx, tok);
       tok = skip(ctx, tok, "}");
+    } else if (tok.size() > 3 && tok[1] == "=" && tok[3] == ";") {
+      ctx.arg.defsyms.emplace_back(get_symbol(ctx, unquote(tok[0])),
+                                   get_symbol(ctx, unquote(tok[2])));
+      tok = tok.subspan(4);
     } else if (tok[0] == ";") {
       tok = tok.subspan(1);
     } else {
@@ -267,6 +272,7 @@ template <typename E>
 static void
 read_version_script_commands(Context<E> &ctx, std::span<std::string_view> &tok,
                              u16 ver_idx, bool is_cpp) {
+  ctx.version_specified = true;
   bool is_global = true;
 
   while (!tok.empty() && tok[0] != "}") {
@@ -351,6 +357,8 @@ void parse_version_script(Context<E> &ctx, std::string path) {
 template <typename E>
 void read_dynamic_list_commands(Context<E> &ctx, std::span<std::string_view> &tok,
                                 bool is_cpp) {
+  ctx.version_specified = true;
+
   while (!tok.empty() && tok[0] != "}") {
     if (tok[0] == "extern") {
       tok = tok.subspan(1);

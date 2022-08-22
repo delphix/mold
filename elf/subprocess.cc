@@ -1,5 +1,4 @@
 #include "mold.h"
-#include "../sha.h"
 
 #include <filesystem>
 #include <signal.h>

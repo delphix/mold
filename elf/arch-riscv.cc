@@ -251,11 +251,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       if (sym.is_absolute() || !ctx.arg.pic) {
         *(ul64 *)loc = S + A;
       } else if (sym.is_imported) {
-        *dynrel++ = {P, R_RISCV_64, (u32)sym.get_dynsym_idx(ctx), A};
+        *dynrel++ = ElfRel<E>(P, R_RISCV_64, sym.get_dynsym_idx(ctx), A);
         *(ul64 *)loc = A;
       } else {
         if (!is_relr_reloc(ctx, rel))
-          *dynrel++ = {P, R_RISCV_RELATIVE, 0, (i64)(S + A)};
+          *dynrel++ = ElfRel<E>(P, R_RISCV_RELATIVE, 0, S + A);
         *(ul64 *)loc = S + A;
       }
       break;
@@ -294,7 +294,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         // Calling an undefined weak symbol does not make sense.
         // We make such call into an infinite loop. This should
         // help debugging of a faulty program.
-        *(ul32 *)loc = P;
+        *(ul32 *)loc = 0;
       } else {
         *(ul32 *)loc = S + A - P;
       }
@@ -716,7 +716,7 @@ static void relax_section(Context<E> &ctx, InputSection<E> &isec) {
       // The total bytes of NOPs is stored to r_addend, so the next
       // instruction is r_addend away.
       u64 next_loc = loc + r.r_addend;
-      u64 alignment = bit_ceil(r.r_addend);
+      u64 alignment = bit_ceil(r.r_addend + 1);
       assert(alignment <= (1 << isec.p2align));
 
       if (next_loc % alignment)

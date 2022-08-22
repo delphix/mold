@@ -12,8 +12,14 @@
 #include <sys/types.h>
 #include <tbb/global_control.h>
 #include <tbb/parallel_for_each.h>
-#include <unistd.h>
 #include <unordered_set>
+
+#ifdef _WIN32
+# include <direct.h>
+# define _chdir chdir
+#else
+# include <unistd.h>
+#endif
 
 namespace mold::elf {
 
@@ -241,6 +247,7 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
         ctx.default_version = VER_NDX_GLOBAL;
       else
         ctx.version_patterns.push_back({arg, VER_NDX_GLOBAL, false});
+      ctx.version_specified = true;
     } else if (remove_prefix(arg, "--export-dynamic-symbol-list=")) {
       parse_dynamic_list(ctx, std::string(arg));
     } else if (arg == "--push-state") {
@@ -265,56 +272,6 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
     Fatal(ctx) << "no input files";
 
   ctx.tg.wait();
-}
-
-template <typename E>
-static i64 get_mtime(Context<E> &ctx, std::string path) {
-  struct stat st;
-  if (stat(path.c_str(), &st) < 0)
-    Fatal(ctx) << path << ": stat failed: " << errno_string();
-  return st.st_mtime;
-}
-
-template <typename E>
-static bool reload_input_files(Context<E> &ctx) {
-  Timer t(ctx, "reload_input_files");
-
-  std::vector<ObjectFile<E> *> objs;
-  std::vector<SharedFile<E> *> dsos;
-
-  // Reload updated .o files
-  for (ObjectFile<E> *file : ctx.objs) {
-    if (file->mf->parent) {
-      if (get_mtime(ctx, file->mf->parent->name) != file->mf->parent->mtime)
-        return false;
-      objs.push_back(file);
-      continue;
-    }
-
-    if (get_mtime(ctx, file->mf->name) == file->mf->mtime) {
-      objs.push_back(file);
-      continue;
-    }
-
-    MappedFile<Context<E>> *mf =
-      MappedFile<Context<E>>::must_open(ctx, file->mf->name);
-    objs.push_back(new_object_file(ctx, mf, file->mf->name));
-  }
-
-  // Reload updated .so files
-  for (SharedFile<E> *file : ctx.dsos) {
-    if (get_mtime(ctx, file->mf->name) == file->mf->mtime) {
-      dsos.push_back(file);
-    } else {
-      MappedFile<Context<E>> *mf =
-        MappedFile<Context<E>>::must_open(ctx, file->mf->name);
-      dsos.push_back(new_shared_file(ctx, mf));
-    }
-  }
-
-  ctx.objs = objs;
-  ctx.dsos = dsos;
-  return true;
 }
 
 template <typename E>
@@ -389,9 +346,12 @@ static int elf_main(int argc, char **argv) {
   Context<E> ctx;
 
   // Process -run option first. process_run_subcommand() does not return.
-  if (argc >= 2)
-    if (argv[1] == "-run"sv || argv[1] == "--run"sv)
-      process_run_subcommand(ctx, argc, argv);
+  if (argc >= 2 && (argv[1] == "-run"sv || argv[1] == "--run"sv)) {
+#if defined(_WIN32) || defined(__APPLE__)
+    Fatal(ctx) << ": -run is supported only on Unix";
+#endif
+    process_run_subcommand(ctx, argc, argv);
+  }
 
   // Parse non-positional command line options
   ctx.cmdline_args = expand_response_files(ctx, argv);
@@ -403,7 +363,7 @@ static int elf_main(int argc, char **argv) {
 
   // Redo if -m is not x86-64.
   if (ctx.arg.emulation != E::machine_type) {
-#if !MOLD_DEBUG_X86_64_ONLY && !MOLD_DEBUG_ARM64_ONLY
+#ifndef MOLD_DEBUG_X86_64_ONLY
     switch (ctx.arg.emulation) {
     case MachineType::I386:
       return elf_main<I386>(argc, argv);
@@ -438,8 +398,11 @@ static int elf_main(int argc, char **argv) {
 
   // Fork a subprocess unless --no-fork is given.
   std::function<void()> on_complete;
+
+#if !defined(_WIN32) && !defined(__APPLE__)
   if (ctx.arg.fork)
     on_complete = fork_child();
+#endif
 
   tbb::global_control tbb_cont(tbb::global_control::max_allowed_parallelism,
                                ctx.arg.thread_count);
@@ -472,6 +435,9 @@ static int elf_main(int argc, char **argv) {
 
   // Apply -exclude-libs
   apply_exclude_libs(ctx);
+
+  // Create a dummy file containing linker-synthesized symbols.
+  create_internal_file(ctx);
 
   // Resolve symbols and fix the set of object files that are
   // included to the final output.
@@ -520,10 +486,8 @@ static int elf_main(int argc, char **argv) {
   // Get a list of output sections.
   append(ctx.chunks, collect_output_sections(ctx));
 
-  // Create a dummy file containing linker-synthesized symbols
-  // (e.g. `__bss_start`).
-  ctx.internal_obj = create_internal_file(ctx);
-  ctx.objs.push_back(ctx.internal_obj);
+  // Add synthetic symbols such as __ehdr_start or __end.
+  add_synthetic_symbols(ctx);
 
   // Beyond this point, no new files will be added to ctx.objs
   // or ctx.dsos.
@@ -770,11 +734,7 @@ static int elf_main(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
-#if MOLD_DEBUG_ARM64_ONLY
-  return elf_main<ARM64>(argc, argv);
-#else
   return elf_main<X86_64>(argc, argv);
-#endif
 }
 
 #define INSTANTIATE(E)                                                  \

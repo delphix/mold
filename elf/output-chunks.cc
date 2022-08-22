@@ -3,10 +3,13 @@
 
 #include <cctype>
 #include <shared_mutex>
-#include <sys/mman.h>
 #include <tbb/parallel_for_each.h>
 #include <tbb/parallel_scan.h>
 #include <tbb/parallel_sort.h>
+
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 
 namespace mold::elf {
 
@@ -355,25 +358,15 @@ void RelDynSection<E>::update_shdr(Context<E> &ctx) {
 }
 
 template <typename E>
-static ElfRel<E> reloc(u64 offset, u32 type, u32 sym, i64 addend = 0) {
-  if constexpr (E::is_rel)
-    return {(u32)offset, (u8)type, sym};
-  else if constexpr (E::word_size == 4)
-    return {offset, (u8)type, sym, addend};
-  else
-    return {offset, type, sym, addend};
-}
-
-template <typename E>
 void RelDynSection<E>::copy_buf(Context<E> &ctx) {
   ElfRel<E> *rel = (ElfRel<E> *)(ctx.buf + this->shdr.sh_offset +
                                  ctx.got->get_reldyn_size(ctx));
 
   for (Symbol<E> *sym : ctx.copyrel->symbols)
-    *rel++ = reloc<E>(sym->get_addr(ctx), E::R_COPY, sym->get_dynsym_idx(ctx));
+    *rel++ = ElfRel<E>(sym->get_addr(ctx), E::R_COPY, sym->get_dynsym_idx(ctx), 0);
 
   for (Symbol<E> *sym : ctx.copyrel_relro->symbols)
-    *rel++ = reloc<E>(sym->get_addr(ctx), E::R_COPY, sym->get_dynsym_idx(ctx));
+    *rel++ = ElfRel<E>(sym->get_addr(ctx), E::R_COPY, sym->get_dynsym_idx(ctx), 0);
 }
 
 template <typename E>
@@ -1113,8 +1106,8 @@ void GotSection<E>::copy_buf(Context<E> &ctx) {
 
     if (ent.r_type &&
         (ent.r_type != E::R_RELATIVE || !ctx.arg.pack_dyn_relocs_relr))
-      *rel++ = reloc<E>(this->shdr.sh_addr + ent.idx * E::word_size, ent.r_type,
-                        ent.sym ? ent.sym->get_dynsym_idx(ctx) : 0, ent.val);
+      *rel++ = ElfRel<E>(this->shdr.sh_addr + ent.idx * E::word_size, ent.r_type,
+                         ent.sym ? ent.sym->get_dynsym_idx(ctx) : 0, ent.val);
   }
 }
 
@@ -1187,8 +1180,8 @@ void RelPltSection<E>::copy_buf(Context<E> &ctx) {
 
   i64 relplt_idx = 0;
   for (Symbol<E> *sym : ctx.plt->symbols)
-    buf[relplt_idx++] = reloc<E>(sym->get_gotplt_addr(ctx), E::R_JUMP_SLOT,
-                                 sym->get_dynsym_idx(ctx));
+    buf[relplt_idx++] = ElfRel<E>(sym->get_gotplt_addr(ctx), E::R_JUMP_SLOT,
+                                  sym->get_dynsym_idx(ctx), 0);
 }
 
 template<typename E>
@@ -1227,10 +1220,10 @@ void get_output_esym(Context<E> &ctx, const Symbol<E> &sym, i64 strtab_offset,
       out_esym.st_shndx = SHN_ABS;
       out_esym.st_value = sym.get_addr(ctx);
     } else if (sym.get_type() == STT_TLS) {
-      out_esym.st_shndx = isec->output_section->shndx;
+      out_esym.st_shndx = sym.get_st_shndx();
       out_esym.st_value = sym.get_addr(ctx) - ctx.tls_begin;
     } else {
-      out_esym.st_shndx = isec->output_section->shndx;
+      out_esym.st_shndx = sym.get_st_shndx();
       out_esym.st_value = sym.get_addr(ctx, false);
       out_esym.st_visibility = sym.visibility;
     }
@@ -1986,26 +1979,30 @@ static void compute_sha256(Context<E> &ctx, i64 offset) {
   tbb::parallel_for((i64)0, num_shards, [&](i64 i) {
     u8 *begin = buf + shard_size * i;
     u8 *end = (i == num_shards - 1) ? buf + filesize : begin + shard_size;
-    SHA256(begin, end - begin, shards.data() + i * SHA256_SIZE);
+    sha256_hash(begin, end - begin, shards.data() + i * SHA256_SIZE);
 
+#ifndef _WIN32
     // We call munmap early for each chunk so that the last munmap
     // gets cheaper. We assume that the .note.build-id section is
     // at the beginning of an output file. This is an ugly performance
     // hack, but we can save about 30 ms for a 2 GiB output.
     if (i > 0 && ctx.output_file->is_mmapped)
       munmap(begin, end - begin);
-  });
+#endif
+   });
 
   assert(ctx.arg.build_id.size() <= SHA256_SIZE);
 
   u8 digest[SHA256_SIZE];
-  SHA256(shards.data(), shards.size(), digest);
+  sha256_hash(shards.data(), shards.size(), digest);
   memcpy(buf + offset, digest, ctx.arg.build_id.size());
 
+#ifndef _WIN32
   if (ctx.output_file->is_mmapped) {
     munmap(buf, std::min(filesize, shard_size));
     ctx.output_file->is_unmapped = true;
   }
+#endif
 }
 
 template <typename E>

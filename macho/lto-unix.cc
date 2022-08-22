@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <dlfcn.h>
+#include <unistd.h>
 
 namespace mold::macho {
 
@@ -138,8 +139,6 @@ void do_lto(Context<E> &ctx) {
       file->is_alive = false;
     }
   }
-
-  std::erase_if(ctx.objs, [](InputFile<E> *file) { return !file->is_alive; });
 
   // Add a result of LTO as a new object file.
   MappedFile<Context<E>> *mf = new MappedFile<Context<E>>;

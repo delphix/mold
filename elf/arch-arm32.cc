@@ -159,10 +159,10 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       if (sym.is_absolute() || !ctx.arg.pic) {
         *(ul32 *)loc = S + A;
       } else if (sym.is_imported) {
-        *dynrel++ = {P, R_ARM_ABS32, (u32)sym.get_dynsym_idx(ctx)};
+        *dynrel++ = ElfRel<E>(P, R_ARM_ABS32, sym.get_dynsym_idx(ctx));
       } else {
         if (!is_relr_reloc(ctx, rel))
-          *dynrel++ = {P, R_ARM_RELATIVE, 0};
+          *dynrel++ = ElfRel<E>(P, R_ARM_RELATIVE, 0);
         *(ul32 *)loc = S + A;
       }
       continue;
@@ -177,13 +177,13 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         // On ARM, calling an weak undefined symbol jumps to the
         // next instruction.
         write_thm_b_imm(loc, 4);
-        *(ul16 *)(loc + 2) |= (1 << 12); // rewrite with BL
+        *(ul16 *)(loc + 2) |= 0x1000;  // rewrite with BL
       } else if (T) {
         write_thm_b_imm(loc, S + A - P);
-        *(ul16 *)(loc + 2) |= (1 << 12); // rewrite with BL
+        *(ul16 *)(loc + 2) |= 0x1000;  // rewrite with BL
       } else {
         write_thm_b_imm(loc, align_to(S + A - P, 4));
-        *(ul16 *)(loc + 2) &= ~(1 << 12); // rewrite with BLX
+        *(ul16 *)(loc + 2) &= ~0x1000; // rewrite with BLX
       }
       continue;
     case R_ARM_BASE_PREL:
@@ -198,27 +198,36 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_ARM_TARGET2:
       *(ul32 *)loc = GOT + G + A - P;
       continue;
-    case R_ARM_CALL:
-    case R_ARM_JUMP24: {
-      u32 val;
+    case R_ARM_CALL: {
+      // Just like THM_CALL, ARM_CALL relocation refers either BL or
+      // BLX instruction. We may need to rewrite BL → BLX or BLX → BL.
+      bool is_bl = ((*(ul32 *)loc & 0xff00'0000) == 0xeb00'0000);
+      bool is_blx = ((*(ul32 *)loc & 0xfe00'0000) == 0xfa00'0000);
+      if (!is_bl && !is_blx)
+        Fatal(ctx) << *this << ": R_ARM_CALL refers neither BL nor BLX";
 
       if (sym.esym().is_undef_weak()) {
         // On ARM, calling an weak undefined symbol jumps to the
         // next instruction.
-        val = 4;
+        *(ul32 *)loc = 0xeb00'0001;
+      } else if (T) {
+        u32 val = S + A - P;
+        *(ul32 *)loc = 0xfa00'0000 | (bit(val, 1) << 24) | bits(val, 25, 2);
       } else {
-        val = S + A - P;
+        *(ul32 *)loc = 0xeb00'0000 | bits(S + A - P, 25, 2);
       }
-
-      *(ul32 *)loc = (*(ul32 *)loc & 0xff00'0000) | ((val >> 2) & 0x00ff'ffff);
       continue;
     }
-    case R_ARM_THM_JUMP11: {
+    case R_ARM_JUMP24:
+      if (sym.esym().is_undef_weak())
+        *(ul32 *)loc = (*(ul32 *)loc & 0xff00'0000) | 1;
+      else
+        *(ul32 *)loc = (*(ul32 *)loc & 0xff00'0000) | bits(S + A - P, 25, 2);
+      continue;
+    case R_ARM_THM_JUMP11:
       assert(T);
-      u32 val = (S + A - P) >> 1;
-      *(ul16 *)loc = (*(ul16 *)loc & 0xf800) | (val & 0x07ff);
+      *(ul16 *)loc = (*(ul16 *)loc & 0xf800) | bits(S + A - P, 11, 1);
       continue;
-    }
     case R_ARM_THM_JUMP24:
       if (T) {
         write_thm_b_imm(loc, S + A - P);
@@ -239,11 +248,9 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_ARM_THM_MOVW_PREL_NC:
       write_thm_mov_imm(loc, ((S + A) | T) - P);
       continue;
-    case R_ARM_PREL31: {
-      u32 val = S + A - P;
-      *(ul32 *)loc = (*(ul32 *)loc & 0x8000'0000) | (val & 0x7fff'ffff);
+    case R_ARM_PREL31:
+      *(ul32 *)loc = (*(ul32 *)loc & 0x8000'0000) | ((S + A - P) & 0x7fff'ffff);
       continue;
-    }
     case R_ARM_THM_MOVW_ABS_NC:
       write_thm_mov_imm(loc, (S + A) | T);
       continue;

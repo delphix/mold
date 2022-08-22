@@ -130,7 +130,7 @@ read_relocations(Context<E> &ctx, ObjectFile<E> &file, const MachSection &hdr) {
     }
 
     u64 addr = r.is_pcrel ? (hdr.addr + r.offset + addend) : addend;
-    Subsection<E> *target = file.find_subsection(ctx, addr);
+    Subsection<E> *target = file.find_subsection(ctx, r.idx - 1, addr);
     if (!target)
       Fatal(ctx) << file << ": bad relocation: " << r.offset;
 
@@ -508,9 +508,11 @@ static u64 get_adrp_imm(ul32 *loc) {
   return (bits(*loc, 23, 5) << 14) + (bits(*loc, 30, 29) << 12);
 }
 
+template <typename E>
 static void relax_adrp_ldr_got_ldr(Context<E> &ctx,
                                    ul32 *loc1, ul32 *loc2, ul32 *loc3,
-                                   u64 addr1, u64 addr2, u64 addr3) {
+                                   u64 addr1, u64 addr2, u64 addr3,
+                                   ObjectFile<E> *file) {
   // We expect the following instructions for a GOT-indirect load:
   //
   //   adrp Xa, _foo@GOTPAGE
@@ -521,6 +523,10 @@ static void relax_adrp_ldr_got_ldr(Context<E> &ctx,
 
   u64 got_page = page(addr1) + get_adrp_imm(loc1);
   u64 pageoff = bits(*loc2, 21, 10) << 3;
+
+  if (got_page + pageoff < ctx.got.hdr.addr ||
+      ctx.got.hdr.addr + ctx.got.hdr.size <= got_page + pageoff)
+    Fatal(ctx) << *file << ": LDR_GOT_LDR out of range";
 
   ASSERT_RANGE(got_page + pageoff, ctx.got.hdr.addr, ctx.got.hdr.size);
 
@@ -584,6 +590,14 @@ static void relax_adrp_add(Context<E> &ctx, ul32 *loc1, ul32 *loc2,
   }
 }
 
+static Subsection<E> *find_subsection_by_addr(ObjectFile<E> *file, u32 addr) {
+  for (Subsection<E> *subsec : file->subsections)
+    if (subsec->input_addr <= addr &&
+        addr < subsec->input_addr + subsec->input_size)
+      return subsec;
+  return nullptr;
+}
+
 // On ARM, we generally need two or more instructions to materialize
 // an address of an object in a register or jump to a function.
 // However, if an object or a function is close enough to PC, a single
@@ -621,7 +635,7 @@ void apply_linker_optimization_hints(Context<E> &ctx) {
         i64 input_addr2 = read_uleb(hints);
         i64 input_addr3 = read_uleb(hints);
 
-        Subsection<E> *subsec = file->find_subsection(ctx, input_addr1);
+        Subsection<E> *subsec = find_subsection_by_addr(file, input_addr1);
         if (!subsec || !subsec->is_alive)
           return;
 
@@ -642,7 +656,8 @@ void apply_linker_optimization_hints(Context<E> &ctx) {
         u64 addr2 = subsec->get_addr(ctx) + offset2;
         u64 addr3 = subsec->get_addr(ctx) + offset3;
 
-        relax_adrp_ldr_got_ldr(ctx, loc1, loc2, loc3, addr1, addr2, addr3);
+        relax_adrp_ldr_got_ldr(ctx, loc1, loc2, loc3, addr1, addr2, addr3,
+                               file);
         break;
       }
       case LOH_ARM64_ADRP_ADRP:
@@ -652,7 +667,7 @@ void apply_linker_optimization_hints(Context<E> &ctx) {
         i64 input_addr1 = read_uleb(hints);
         i64 input_addr2 = read_uleb(hints);
 
-        Subsection<E> *subsec = file->find_subsection(ctx, input_addr1);
+        Subsection<E> *subsec = find_subsection_by_addr(file, input_addr1);
         if (!subsec || !subsec->is_alive)
           return;
 

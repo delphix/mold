@@ -1,10 +1,11 @@
-VERSION = 1.4.0
+VERSION = 1.4.1
 
 PREFIX = /usr/local
 BINDIR = $(PREFIX)/bin
 LIBDIR = $(PREFIX)/lib
 LIBEXECDIR = $(PREFIX)/libexec
 MANDIR = $(PREFIX)/share/man
+DOCDIR = $(PREFIX)/share/doc
 
 INSTALL = install
 INSTALL_PROGRAM = $(INSTALL)
@@ -32,7 +33,7 @@ endif
 STRIP = strip
 
 SRCS = $(wildcard *.cc elf/*.cc macho/*.cc)
-OBJS = $(SRCS:%.cc=out/%.o) out/rust-demangle.o
+OBJS = $(SRCS:%.cc=out/%.o) out/rust-demangle.o out/git-hash.o
 
 IS_ANDROID = 0
 ifneq ($(findstring -android,$(shell $(CC) -dumpmachine)),)
@@ -45,19 +46,10 @@ CFLAGS = -O2
 CXXFLAGS = -O2
 
 MOLD_CXXFLAGS := -std=c++20 -fno-exceptions -fno-unwind-tables \
-                 -fno-asynchronous-unwind-tables -Ithird-party \
+                 -fno-asynchronous-unwind-tables \
                  -DMOLD_VERSION=\"$(VERSION)\" -DLIBDIR="\"$(LIBDIR)\""
 
 MOLD_LDFLAGS := -pthread -lz -lm -ldl
-
-# Get a hash of the current git head. We don't want to use the git
-# command because the command prints out a warning if running under
-# sudo.
-GIT_HASH := $(shell [ -f .git/HEAD ] && if grep -q '^ref:' .git/HEAD; then cat .git/`sed 's/^ref: //' .git/HEAD`; else cat .git/HEAD; fi)
-
-ifneq ($(GIT_HASH),)
-  MOLD_CXXFLAGS += -DGIT_HASH=\"$(GIT_HASH)\"
-endif
 
 LTO = 0
 ifeq ($(LTO), 1)
@@ -85,6 +77,10 @@ ifeq ($(USE_MIMALLOC), 1)
   endif
 endif
 
+# Note: Do NOT specify `SYSTEM_TBB=1` unless your system-wide OneTBB
+# library is compiled with https://github.com/oneapi-src/oneTBB/pull/824.
+# mold with an unpatched OneTBB is unstable when doing LTO if the system
+# is under high load.
 ifdef SYSTEM_TBB
   MOLD_LDFLAGS += -ltbb
 else
@@ -129,6 +125,14 @@ DEPFLAGS = -MT $@ -MMD -MP -MF out/$*.d
 all: mold mold-wrapper.so
 
 -include $(SRCS:%.cc=out/%.d)
+
+out/git-hash.cc: FORCE
+	./update-git-hash.py . out/git-hash.cc
+
+FORCE:
+
+out/git-hash.o: out/git-hash.cc
+	$(CXX) $(MOLD_CXXFLAGS) $(CXXFLAGS) -c -o $@ $<
 
 mold: $(OBJS) $(MIMALLOC_LIB) $(TBB_LIB)
 	$(CXX) $(OBJS) -o $@ $(MOLD_LDFLAGS) $(LDFLAGS)
@@ -209,8 +213,11 @@ install: all
 	$(STRIP) $D$(BINDIR)/mold
 
 	$(INSTALL) -d $D$(LIBDIR)/mold
+
+ifneq ($(OS), Darwin)
 	$(INSTALL_DATA) mold-wrapper.so $D$(LIBDIR)/mold
 	$(STRIP) $D$(LIBDIR)/mold/mold-wrapper.so
+endif
 
 	$(INSTALL) -d $D$(LIBEXECDIR)/mold
 
@@ -222,6 +229,10 @@ install: all
 
 	$(INSTALL) -d $D$(MANDIR)/man1
 	$(INSTALL_DATA) docs/mold.1 $D$(MANDIR)/man1
+	ln -sf mold.1 $D$(MANDIR)/man1/ld.mold.1
+
+	$(INSTALL) -d $D$(DOCDIR)/mold
+	$(INSTALL_DATA) LICENSE $D$(DOCDIR)/mold/
 
 	ln -sf mold $D$(BINDIR)/ld.mold
 	ln -sf mold $D$(BINDIR)/ld64.mold

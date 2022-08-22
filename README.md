@@ -61,7 +61,7 @@ necessary packages. You may want to run it as root.
 ```shell
 git clone https://github.com/rui314/mold.git
 cd mold
-git checkout v1.4.0
+git checkout v1.4.1
 make -j$(nproc) CXX=clang++
 sudo make install
 ```
@@ -150,6 +150,20 @@ replace `argv[0]` with `mold` if it is `ld`, `ld.gold` or `ld.lld`.
 
 </details>
 
+<details><summary>On macOS</summary>
+
+mold/macOS is available as an alpha version. It can be used to build not
+only macOS apps but also iOS apps because their binary formats are the same.
+
+The command name of mold/macOS is `ld64.mold`. If you build mold on macOS,
+it still produces `mold` and `ld.mold`, but these executables are useful
+only for cross compilation (i.e. building Linux apps on macOS.)
+
+If you find any issue with mold/macOS, please file it to
+<a href=https://github.com/rui314/mold/issues>our GitHub Issues</a>.
+
+</details>
+
 <details><summary>GitHub Actions</summary>
 
 You can use our <a href=https://github.com/rui314/setup-mold>setup-mold</a>
@@ -174,6 +188,15 @@ String dump of section '.comment':
 ```
 
 If `mold` is in `.comment`, the file is created by mold.
+
+</details>
+
+<details><summary>Online manual</summary>
+
+Since mold is a drop-in replacement, you should be able to use it
+without reading its manual. But just in case you need it, it's available
+online at <a href=https://rui314.github.io/mold.html>here</a>.
+You can also read the same manual by `man mold`.
 
 </details>
 

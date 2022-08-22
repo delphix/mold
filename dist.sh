@@ -24,12 +24,12 @@ image=rui314/mold-builder:v1-$arch
 
 docker images -q $image 2> /dev/null || docker pull $image
 
-docker run -it --rm -v "$(pwd):/mold:Z" -u "$(id -u):$(id -g)" $image \
-  bash -c "cp -r /mold /tmp/mold &&
-cd /tmp/mold &&
-make clean &&
-make -j\$(nproc) CXX=clang++-14 CXXFLAGS='-I/openssl/include -O2 $CXXFLAGS' LDFLAGS='-static-libstdc++ /openssl/libcrypto.a' NEEDS_LIBCRYPTO=0 LTO=${LTO:-0} &&
-make install PREFIX=/ DESTDIR=$dest &&
+docker run -it --rm -v "$(pwd):/mold" -e "OWNER=$(id -u):$(id -g)" $image \
+  bash -c "mkdir /tmp/build &&
+cd /tmp/build &&
+cmake -DCMAKE_C_COMPILER=gcc-10 -DCMAKE_CXX_COMPILER=g++-10 -DMOLD_MOSTLY_STATIC=On -DCMAKE_BUILD_TYPE=Release /mold &&
+cmake --build . -j\$(nproc)
+cmake --install . --prefix $dest --strip
 tar czf /mold/$dest.tar.gz $dest &&
-cp mold /mold &&
-cp mold-wrapper.so /mold"
+cp mold mold-wrapper.so /mold &&
+chown \$OWNER /mold/mold /mold/mold-wrapper.so /mold/$dest.tar.gz"

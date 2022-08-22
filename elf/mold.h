@@ -25,11 +25,14 @@
 #include <tbb/spin_mutex.h>
 #include <tbb/task_group.h>
 #include <type_traits>
-#include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
 #include <vector>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 // MOLD_DEBUG_{X86_64,ARM64}_ONLY are macros to speed up builds.
 // This should be used only for debugging. When you use this flag,
@@ -37,8 +40,6 @@
 // -fdata-sections` and link them with -Wl,-gc-sections.
 #if MOLD_DEBUG_X86_64_ONLY
 # define INSTANTIATE_ALL INSTANTIATE(X86_64)
-#elif MOLD_DEBUG_ARM64_ONLY
-# define INSTANTIATE_ALL INSTANTIATE(ARM64)
 #else
 # define INSTANTIATE_ALL                        \
   INSTANTIATE(X86_64);                          \
@@ -1300,6 +1301,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx);
 // passes.cc
 //
 
+template <typename E> void create_internal_file(Context<E> &);
 template <typename E> void apply_exclude_libs(Context<E> &);
 template <typename E> void create_synthetic_sections(Context<E> &);
 template <typename E> void set_file_priority(Context<E> &);
@@ -1309,7 +1311,7 @@ template <typename E> void eliminate_comdats(Context<E> &);
 template <typename E> void convert_common_symbols(Context<E> &);
 template <typename E> void compute_merged_section_sizes(Context<E> &);
 template <typename E> void bin_sections(Context<E> &);
-template <typename E> ObjectFile<E> *create_internal_file(Context<E> &);
+template <typename E> void add_synthetic_symbols(Context<E> &);
 template <typename E> void check_cet_errors(Context<E> &);
 template <typename E> void print_dependencies(Context<E> &);
 template <typename E> void print_dependencies(Context<E> &);
@@ -1472,7 +1474,7 @@ struct Context {
     bool fork = true;
     bool gc_sections = false;
     bool gdb_index = false;
-    bool hash_style_gnu = false;
+    bool hash_style_gnu = true;
     bool hash_style_sysv = true;
     bool icf = false;
     bool icf_all = false;
@@ -1559,6 +1561,7 @@ struct Context {
 
   std::vector<VersionPattern> version_patterns;
   u16 default_version = VER_NDX_GLOBAL;
+  bool version_specified = false;
   i64 page_size = -1;
 
   // Reader context
@@ -1587,7 +1590,6 @@ struct Context {
   tbb::concurrent_vector<std::unique_ptr<SharedFile<E>>> dso_pool;
   tbb::concurrent_vector<std::unique_ptr<u8[]>> string_pool;
   tbb::concurrent_vector<std::unique_ptr<MappedFile<Context<E>>>> mf_pool;
-  tbb::concurrent_vector<std::vector<ElfRel<E>>> rel_pool;
 
   // Symbol auxiliary data
   std::vector<SymbolAux> symbol_aux;
@@ -1598,7 +1600,9 @@ struct Context {
   // Input files
   std::vector<ObjectFile<E> *> objs;
   std::vector<SharedFile<E> *> dsos;
+
   ObjectFile<E> *internal_obj = nullptr;
+  std::vector<ElfSym<E>> internal_esyms;
 
   // Output buffer
   std::unique_ptr<OutputFile<Context<E>>> output_file;
@@ -1783,8 +1787,9 @@ public:
   bool has_plt(Context<E> &ctx) const;
   bool has_got(Context<E> &ctx) const;
 
+  u64 get_st_shndx() const;
   bool is_absolute() const;
-  bool is_relative() const;
+  bool is_relative() const { return !is_absolute(); }
   bool is_local() const;
 
   InputSection<E> *get_input_section() const;
@@ -2276,6 +2281,21 @@ inline InputSection<E> *ObjectFile<E>::get_section(const ElfSym<E> &esym) {
 }
 
 template <typename E>
+inline u64 Symbol<E>::get_st_shndx() const {
+  // if we are pointing to a section fragment, then the parent section (which is
+  // mergeable) should contain the real st_shndx
+  if (SectionFragment<E> *frag = get_frag())
+    if (frag->is_alive)
+      return frag->output_section.shndx;
+
+  if (InputSection<E> *isec = get_input_section())
+    if (isec->is_alive)
+      return isec->output_section->shndx;
+
+  return SHN_UNDEF;
+}
+
+template <typename E>
 inline u64 Symbol<E>::get_addr(Context<E> &ctx, bool allow_plt) const {
   if (file && !file->is_dso) {
     SectionFragmentRef<E> &ref = ((ObjectFile<E> *)file)->sym_fragments[sym_idx];
@@ -2488,14 +2508,9 @@ inline bool Symbol<E>::has_got(Context<E> &ctx) const {
 
 template <typename E>
 inline bool Symbol<E>::is_absolute() const {
-  if (file->is_dso)
+  if (file && file->is_dso)
     return esym().is_abs();
   return !is_imported && !get_frag() && shndx == 0;
-}
-
-template <typename E>
-inline bool Symbol<E>::is_relative() const {
-  return !is_absolute();
 }
 
 template<typename E>
