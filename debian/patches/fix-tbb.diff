@@ -2,7 +2,7 @@ Index: mold/Makefile
 ===================================================================
 --- mold.orig/Makefile
 +++ mold/Makefile
-@@ -159,7 +159,8 @@ $(MIMALLOC_LIB):
+@@ -163,7 +163,8 @@ $(MIMALLOC_LIB):
  
  $(TBB_LIB):
  	mkdir -p out/tbb
