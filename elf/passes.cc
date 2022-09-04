@@ -34,7 +34,8 @@ template <typename E>
 void create_synthetic_sections(Context<E> &ctx) {
   auto push = [&]<typename T>(T *x) {
     ctx.chunks.push_back(x);
-    return std::unique_ptr<T>(x);
+    ctx.chunk_pool.emplace_back(x);
+    return x;
   };
 
   if (!ctx.arg.oformat_binary) {
@@ -84,11 +85,6 @@ void create_synthetic_sections(Context<E> &ctx) {
   ctx.verneed = push(new VerneedSection<E>);
   ctx.note_package = push(new NotePackageSection<E>);
   ctx.note_property = push(new NotePropertySection<E>);
-
-  if constexpr (std::is_same_v<E, ARM32>) {
-    ctx.thumb_to_arm = push(new ThumbToArmSection);
-    ctx.tls_trampoline = push(new TlsTrampolineSection);
-  }
 
   // If .dynamic exists, .dynsym and .dynstr must exist as well
   // since .dynamic refers them.
@@ -419,9 +415,9 @@ void add_synthetic_symbols(Context<E> &ctx) {
   ctx.__executable_start = add("__executable_start");
 
   ctx.__rel_iplt_start =
-    add(E::is_rel ? "__rel_iplt_start" : "__rela_iplt_start");
+    add(is_rela<E> ? "__rela_iplt_start" : "__rel_iplt_start");
   ctx.__rel_iplt_end =
-    add(E::is_rel ? "__rel_iplt_end" : "__rela_iplt_end");
+    add(is_rela<E> ? "__rela_iplt_end" : "__rel_iplt_end");
 
   if (ctx.arg.eh_frame_hdr)
     ctx.__GNU_EH_FRAME_HDR = add("__GNU_EH_FRAME_HDR");
@@ -435,10 +431,10 @@ void add_synthetic_symbols(Context<E> &ctx) {
   if (!get_symbol(ctx, "__dso_handle")->file)
     ctx.__dso_handle = add("__dso_handle");
 
-  if constexpr (E::supports_tlsdesc)
+  if constexpr (supports_tlsdesc<E>)
     ctx._TLS_MODULE_BASE_ = add("_TLS_MODULE_BASE_");
 
-  if constexpr (std::is_same_v<E, RISCV64> || std::is_same_v<E, RISCV32>)
+  if constexpr (is_riscv<E>)
     if (!ctx.arg.shared)
       ctx.__global_pointer = add("__global_pointer$");
 
@@ -815,7 +811,7 @@ void compute_section_sizes(Context<E> &ctx) {
   tbb::parallel_for_each(ctx.output_sections,
                          [&](std::unique_ptr<OutputSection<E>> &osec) {
     // This pattern will be processed in the next loop.
-    if constexpr (std::is_same_v<E, ARM64>)
+    if constexpr (needs_thunk<E>)
       if (osec->shdr.sh_flags & SHF_EXECINSTR)
         return;
 
@@ -859,12 +855,15 @@ void compute_section_sizes(Context<E> &ctx) {
     });
   });
 
-  // On ARM64, we may need to create so-called "range extension thunks" to
-  // extend branch instructions reach, as they can jump only to ±128 MiB.
-  // In this case, we compute the sizes of sections while inserting thunks.
-  // This pass cannot be parallelized (`create_range_extension_thunks` is
-  // parallelized internally, but the function itself is not thread-safe.
-  if constexpr (std::is_same_v<E, ARM64>)
+  // On ARM32 or ARM64, we may need to create so-called "range extension
+  // thunks" to extend branch instructions reach, as they can jump only
+  // to ±16 MiB or ±128 MiB, respecitvely.
+  //
+  // In the following loop, We compute the sizes of sections while
+  // inserting thunks. This pass cannot be parallelized. That is,
+  // create_range_extension_thunks is parallelized internally, but the
+  // function itself is not thread-safe.
+  if constexpr (needs_thunk<E>)
     for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections)
       if (osec->shdr.sh_flags & SHF_EXECINSTR)
         create_range_extension_thunks(ctx, *osec);
@@ -979,10 +978,6 @@ void scan_rels(Context<E> &ctx) {
       }
     }
 
-    if constexpr (std::is_same_v<E, ARM32>)
-      if (sym->flags & NEEDS_THUMB_TO_ARM_THUNK)
-        ctx.thumb_to_arm->add_symbol(ctx, sym);
-
     sym->flags = 0;
   }
 
@@ -1001,7 +996,7 @@ void create_reloc_sections(Context<E> &ctx) {
   for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections) {
     RelocSection<E> *r = new RelocSection<E>(ctx, *osec);
     ctx.chunks.push_back(r);
-    ctx.output_chunks.emplace_back(r);
+    ctx.chunk_pool.emplace_back(r);
   }
 
   // Create a table to map input symbol indices to output symbol indices
@@ -1188,7 +1183,7 @@ void compute_import_export(Context<E> &ctx) {
         continue;
 
       // If we are using a symbol in a DSO, we need to import it at runtime.
-      if (sym->file != file && sym->file->is_dso) {
+      if (sym->file != file && sym->file->is_dso && !sym->is_absolute()) {
         std::scoped_lock lock(sym->mu);
         sym->is_imported = true;
         continue;
@@ -1211,8 +1206,9 @@ void compute_import_export(Context<E> &ctx) {
 template <typename E>
 void mark_addrsig(Context<E> &ctx) {
   Timer t(ctx, "mark_addrsig");
+
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    file->fill_addrsig(ctx);
+    file->mark_addrsig(ctx);
   });
 }
 
@@ -1278,34 +1274,34 @@ i64 get_section_rank(Context<E> &ctx, Chunk<E> *chunk) {
   u64 type = chunk->shdr.sh_type;
   u64 flags = chunk->shdr.sh_flags;
 
-  if (chunk == ctx.ehdr.get())
+  if (chunk == ctx.ehdr)
     return 0;
-  if (chunk == ctx.phdr.get())
+  if (chunk == ctx.phdr)
     return 1;
-  if (chunk == ctx.interp.get())
+  if (chunk == ctx.interp)
     return 2;
 
   if (type == SHT_NOTE && (flags & SHF_ALLOC))
     return (1 << 10) + chunk->shdr.sh_addralign;
 
-  if (chunk == ctx.hash.get())
+  if (chunk == ctx.hash)
     return (1 << 11) + 0;
-  if (chunk == ctx.gnu_hash.get())
+  if (chunk == ctx.gnu_hash)
     return (1 << 11) + 1;
-  if (chunk == ctx.dynsym.get())
+  if (chunk == ctx.dynsym)
     return (1 << 11) + 2;
-  if (chunk == ctx.dynstr.get())
+  if (chunk == ctx.dynstr)
     return (1 << 11) + 3;
-  if (chunk == ctx.versym.get())
+  if (chunk == ctx.versym)
     return (1 << 11) + 4;
-  if (chunk == ctx.verneed.get())
+  if (chunk == ctx.verneed)
     return (1 << 11) + 5;
-  if (chunk == ctx.reldyn.get())
+  if (chunk == ctx.reldyn)
     return (1 << 11) + 6;
-  if (chunk == ctx.relplt.get())
+  if (chunk == ctx.relplt)
     return (1 << 11) + 7;
 
-  if (chunk == ctx.shdr.get())
+  if (chunk == ctx.shdr)
     return 1 << 30;
   if (!(flags & SHF_ALLOC))
     return (1 << 30) - 1;
@@ -1336,22 +1332,26 @@ i64 do_set_osec_offsets(Context<E> &ctx) {
 
   // Assign virtual addresses
   u64 addr = ctx.arg.image_base;
-  for (i64 i = 0; i < chunks.size(); i++) {
-    if (!(chunks[i]->shdr.sh_flags & SHF_ALLOC))
+  for (Chunk<E> *chunk : chunks) {
+    if (!(chunk->shdr.sh_flags & SHF_ALLOC))
       continue;
 
-    if (auto it = ctx.arg.section_start.find(chunks[i]->name);
-        it != ctx.arg.section_start.end())
+    bool addr_specified = false;
+    if (auto it = ctx.arg.section_start.find(chunk->name);
+        it != ctx.arg.section_start.end()) {
       addr = it->second;
+      addr_specified = true;
+    }
 
-    if (is_tbss(chunks[i])) {
-      chunks[i]->shdr.sh_addr = addr;
+    if (is_tbss(chunk)) {
+      chunk->shdr.sh_addr = addr;
       continue;
     }
 
-    addr = align_to(addr, alignment(chunks[i]));
-    chunks[i]->shdr.sh_addr = addr;
-    addr += chunks[i]->shdr.sh_size;
+    if (!addr_specified)
+      addr = align_to(addr, alignment(chunk));
+    chunk->shdr.sh_addr = addr;
+    addr += chunk->shdr.sh_size;
   }
 
   // Fix tbss virtual addresses. tbss sections are laid out as if they
@@ -1382,26 +1382,39 @@ i64 do_set_osec_offsets(Context<E> &ctx) {
   while (i < chunks.size() && (chunks[i]->shdr.sh_flags & SHF_ALLOC)) {
     Chunk<E> &first = *chunks[i];
     assert(first.shdr.sh_type != SHT_NOBITS);
-
     fileoff = align_to(fileoff, alignment(&first));
 
-    u64 end = fileoff;
-    while (i < chunks.size() && (chunks[i]->shdr.sh_flags & SHF_ALLOC) &&
-           chunks[i]->shdr.sh_type != SHT_NOBITS) {
-      // The addresses may not increase monotonically if a user uses
-      // --start-sections.
+    // Assign ALLOC sections contiguous file offsets as long as they
+    // are contiguous in memory.
+    for (;;) {
+      chunks[i]->shdr.sh_offset =
+        fileoff + chunks[i]->shdr.sh_addr - first.shdr.sh_addr;
+      i++;
+
+      if (i >= chunks.size() ||
+          !(chunks[i]->shdr.sh_flags & SHF_ALLOC) ||
+          chunks[i]->shdr.sh_type == SHT_NOBITS)
+        break;
+
+      // If --start-section is given, addresses may not increase
+      // monotonically.
       if (chunks[i]->shdr.sh_addr < first.shdr.sh_addr)
         break;
 
-      chunks[i]->shdr.sh_offset =
-        fileoff + chunks[i]->shdr.sh_addr - first.shdr.sh_addr;
-      end = chunks[i]->shdr.sh_offset + chunks[i]->shdr.sh_size;
-      i++;
+      i64 gap_size = chunks[i]->shdr.sh_addr - chunks[i - 1]->shdr.sh_addr -
+                     chunks[i - 1]->shdr.sh_size;
+
+      // If --start-section is given, there may be a large gap between
+      // sections. We don't want to allocate a disk space for a gap if
+      // exists.
+      if (gap_size >= ctx.page_size)
+        break;
     }
 
-    fileoff = end;
+    fileoff = chunks[i - 1]->shdr.sh_offset + chunks[i - 1]->shdr.sh_size;
 
-    while (i < chunks.size() && (chunks[i]->shdr.sh_flags & SHF_ALLOC) &&
+    while (i < chunks.size() &&
+           (chunks[i]->shdr.sh_flags & SHF_ALLOC) &&
            chunks[i]->shdr.sh_type == SHT_NOBITS)
       i++;
   }
@@ -1554,7 +1567,7 @@ void fix_synthetic_symbols(Context<E> &ctx) {
     start(ctx._GLOBAL_OFFSET_TABLE_, ctx.got);
 
   // _TLS_MODULE_BASE_
-  if constexpr (E::supports_tlsdesc) {
+  if (ctx._TLS_MODULE_BASE_) {
     // _TLS_MODULE_BASE_ is used for Local Dynamic model for TLSDESC.
     // I believe GCC and Clang don't create a reference to it, but Intel
     // compiler seems to be using this symbol.
@@ -1565,10 +1578,7 @@ void fix_synthetic_symbols(Context<E> &ctx) {
     // DTPOFF's relaxed value.
     u64 addr;
     if constexpr (std::is_same_v<E, X86_64> || std::is_same_v<E, I386>) {
-      if (ctx.arg.relax && !ctx.arg.shared)
-        addr = ctx.tls_end;
-      else
-        addr = ctx.tls_begin;
+      addr = (ctx.arg.relax && !ctx.arg.shared) ? ctx.tls_end : ctx.tls_begin;
     } else {
       addr = ctx.tls_begin;
     }
@@ -1581,18 +1591,16 @@ void fix_synthetic_symbols(Context<E> &ctx) {
   start(ctx.__GNU_EH_FRAME_HDR, ctx.eh_frame_hdr);
 
   // RISC-V's __global_pointer$
-  if constexpr (std::is_same_v<E, RISCV64> || std::is_same_v<E, RISCV32>) {
-    if (!ctx.arg.shared) {
-      if (Chunk<E> *chunk = find(".sdata"))
-        ctx.__global_pointer->shndx = -chunk->shndx;
-      else
-        ctx.__global_pointer->shndx = -1;
-      ctx.__global_pointer->value = 0x800;
-    }
+  if (ctx.__global_pointer) {
+    if (Chunk<E> *chunk = find(".sdata"))
+      ctx.__global_pointer->shndx = -chunk->shndx;
+    else
+      ctx.__global_pointer->shndx = -1;
+    ctx.__global_pointer->value = 0x800;
   }
 
   // ARM32's __exidx_{start,end}
-  if constexpr (std::is_same_v<E, ARM32>) {
+  if (ctx.__exidx_start) {
     if (Chunk<E> *chunk = find(".ARM.exidx")) {
       start(ctx.__exidx_start, chunk);
       stop(ctx.__exidx_end, chunk);
@@ -1656,7 +1664,7 @@ i64 compress_debug_sections(Context<E> &ctx) {
       comp = new GnuCompressedSection<E>(ctx, chunk);
     assert(comp);
 
-    ctx.output_chunks.emplace_back(comp);
+    ctx.chunk_pool.emplace_back(comp);
     ctx.chunks[i] = comp;
   });
 
@@ -1727,7 +1735,7 @@ void write_dependency_file(Context<E> &ctx) {
   template void apply_version_script(Context<E> &);                     \
   template void parse_symbol_version(Context<E> &);                     \
   template void compute_import_export(Context<E> &);                    \
-  template void mark_addrsig(Context<E> &);                                   \
+  template void mark_addrsig(Context<E> &);                             \
   template void clear_padding(Context<E> &);                            \
   template i64 get_section_rank(Context<E> &, Chunk<E> *);              \
   template i64 set_osec_offsets(Context<E> &);                          \

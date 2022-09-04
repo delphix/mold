@@ -1,4 +1,4 @@
-VERSION = 1.4.1
+VERSION = 1.4.2
 
 PREFIX = /usr/local
 BINDIR = $(PREFIX)/bin
@@ -49,7 +49,11 @@ MOLD_CXXFLAGS := -std=c++20 -fno-exceptions -fno-unwind-tables \
                  -fno-asynchronous-unwind-tables \
                  -DMOLD_VERSION=\"$(VERSION)\" -DLIBDIR="\"$(LIBDIR)\""
 
-MOLD_LDFLAGS := -pthread -lz -lm -ldl
+ifeq ($(OS), OpenBSD)
+  MOLD_LDFLAGS := -pthread -lz -lm
+else
+  MOLD_LDFLAGS := -pthread -lz -lm -ldl
+endif
 
 LTO = 0
 ifeq ($(LTO), 1)
@@ -127,7 +131,7 @@ all: mold mold-wrapper.so
 -include $(SRCS:%.cc=out/%.d)
 
 out/git-hash.cc: FORCE
-	./update-git-hash.py . out/git-hash.cc
+	cmake -DSOURCE_DIR=. -DOUTPUT_FILE=out/git-hash.cc -P update-git-hash.cmake
 
 FORCE:
 
@@ -220,12 +224,7 @@ ifneq ($(OS), Darwin)
 endif
 
 	$(INSTALL) -d $D$(LIBEXECDIR)/mold
-
-# We want to make a symblink with a relative path, so that users can
-# move the entire directory to other place without breaking the reference.
-# GNU ln supports `--relative` to do that, but that's not supported by
-# non-GNU systems. So we use Python to compute a relative path.
-	ln -sf `python3 -c "import os.path; print(os.path.relpath('$(BINDIR)/mold', '$(LIBEXECDIR)/mold'))"` $D$(LIBEXECDIR)/mold/ld
+	cmake -DSOURCE=$D$(BINDIR)/mold -DDEST=$D$(LIBEXECDIR)/mold/ld -P create-symlink.cmake
 
 	$(INSTALL) -d $D$(MANDIR)/man1
 	$(INSTALL_DATA) docs/mold.1 $D$(MANDIR)/man1

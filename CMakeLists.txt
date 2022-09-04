@@ -1,14 +1,7 @@
 cmake_minimum_required(VERSION 3.18)
-project(mold VERSION 1.4.1)
+project(mold VERSION 1.4.2)
 
 include(CMakeDependentOption)
-
-# FIXME: this is for parity with the makefiles that install directly to
-# <prefix>/lib
-#
-# NOTE: defining this before including GNUInstallDirs makes its platform
-# detection a noop
-set(CMAKE_INSTALL_LIBDIR lib CACHE PATH "")
 include(GNUInstallDirs)
 
 # Add -fuse-ld=mold if accepted by the compiler.
@@ -25,7 +18,7 @@ add_executable(mold)
 target_compile_features(mold PRIVATE cxx_std_20)
 target_link_libraries(mold PRIVATE ${CMAKE_DL_LIBS})
 
-if("${CMAKE_CXX_COMPILER_FRONTEND_VARIANT}" STRLESS "MSVC")
+if(NOT "${CMAKE_CXX_COMPILER_FRONTEND_VARIANT}" STREQUAL "MSVC")
   target_compile_options(mold PRIVATE
     -fno-exceptions
     -fno-unwind-tables
@@ -79,8 +72,8 @@ cmake_dependent_option(
 if(MOLD_USE_MIMALLOC)
   if(MOLD_USE_SYSTEM_MIMALLOC)
     find_package(mimalloc REQUIRED)
-    target_compile_definitions(mimalloc INTERFACE USE_SYSTEM_MIMALLOC)
     target_link_libraries(mold PRIVATE mimalloc)
+    target_compile_definitions(mold PRIVATE USE_SYSTEM_MIMALLOC)
   else()
     function(mold_add_mimalloc)
       set(MI_BUILD_STATIC ON)
@@ -126,7 +119,7 @@ if(WIN32)
   if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     message(FATAL_ERROR
       "Your compiler is not supported; install Clang from Visual Studio Installer and re-run cmake with '-T clangcl'")
-   endif()
+  endif()
 
   target_compile_definitions(mold PRIVATE NOGDI NOMINMAX)
 
@@ -156,29 +149,28 @@ if(NOT APPLE AND NOT WIN32)
   target_sources(mold-wrapper PRIVATE elf/mold-wrapper.c)
 endif()
 
-if(NOT APPLE AND NOT MOLD_MOSTLY_STATIC AND NOT WIN32)
+if(NOT APPLE AND NOT WIN32 AND NOT MOLD_MOSTLY_STATIC)
   find_package(OpenSSL REQUIRED COMPONENTS Crypto)
   target_link_libraries(mold PRIVATE OpenSSL::Crypto)
 endif()
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES riscv64
-    OR CMAKE_SYSTEM_PROCESSOR MATCHES armv6)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(riscv64|armv)")
   target_link_libraries(mold PRIVATE atomic)
 endif()
 
 set_property(SOURCE main.cc elf/lto-unix.cc macho/output-chunks.cc APPEND PROPERTY
   COMPILE_DEFINITIONS "MOLD_VERSION=\"${CMAKE_PROJECT_VERSION}\"")
 
-find_package(Python3 REQUIRED)
-
-add_custom_target(UpdateGitHash
-  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/update-git-hash.py
-    ${CMAKE_SOURCE_DIR} git-hash.cc
-  DEPENDS update-git-hash.py
+add_custom_target(git_hash
+  COMMAND ${CMAKE_COMMAND}
+    -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+    -DOUTPUT_FILE=${CMAKE_BINARY_DIR}/git-hash.cc
+    -P ${CMAKE_SOURCE_DIR}/update-git-hash.cmake
+  DEPENDS update-git-hash.cmake
   BYPRODUCTS git-hash.cc
   VERBATIM)
 
-add_dependencies(mold UpdateGitHash)
+add_dependencies(mold git_hash)
 
 target_sources(mold PRIVATE
   compress.cc
@@ -200,6 +192,7 @@ target_sources(mold PRIVATE
   elf/output-chunks.cc
   elf/passes.cc
   elf/relocatable.cc
+  elf/thunks.cc
   filepath.cc
   git-hash.cc
   glob.cc
@@ -233,6 +226,7 @@ if(BUILD_TESTING)
       TARGET mold POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E create_symlink mold ld
       COMMAND ${CMAKE_COMMAND} -E create_symlink mold ld64
+      BYPRODUCTS ld ld64
       WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
       VERBATIM)
   endif()
@@ -249,16 +243,17 @@ if(NOT CMAKE_SKIP_INSTALL_RULES)
   install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
   install(FILES docs/mold.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1/)
   install(CODE "
-        file(RELATIVE_PATH RELPATH
-             /${CMAKE_INSTALL_LIBEXECDIR}/mold /${CMAKE_INSTALL_BINDIR}/mold)
-        execute_process(COMMAND ${CMAKE_COMMAND} -E make_directory
-            \${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBEXECDIR}/mold)
-        execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink \${RELPATH}
-            \${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBEXECDIR}/mold/ld)
-        execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink mold
-            \${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/ld.mold)
-        execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink mold
-            \${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/ld64.mold)
-        execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink mold.1
-            \${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_MANDIR}/man1/ld.mold.1)")
+    set(DEST \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}\")
+    file(RELATIVE_PATH RELPATH
+       /${CMAKE_INSTALL_LIBEXECDIR}/mold /${CMAKE_INSTALL_BINDIR}/mold)
+    execute_process(COMMAND ${CMAKE_COMMAND} -E make_directory
+      \${DEST}/${CMAKE_INSTALL_LIBEXECDIR}/mold)
+    execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink \${RELPATH}
+      \${DEST}/${CMAKE_INSTALL_LIBEXECDIR}/mold/ld)
+    execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink mold
+      \${DEST}/${CMAKE_INSTALL_BINDIR}/ld.mold)
+    execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink mold
+      \${DEST}/${CMAKE_INSTALL_BINDIR}/ld64.mold)
+    execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink mold.1
+      \${DEST}/${CMAKE_INSTALL_MANDIR}/man1/ld.mold.1)")
 endif()

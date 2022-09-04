@@ -61,7 +61,7 @@ necessary packages. You may want to run it as root.
 ```shell
 git clone https://github.com/rui314/mold.git
 cd mold
-git checkout v1.4.1
+git checkout v1.4.2
 make -j$(nproc) CXX=clang++
 sudo make install
 ```
@@ -117,7 +117,7 @@ take an absolute path as an argument for `-fuse-ld` though.
 
 Create `.cargo/config.toml` in your project directory with the following:
 
-```
+```toml
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=/path/to/mold"]
@@ -128,6 +128,19 @@ Please make sure you have installed `clang`.
 
 If you want to use mold for all projects, put the above snippet to
 `~/.cargo/config.toml`.
+
+If you are using macOS, you can modify `config.toml` in a similar manner.
+Here is an example with `mold` installed via [Homebrew](https://brew.sh).
+
+```toml
+[target.x86_64-apple-darwin]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.aarch64-apple-darwin]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+```
 
 </details>
 

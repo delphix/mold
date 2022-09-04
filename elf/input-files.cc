@@ -4,7 +4,7 @@
 #include <regex>
 
 #ifndef _WIN32
-#include <unistd.h>
+# include <unistd.h>
 #endif
 
 namespace mold::elf {
@@ -111,7 +111,7 @@ u32 ObjectFile<E>::read_note_gnu_property(Context<E> &ctx,
     data = data.substr(align_to(hdr.n_namesz, 4));
 
     std::string_view desc = data.substr(0, hdr.n_descsz);
-    data = data.substr(align_to(hdr.n_descsz, E::word_size));
+    data = data.substr(align_to(hdr.n_descsz, sizeof(Word<E>)));
 
     if (hdr.n_type != NT_GNU_PROPERTY_TYPE_0 || name != "GNU")
       continue;
@@ -122,7 +122,7 @@ u32 ObjectFile<E>::read_note_gnu_property(Context<E> &ctx,
       desc = desc.substr(8);
       if (type == GNU_PROPERTY_X86_FEATURE_1_AND)
         ret |= *(ul32 *)desc.data();
-      desc = desc.substr(align_to(size, E::word_size));
+      desc = desc.substr(align_to(size, sizeof(Word<E>)));
     }
   }
   return ret;
@@ -221,10 +221,8 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
       this->sections[i] = std::make_unique<InputSection<E>>(ctx, *this, name, i);
 
       // Save .llvm_addrsig for --icf=safe.
-      if (shdr.sh_type == SHT_LLVM_ADDRSIG) {
-        if (ctx.arg.icf && !ctx.arg.icf_all)
-          llvm_addrsig = this->sections[i].get();
-      }
+      if (shdr.sh_type == SHT_LLVM_ADDRSIG)
+        llvm_addrsig = this->sections[i].get();
 
       // Save debug sections for --gdb-index.
       if (ctx.arg.gdb_index) {
@@ -271,7 +269,7 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
   // Attach relocation sections to their target sections.
   for (i64 i = 0; i < this->elf_sections.size(); i++) {
     const ElfShdr<E> &shdr = this->elf_sections[i];
-    if (shdr.sh_type != (E::is_rel ? SHT_REL : SHT_RELA))
+    if (shdr.sh_type != (is_rela<E> ? SHT_RELA : SHT_REL))
       continue;
 
     if (shdr.sh_info >= sections.size())
@@ -411,7 +409,7 @@ template <typename E>
 static Symbol<E> *insert_symbol(Context<E> &ctx, const ElfSym<E> &esym,
                                 std::string_view key, std::string_view name) {
   if (esym.is_undef() && name.starts_with("__real_") &&
-      ctx.arg.wrap.count(name.substr(7))) {
+      ctx.arg.wrap.contains(name.substr(7))) {
     return get_symbol(ctx, key.substr(7), name.substr(7));
   }
 
@@ -501,7 +499,7 @@ void ObjectFile<E>::initialize_symbols(Context<E> &ctx) {
 // We expect them to be sorted, so sort them if necessary.
 template <typename E>
 void ObjectFile<E>::sort_relocations(Context<E> &ctx) {
-  if constexpr (std::is_same_v<E, RISCV64> || std::is_same_v<E, RISCV32>) {
+  if constexpr (is_riscv<E>) {
     auto less = [&](const ElfRel<E> &a, const ElfRel<E> &b) {
       return a.r_offset < b.r_offset;
     };
@@ -753,7 +751,7 @@ void ObjectFile<E>::register_section_pieces(Context<E> &ctx) {
 }
 
 template <typename E>
-void ObjectFile<E>::fill_addrsig(Context<E> &ctx) {
+void ObjectFile<E>::mark_addrsig(Context<E> &ctx) {
   // Parse a .llvm_addrsig section.
   if (llvm_addrsig) {
     u8 *cur = (u8 *)llvm_addrsig->contents.data();
@@ -770,12 +768,12 @@ void ObjectFile<E>::fill_addrsig(Context<E> &ctx) {
   // We treat a symbol's address as significant if
   //
   // 1. we have no address significance information for the symbol, or
-  // 2. the symbol could be referenced from the outside in an address-
+  // 2. the symbol can be referenced from the outside in an address-
   //    significant manner.
   for (Symbol<E> *sym : this->symbols)
     if (sym->file == this)
       if (InputSection<E> *isec = sym->get_input_section())
-        if (!llvm_addrsig || sym->is_imported || sym->is_exported)
+        if (!llvm_addrsig || sym->is_exported)
           isec->address_significant = true;
 }
 
@@ -1185,9 +1183,9 @@ static bool should_write_to_local_symtab(Context<E> &ctx, Symbol<E> &sym) {
     return false;
 
   // Local symbols are discarded if --discard-local is given or they
-  // are not in a mergeable section. I *believe* we exclude symbols in
-  // mergeable sections because (1) they are too many and (2) they are
-  // merged, so their origins shouldn't matter, but I dont' really
+  // are in a mergeable section. I *believe* we exclude symbols in
+  // mergeable sections because (1) there are too many and (2) they are
+  // merged, so their origins shouldn't matter, but I don't really
   // know the rationale. Anyway, this is the behavior of the
   // traditional linkers.
   if (sym.name().starts_with(".L")) {
@@ -1250,7 +1248,7 @@ void ObjectFile<E>::compute_symtab(Context<E> &ctx) {
 }
 
 template <typename E>
-void ObjectFile<E>::export_to_symtab(Context<E> &ctx) {
+void ObjectFile<E>::populate_symtab(Context<E> &ctx) {
   ElfSym<E> *symtab_base = (ElfSym<E> *)(ctx.buf + ctx.symtab->shdr.sh_offset);
 
   u8 *strtab_base = ctx.buf + ctx.strtab->shdr.sh_offset;
@@ -1258,9 +1256,8 @@ void ObjectFile<E>::export_to_symtab(Context<E> &ctx) {
 
   auto write_sym = [&](Symbol<E> &sym, i64 &symtab_idx) {
     ElfSym<E> &esym = symtab_base[symtab_idx++];
-
-    get_output_esym(ctx, sym, strtab_off, esym);
-
+    esym = to_output_esym(ctx, sym);
+    esym.st_name = strtab_off;
     write_string(strtab_base + strtab_off, sym.name());
     strtab_off += sym.name().size() + 1;
   };
@@ -1382,6 +1379,36 @@ void SharedFile<E>::parse(Context<E> &ctx) {
   counter += this->elf_syms.size();
 }
 
+// Symbol versioning is a GNU extension to the ELF file format. I don't
+// particularly like the feature as it complicates the semantics of
+// dynamic linking, but we need to support it anyway because it is
+// mandatory on glibc-based systems such as most Linux distros.
+//
+// Let me explain what symbol versioning is. Symbol versioning is a
+// mechanism to allow multiple symbols of the same name but of different
+// versions live together in a shared object file. It's convenient if you
+// want to make an API-breaking change to some function but want to keep
+// old programs working with the newer libraries.
+//
+// With symbol versioning, dynamic symbols are resolved by (name, version)
+// tuple instead of just by name. For example, glibc 2.35 defines two
+// different versions of `posix_spawn`, `posix_spawn` of version
+// "GLIBC_2.15" and that of version "GLIBC_2.2.5". Any executable that
+// uses `posix_spawn` is linked either to that of "GLIBC_2.15" or that of
+// "GLIBC_2.2.5"
+//
+// Versions are just stirngs, and no ordering is defined between them.
+// For example, "GLIBC_2.15" is not considered a newer version of
+// "GLIBC_2.2.5" or vice versa. They are considered just different.
+//
+// If a shared object file has versioned symbols, it contains a parallel
+// array for the symbol table. Version strings can be found in that
+// parallel table.
+//
+// One version is considered the "default" version for each shared object.
+// If an undefiend symbol `foo` is resolved to a symbol defined by the
+// shared object, it's marked so that it'll be resolved to (`foo`, the
+// default version of the library) at load-time.
 template <typename E>
 std::vector<std::string_view> SharedFile<E>::read_verdef(Context<E> &ctx) {
   std::vector<std::string_view> ret(VER_NDX_LAST_RESERVED + 1);
@@ -1496,7 +1523,7 @@ void SharedFile<E>::compute_symtab(Context<E> &ctx) {
 }
 
 template <typename E>
-void SharedFile<E>::export_to_symtab(Context<E> &ctx) {
+void SharedFile<E>::populate_symtab(Context<E> &ctx) {
   ElfSym<E> *symtab =
     (ElfSym<E> *)(ctx.buf + ctx.symtab->shdr.sh_offset) + this->global_symtab_idx;
 

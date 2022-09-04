@@ -144,7 +144,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 #define S   (frag_ref ? frag_ref->frag->get_addr(ctx) : sym.get_addr(ctx))
 #define A   (frag_ref ? frag_ref->addend : this->get_addend(rel))
 #define P   (output_section->shdr.sh_addr + offset + rel.r_offset)
-#define G   (sym.get_got_addr(ctx) - ctx.got->shdr.sh_addr)
+#define G   (sym.get_got_idx(ctx) * sizeof(Word<E>))
 #define GOT ctx.got->shdr.sh_addr
 
     switch (rel.r_type) {
@@ -161,37 +161,21 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       continue;
     }
     case R_386_32:
-      if (sym.is_absolute() || !ctx.arg.pic) {
-        *(ul32 *)loc = S + A;
-      } else if (sym.is_imported) {
-        *dynrel++ = ElfRel<E>(P, R_386_32, sym.get_dynsym_idx(ctx));
-        *(ul32 *)loc = A;
-      } else {
-        if (!is_relr_reloc(ctx, rel))
-          *dynrel++ = ElfRel<E>(P, R_386_RELATIVE, 0);
-        *(ul32 *)loc = S + A;
-      }
+      apply_abs_dyn_rel(ctx, sym, rel, loc, S, A, P, dynrel);
       continue;
     case R_386_PC8: {
-      i64 val = S + A;
+      i64 val = S + A - P;
       overflow_check(val, -(1 << 7), 1 << 7);
       *loc = val;
       continue;
     };
     case R_386_PC16: {
-      i64 val = S + A;
+      i64 val = S + A - P;
       overflow_check(val, -(1 << 15), 1 << 15);
       *(ul16 *)loc = val;
       continue;
     }
     case R_386_PC32:
-      if (sym.is_absolute() || !sym.is_imported || !ctx.arg.shared) {
-        *(ul32 *)loc = S + A - P;
-      } else {
-        *dynrel++ = ElfRel<E>(P, R_386_32, sym.get_dynsym_idx(ctx));
-        *(ul32 *)loc = A;
-      }
-      continue;
     case R_386_PLT32:
       *(ul32 *)loc = S + A - P;
       continue;
@@ -345,7 +329,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
 
 #define S   (frag ? frag->get_addr(ctx) : sym.get_addr(ctx))
 #define A   (frag ? addend : this->get_addend(rel))
-#define G   (sym.get_got_addr(ctx) - ctx.got->shdr.sh_addr)
+#define G   (sym.get_got_idx(ctx) * sizeof(Word<E>))
 #define GOT ctx.got->shdr.sh_addr
 
     switch (rel.r_type) {
@@ -430,69 +414,31 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       continue;
     }
 
-    if (sym.get_type() == STT_GNU_IFUNC) {
-      sym.flags |= NEEDS_GOT;
-      sym.flags |= NEEDS_PLT;
-    }
+    if (sym.get_type() == STT_GNU_IFUNC)
+      sym.flags |= (NEEDS_GOT | NEEDS_PLT);
 
     switch (rel.r_type) {
     case R_386_8:
-    case R_386_16: {
-      Action table[][4] = {
-        // Absolute  Local  Imported data  Imported code
-        {  NONE,     ERROR, ERROR,         ERROR },      // DSO
-        {  NONE,     ERROR, ERROR,         ERROR },      // PIE
-        {  NONE,     NONE,  COPYREL,       CPLT  },      // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
+    case R_386_16:
+      scan_abs_rel(ctx, sym, rel);
       break;
-    }
-    case R_386_32: {
-      Action table[][4] = {
-        // Absolute  Local    Imported data  Imported code
-        {  NONE,     BASEREL, DYNREL,        DYNREL },     // DSO
-        {  NONE,     BASEREL, DYNREL,        DYNREL },     // PIE
-        {  NONE,     NONE,    COPYREL,       CPLT   },     // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
+    case R_386_32:
+      scan_abs_dyn_rel(ctx, sym, rel);
       break;
-    }
     case R_386_PC8:
-    case R_386_PC16: {
-      Action table[][4] = {
-        // Absolute  Local  Imported data  Imported code
-        {  ERROR,    NONE,  ERROR,         ERROR },      // DSO
-        {  ERROR,    NONE,  COPYREL,       PLT   },      // PIE
-        {  NONE,     NONE,  COPYREL,       PLT   },      // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
+    case R_386_PC16:
+    case R_386_PC32:
+      scan_pcrel_rel(ctx, sym, rel);
       break;
-    }
-    case R_386_PC32: {
-      Action table[][4] = {
-        // Absolute  Local  Imported data  Imported code
-        {  ERROR,    NONE,  DYNREL,        DYNREL },     // DSO
-        {  ERROR,    NONE,  COPYREL,       PLT    },     // PIE
-        {  NONE,     NONE,  COPYREL,       PLT    },     // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
-      break;
-    }
     case R_386_GOT32:
     case R_386_GOT32X:
     case R_386_GOTPC:
       sym.flags |= NEEDS_GOT;
       break;
-    case R_386_PLT32: {
-      Action table[][4] = {
-        // Absolute  Local  Imported data  Imported code
-        {  NONE,     NONE,  PLT,           PLT    },     // DSO
-        {  NONE,     NONE,  PLT,           PLT    },     // PIE
-        {  NONE,     NONE,  PLT,           PLT    },     // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
+    case R_386_PLT32:
+      if (sym.is_imported)
+        sym.flags |= NEEDS_PLT;
       break;
-    }
     case R_386_TLS_GOTIE:
     case R_386_TLS_LE:
     case R_386_TLS_IE:

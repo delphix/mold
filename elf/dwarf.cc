@@ -1,3 +1,54 @@
+// This file contains code to read DWARF debug info to create .gdb_index.
+//
+// .gdb_index is an optional section to speed up GNU debugger. It contains
+// two maps: 1) a map from function/variable/type names to compunits, and
+// 2) a map from function address ranges to compunits. gdb uses these
+// maps to quickly find a compunit given a name or an instruction pointer.
+//
+// (Terminology: a compilation unit, which often abbreviated as compunit
+// or cu, is a unit of debug info. An input .debug_info section usually
+// contains one compunit, and thus an output .debug_info contains as
+// many compunits as the number of input files.)
+//
+// .gdb_index is not mandatory. All the information in .gdb_index is
+// also in other debug info sections. You can actually create an
+// executable without .gdb_index and later add it using `gdb-add-index`
+// post-processing tool that comes with gdb.
+//
+// The mapping from names to compunits is 1:n while the mapping from
+// address ranges to compunits is 1:1. That is, two object files may
+// define the same type name (with the same definition), while there
+// should be no two functions that overlap with each other in memory.
+//
+// .gdb_index contains an on-disk hash table for names, so gdb can
+// lookup names without loading all strings into memory and construct an
+// in-memory hash table.
+//
+// Names are in .debug_gnu_pubnames and .debug_gnu_pubtypes input
+// sections. These sections are created if `-ggnu-pubnames` is given.
+// Besides names, these sections contains attributes for each name so
+// that gdb can distinguish type names from function names, for example.
+//
+// A compunit contains one or more function address ranges. If an
+// object file is compiled without -ffunction-sections, it contains
+// only one .text section and therefore contains a single address range.
+// Such range is typically stored directly to the compunit.
+//
+// If an object file is compiled with -fucntion-sections, it contains
+// more than one .text section, and it has as many address ranges as
+// the number of .text sections. Such discontiguous address ranges are
+// stored to .debug_ranges in DWARF 2/3/4/5 and
+// .debug_rnglists/.debug_addr in DWARF 5.
+//
+// .debug_info section contains DWARF debug info. Although we don't need
+// to parse the whole .debug_info section to read address ranges, we
+// have to do a little bit. DWARF is complicated and often handled using
+// a library such as libdwarf. But we don't use any library because we
+// don't want to add an extra run-time dependency just for --gdb-index.
+//
+// This page explains the format of .gdb_index:
+// https://sourceware.org/gdb/onlinedocs/gdb/Index-Section-Format.html
+
 #include "mold.h"
 
 namespace mold::elf {
@@ -134,14 +185,14 @@ find_compunit(Context<E> &ctx, ObjectFile<E> &file, i64 offset) {
   case 3:
   case 4:
     abbrev_offset = *(ul32 *)(cu + 6);
-    if (u32 address_size = cu[10]; address_size != E::word_size)
+    if (u32 address_size = cu[10]; address_size != sizeof(Word<E>))
       Fatal(ctx) << file << ": --gdb-index: unsupported address size "
                  << address_size;
     cu += 11;
     break;
   case 5: {
     abbrev_offset = *(ul32 *)(cu + 8);
-    if (u32 address_size = cu[7]; address_size != E::word_size)
+    if (u32 address_size = cu[7]; address_size != sizeof(Word<E>))
       Fatal(ctx) << file << ": --gdb-index: unsupported address size "
                  << address_size;
 
@@ -216,7 +267,7 @@ i64 estimate_address_areas(Context<E> &ctx, ObjectFile<E> &file) {
   // .debug_ranges contains a vector of [begin, end) address pairs.
   // The last entry must be a null terminator, so we do -1.
   if (file.debug_ranges)
-    ret += file.debug_ranges->sh_size / E::word_size / 2 - 1;
+    ret += file.debug_ranges->sh_size / sizeof(Word<E>) / 2 - 1;
 
   // In DWARF 5, a CU can refer address ranges in .debug_rnglists, which
   // contains variable-length entries. The smallest possible range entry
@@ -287,8 +338,8 @@ inline u64 DebugInfoReader<E>::read(u64 form) {
   }
   case DW_FORM_addr:
   case DW_FORM_ref_addr: {
-    u64 val = *(typename E::WordTy *)cu;
-    cu += E::word_size;
+    u64 val = *(Word<E> *)cu;
+    cu += sizeof(Word<E>);
     return val;
   }
   case DW_FORM_strx:
@@ -312,7 +363,7 @@ inline u64 DebugInfoReader<E>::read(u64 form) {
 // (until an end of list entry).
 template <typename E>
 static std::vector<u64>
-read_debug_range(Context<E> &ctx, ObjectFile<E> &file, typename E::WordTy *range) {
+read_debug_range(Context<E> &ctx, ObjectFile<E> &file, Word<E> *range) {
   std::vector<u64> vec;
   u64 base = 0;
 
@@ -333,7 +384,7 @@ read_debug_range(Context<E> &ctx, ObjectFile<E> &file, typename E::WordTy *range
 template <typename E>
 static std::vector<u64>
 read_rnglist_range(Context<E> &ctx, ObjectFile<E> &file, u8 *rnglist,
-                   typename E::WordTy *addrx) {
+                   Word<E> *addrx) {
   std::vector<u64> vec;
   u64 base = 0;
 
@@ -357,18 +408,18 @@ read_rnglist_range(Context<E> &ctx, ObjectFile<E> &file, u8 *rnglist,
       vec.push_back(base + read_uleb(rnglist));
       break;
     case DW_RLE_base_address:
-      base = *(typename E::WordTy *)rnglist;
-      rnglist += E::word_size;
+      base = *(Word<E> *)rnglist;
+      rnglist += sizeof(Word<E>);
       break;
     case DW_RLE_start_end:
-      vec.push_back(*(typename E::WordTy *)rnglist);
-      rnglist += E::word_size;
-      vec.push_back(*(typename E::WordTy *)rnglist);
-      rnglist += E::word_size;
+      vec.push_back(*(Word<E> *)rnglist);
+      rnglist += sizeof(Word<E>);
+      vec.push_back(*(Word<E> *)rnglist);
+      rnglist += sizeof(Word<E>);
       break;
     case DW_RLE_start_length:
-      vec.push_back(*(typename E::WordTy *)rnglist);
-      rnglist += E::word_size;
+      vec.push_back(*(Word<E> *)rnglist);
+      rnglist += sizeof(Word<E>);
       vec.push_back(vec.back() + read_uleb(rnglist));
       break;
     }
@@ -402,7 +453,7 @@ read_address_areas(Context<E> &ctx, ObjectFile<E> &file, i64 offset) {
   Record high_pc;
   Record ranges;
   std::optional<u64> rnglists_base;
-  typename E::WordTy *addrx = nullptr;
+  Word<E> *addrx = nullptr;
 
   // Read all interesting debug records.
   for (;;) {
@@ -424,7 +475,7 @@ read_address_areas(Context<E> &ctx, ObjectFile<E> &file, i64 offset) {
       rnglists_base = val;
       break;
     case DW_AT_addr_base:
-      addrx = (typename E::WordTy *)(get_buffer(ctx, ctx.debug_addr) + val);
+      addrx = (Word<E> *)(get_buffer(ctx, ctx.debug_addr) + val);
       break;
     case DW_AT_ranges:
       ranges = {form, val};
@@ -435,8 +486,8 @@ read_address_areas(Context<E> &ctx, ObjectFile<E> &file, i64 offset) {
   // Handle non-contiguous address ranges.
   if (ranges.form) {
     if (dwarf_version <= 4) {
-       typename E::WordTy *range_begin =
-        (typename E::WordTy *)(get_buffer(ctx, ctx.debug_ranges) + ranges.value);
+       Word<E> *range_begin =
+        (Word<E> *)(get_buffer(ctx, ctx.debug_ranges) + ranges.value);
       return read_debug_range(ctx, file, range_begin);
     }
 

@@ -58,7 +58,7 @@ InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file,
   // early for REL-type ELF types to read relocation addends from
   // section contents. For RELA-type, we don't need to do this because
   // addends are in relocations.
-  if (E::is_rel)
+  if constexpr (!is_rela<E>)
     uncompress(ctx);
 
   output_section =
@@ -112,43 +112,30 @@ void InputSection<E>::uncompress_to(Context<E> &ctx, u8 *buf) {
   do_uncompress(contents.substr(sizeof(ElfChdr<E>)));
 }
 
-template <typename E>
-static i64 get_output_type(Context<E> &ctx) {
-  if (ctx.arg.shared)
-    return 0;
-  if (ctx.arg.pie)
-    return 1;
-  return 2;
-}
+typedef enum { NONE, ERROR, COPYREL, PLT, CPLT, DYNREL, BASEREL } Action;
 
 template <typename E>
-static i64 get_sym_type(Symbol<E> &sym) {
-  if (sym.is_absolute())
-    return 0;
-  if (!sym.is_imported)
-    return 1;
-  if (sym.get_type() != STT_FUNC)
-    return 2;
-  return 3;
-}
-
-template <typename E>
-void InputSection<E>::dispatch(Context<E> &ctx, Action table[3][4], i64 i,
-                               const ElfRel<E> &rel, Symbol<E> &sym) {
-  Action action = table[get_output_type(ctx)][get_sym_type(sym)];
-  bool is_writable = (shdr().sh_flags & SHF_WRITE);
-
+static void
+dispatch(Context<E> &ctx, InputSection<E> &isec, Action action,
+         Symbol<E> &sym, const ElfRel<E> &rel) {
   auto error = [&] {
     std::string msg = sym.is_absolute() ? "-fno-PIC" : "-fPIC";
-    Error(ctx) << *this << ": " << rel << " relocation at offset 0x"
+    Error(ctx) << isec << ": " << rel << " relocation at offset 0x"
                << std::hex << rel.r_offset << " against symbol `"
                << sym << "' can not be used; recompile with " << msg;
   };
 
-  auto warn_textrel = [&] {
-    if (ctx.arg.warn_textrel)
-      Warn(ctx) << *this << ": relocation against symbol `" << sym
+  auto check_textrel = [&] {
+    if (isec.shdr().sh_flags & SHF_WRITE)
+      return;
+
+    if (ctx.arg.z_text) {
+      error();
+    } else if (ctx.arg.warn_textrel) {
+      Warn(ctx) << isec << ": relocation against symbol `" << sym
                 << "' in read-only section";
+    }
+    ctx.has_textrel = true;
   };
 
   switch (action) {
@@ -160,17 +147,11 @@ void InputSection<E>::dispatch(Context<E> &ctx, Action table[3][4], i64 i,
   case COPYREL:
     if (!ctx.arg.z_copyreloc) {
       error();
-      return;
-    }
-
-    if (sym.esym().st_visibility == STV_PROTECTED) {
-      Error(ctx) << *this
-                 << ": cannot make copy relocation for protected symbol '"
+    } else if (sym.esym().st_visibility == STV_PROTECTED) {
+      Error(ctx) << isec << ": cannot make copy relocation for protected symbol '"
                  << sym << "', defined in " << *sym.file
                  << "; recompile with -fPIC";
-      return;
     }
-
     sym.flags |= NEEDS_COPYREL;
     return;
   case PLT:
@@ -180,31 +161,118 @@ void InputSection<E>::dispatch(Context<E> &ctx, Action table[3][4], i64 i,
     sym.flags |= NEEDS_CPLT;
     return;
   case DYNREL:
-    if (!is_writable) {
-      if (ctx.arg.z_text) {
-        error();
-        return;
-      }
-      warn_textrel();
-      ctx.has_textrel = true;
-    }
-
     assert(sym.is_imported);
-    file.num_dynrel++;
+    check_textrel();
+    isec.file.num_dynrel++;
     return;
   case BASEREL:
-    if (!is_writable) {
-      if (ctx.arg.z_text) {
-        error();
-        return;
-      }
-      warn_textrel();
-      ctx.has_textrel = true;
-    }
-
-    if (!is_relr_reloc(ctx, rel))
-      file.num_dynrel++;
+    check_textrel();
+    if (!isec.is_relr_reloc(ctx, rel))
+      isec.file.num_dynrel++;
     return;
+  default:
+    unreachable();
+  }
+}
+
+template <typename E>
+static Action get_rel_action(Context<E> &ctx, const Action table[3][4],
+                             Symbol<E> &sym) {
+  auto get_output_type = [&] {
+    if (ctx.arg.shared)
+      return 0;
+    if (ctx.arg.pie)
+      return 1;
+    return 2;
+  };
+
+  auto get_sym_type = [&] {
+    if (sym.is_absolute())
+      return 0;
+    if (!sym.is_imported)
+      return 1;
+    if (sym.get_type() != STT_FUNC)
+      return 2;
+    return 3;
+  };
+
+  return table[get_output_type()][get_sym_type()];
+}
+
+template <typename E>
+void InputSection<E>::scan_abs_rel(Context<E> &ctx, Symbol<E> &sym,
+                                   const ElfRel<E> &rel) {
+  // This is a decision table for absolute relocations that is smaller
+  // than the word size (e.g. R_X86_64_32). Since the dynamic linker
+  // generally does not support dynamic relocations smaller than the
+  // word size, we need to report an error if a relocation cannot be
+  // resolved at link-time.
+  constexpr Action table[][4] = {
+    // Absolute  Local    Imported data  Imported code
+    {  NONE,     ERROR,   ERROR,         ERROR },  // Shared object
+    {  NONE,     ERROR,   ERROR,         ERROR },  // Position-independent exec
+    {  NONE,     NONE,    COPYREL,       CPLT  },  // Position-dependent exec
+  };
+  Action action = get_rel_action(ctx, table, sym);
+  dispatch(ctx, *this, action, sym, rel);
+}
+
+template <typename E>
+static Action get_abs_dyn_action(Context<E> &ctx, Symbol<E> &sym) {
+  // This is a decision table for absolute relocations for the word
+  // size data (e.g. R_X86_64_64). Unlike the above, we can emit a
+  // dynamic relocation if we cannot resolve its address at link-time.
+  constexpr Action table[][4] = {
+    // Absolute  Local    Imported data  Imported code
+    {  NONE,     BASEREL, DYNREL,        DYNREL },  // Shared object
+    {  NONE,     BASEREL, DYNREL,        DYNREL },  // Position-independent exec
+    {  NONE,     NONE,    COPYREL,       CPLT   },  // Position-dependent exec
+  };
+  return get_rel_action(ctx, table, sym);
+}
+
+template <typename E>
+void InputSection<E>::scan_abs_dyn_rel(Context<E> &ctx, Symbol<E> &sym,
+                                       const ElfRel<E> &rel) {
+  Action action = get_abs_dyn_action(ctx, sym);
+  dispatch(ctx, *this, action, sym, rel);
+}
+
+template <typename E>
+void InputSection<E>::scan_pcrel_rel(Context<E> &ctx, Symbol<E> &sym,
+                                     const ElfRel<E> &rel) {
+  // This is for PC-relative relocations (e.g. R_X86_64_PC32).
+  // We cannot promote them to dynamic relocations because the dynamic
+  // linker generally does not support PC-relative relocations.
+  constexpr Action table[][4] = {
+    // Absolute  Local    Imported data  Imported code
+    {  ERROR,    NONE,    ERROR,         PLT    },  // Shared object
+    {  ERROR,    NONE,    COPYREL,       PLT    },  // Position-independent exec
+    {  NONE,     NONE,    COPYREL,       CPLT   },  // Position-dependent exec
+  };
+  Action action = get_rel_action(ctx, table, sym);
+  dispatch(ctx, *this, action, sym, rel);
+}
+
+template <typename E>
+void InputSection<E>::apply_abs_dyn_rel(Context<E> &ctx, Symbol<E> &sym,
+                                        const ElfRel<E> &rel, u8 *loc,
+                                        u64 S, i64 A, u64 P, ElfRel<E> *&dynrel) {
+  switch (get_abs_dyn_action(ctx, sym)) {
+  case COPYREL:
+  case CPLT:
+  case NONE:
+    *(Word<E> *)loc = S + A;
+    break;
+  case BASEREL:
+    if (!is_relr_reloc(ctx, rel))
+      *dynrel++ = ElfRel<E>(P, E::R_RELATIVE, 0, S + A);
+    *(Word<E> *)loc = S + A;
+    break;
+  case DYNREL:
+    *dynrel++ = ElfRel<E>(P, E::R_ABS, sym.get_dynsym_idx(ctx), A);
+    *(Word<E> *)loc = A;
+    break;
   default:
     unreachable();
   }
@@ -216,7 +284,7 @@ void InputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
     return;
 
   // Copy data
-  if constexpr (std::is_same_v<E, RISCV64> || std::is_same_v<E, RISCV32>) {
+  if constexpr (is_riscv<E>) {
     copy_contents_riscv(ctx, buf);
   } else if (compressed) {
     uncompress_to(ctx, buf);

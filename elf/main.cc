@@ -68,13 +68,21 @@ static MachineType get_machine_type(Context<E> &ctx, MappedFile<Context<E>> *mf)
 }
 
 template <typename E>
+static void
+check_file_compatibility(Context<E> &ctx, MappedFile<Context<E>> *mf) {
+  MachineType mt = get_machine_type(ctx, mf);
+  if (mt != ctx.arg.emulation)
+    Fatal(ctx) << mf->name << ": incompatible file type: "
+               << ctx.arg.emulation << " is expected but got " << mt;
+}
+
+template <typename E>
 static ObjectFile<E> *new_object_file(Context<E> &ctx, MappedFile<Context<E>> *mf,
                                       std::string archive_name) {
-  if (get_machine_type(ctx, mf) != ctx.arg.emulation)
-    Fatal(ctx) << mf->name << ": incompatible file type";
-
   static Counter count("parsed_objs");
   count++;
+
+  check_file_compatibility(ctx, mf);
 
   bool in_lib = ctx.in_lib || (!archive_name.empty() && !ctx.whole_archive);
   ObjectFile<E> *file = ObjectFile<E>::create(ctx, mf, archive_name, in_lib);
@@ -108,8 +116,7 @@ static ObjectFile<E> *new_lto_obj(Context<E> &ctx, MappedFile<Context<E>> *mf,
 template <typename E>
 static SharedFile<E> *
 new_shared_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
-  if (get_machine_type(ctx, mf) != ctx.arg.emulation)
-    Fatal(ctx) << mf->name << ": incompatible file type";
+  check_file_compatibility(ctx, mf);
 
   SharedFile<E> *file = SharedFile<E>::create(ctx, mf);
   file->priority = ctx.file_priority++;
@@ -328,7 +335,7 @@ static void show_stats(Context<E> &ctx) {
   static Counter num_objs("num_objs", ctx.objs.size());
   static Counter num_dsos("num_dsos", ctx.dsos.size());
 
-  if constexpr (std::is_same_v<E, ARM64>) {
+  if constexpr (needs_thunk<E>) {
     static Counter num_thunks("num_thunks");
     for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections)
       for (std::unique_ptr<RangeExtensionThunk<E>> &thunk : osec->thunks)
@@ -635,7 +642,7 @@ static int elf_main(int argc, char **argv) {
   // that they can jump to anywhere in ±2 GiB by default. They may
   // be replaced with shorter instruction sequences if destinations
   // are close enough. Do this optimization.
-  if constexpr (std::is_same_v<E, RISCV64> || std::is_same_v<E, RISCV32>)
+  if constexpr (is_riscv<E>)
     filesize = riscv_resize_sections(ctx);
 
   // Fix linker-synthesized symbol addresses.
