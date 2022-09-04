@@ -8,7 +8,7 @@
 #include <tbb/parallel_sort.h>
 
 #ifndef _WIN32
-#include <sys/mman.h>
+# include <sys/mman.h>
 #endif
 
 namespace mold::macho {
@@ -647,7 +647,7 @@ void RebaseSection<E>::compute_size(Context<E> &ctx) {
 
   for (i64 i = 0; i < ctx.stubs.syms.size(); i++)
     enc.add(ctx.data_seg->seg_idx,
-            ctx.lazy_symbol_ptr.hdr.addr + i * E::word_size -
+            ctx.lazy_symbol_ptr.hdr.addr + i * word_size -
             ctx.data_seg->cmd.vmaddr);
 
   for (Symbol<E> *sym : ctx.got.syms)
@@ -671,7 +671,7 @@ void RebaseSection<E>::compute_size(Context<E> &ctx) {
 
   for (std::unique_ptr<OutputSegment<E>> &seg : ctx.segments)
     for (Chunk<E> *chunk : seg->chunks)
-      if (chunk->is_output_section && !chunk->hdr.match("__TEXT", "__eh_frame"))
+      if (chunk->is_output_section)
         for (Subsection<E> *subsec : ((OutputSection<E> *)chunk)->members)
           for (Relocation<E> &rel : subsec->get_rels())
             if (!rel.is_pcrel && !rel.is_subtracted && rel.type == E::abs_rel &&
@@ -701,7 +701,7 @@ static i32 get_dylib_idx(InputFile<E> *file) {
 }
 
 template <typename E>
-void BindEncoder::add(Symbol<E> &sym, i64 seg_idx, i64 offset) {
+void BindEncoder::add(Symbol<E> &sym, i64 seg_idx, i64 offset, i64 addend) {
   i64 dylib_idx = get_dylib_idx(sym.file);
   i64 flags = (sym.is_weak ? BIND_SYMBOL_FLAGS_WEAK_IMPORT : 0);
 
@@ -725,10 +725,15 @@ void BindEncoder::add(Symbol<E> &sym, i64 seg_idx, i64 offset) {
     buf.push_back('\0');
   }
 
-  if (last_seg != seg_idx || last_off != offset) {
+  if (last_seg != seg_idx || last_offset != offset) {
     assert(seg_idx < 16);
     buf.push_back(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | seg_idx);
     encode_uleb(buf, offset);
+  }
+
+  if (last_addend != addend) {
+    buf.push_back(BIND_OPCODE_SET_ADDEND_SLEB);
+    encode_sleb(buf, addend);
   }
 
   buf.push_back(BIND_OPCODE_DO_BIND);
@@ -737,7 +742,8 @@ void BindEncoder::add(Symbol<E> &sym, i64 seg_idx, i64 offset) {
   last_name = sym.name;
   last_flags = flags;
   last_seg = seg_idx;
-  last_off = offset;
+  last_offset = offset;
+  last_addend = addend;
 }
 
 void BindEncoder::finish() {
@@ -752,12 +758,12 @@ void BindSection<E>::compute_size(Context<E> &ctx) {
   for (Symbol<E> *sym : ctx.got.syms)
     if (sym->is_imported)
       enc.add(*sym, ctx.data_const_seg->seg_idx,
-              sym->get_got_addr(ctx) - ctx.data_const_seg->cmd.vmaddr);
+              sym->get_got_addr(ctx) - ctx.data_const_seg->cmd.vmaddr, 0);
 
   for (Symbol<E> *sym : ctx.thread_ptrs.syms)
     if (sym->is_imported)
       enc.add(*sym, ctx.data_seg->seg_idx,
-              sym->get_tlv_addr(ctx) - ctx.data_seg->cmd.vmaddr);
+              sym->get_tlv_addr(ctx) - ctx.data_seg->cmd.vmaddr, 0);
 
   for (std::unique_ptr<OutputSegment<E>> &seg : ctx.segments)
     for (Chunk<E> *chunk : seg->chunks)
@@ -766,7 +772,8 @@ void BindSection<E>::compute_size(Context<E> &ctx) {
           for (Relocation<E> &r : subsec->get_rels())
             if (r.needs_dynrel)
               enc.add(*r.sym, seg->seg_idx,
-                      subsec->get_addr(ctx) + r.offset - seg->cmd.vmaddr);
+                      subsec->get_addr(ctx) + r.offset - seg->cmd.vmaddr,
+                      r.addend);
 
   enc.finish();
   contents = std::move(enc.buf);
@@ -806,7 +813,7 @@ void LazyBindSection<E>::add(Context<E> &ctx, Symbol<E> &sym) {
   i64 seg_idx = ctx.data_seg->seg_idx;
   emit(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | seg_idx);
 
-  i64 offset = ctx.lazy_symbol_ptr.hdr.addr + sym.stub_idx * E::word_size -
+  i64 offset = ctx.lazy_symbol_ptr.hdr.addr + sym.stub_idx * word_size -
                ctx.data_seg->cmd.vmaddr;
   encode_uleb(contents, offset);
 
@@ -1398,7 +1405,7 @@ void StubsSection<E>::add(Context<E> &ctx, Symbol<E> *sym) {
 
   ctx.stub_helper.hdr.size =
     E::stub_helper_hdr_size + nsyms * E::stub_helper_size;
-  ctx.lazy_symbol_ptr.hdr.size = nsyms * E::word_size;
+  ctx.lazy_symbol_ptr.hdr.size = nsyms * word_size;
 }
 
 template <typename E>
@@ -1577,7 +1584,7 @@ void GotSection<E>::add(Context<E> &ctx, Symbol<E> *sym) {
   assert(sym->got_idx == -1);
   sym->got_idx = syms.size();
   syms.push_back(sym);
-  this->hdr.size = (syms.size() + subsections.size()) * E::word_size;
+  this->hdr.size = (syms.size() + subsections.size()) * word_size;
 }
 
 template <typename E>
@@ -1606,7 +1613,7 @@ void ThreadPtrsSection<E>::add(Context<E> &ctx, Symbol<E> *sym) {
   assert(sym->tlv_idx == -1);
   sym->tlv_idx = syms.size();
   syms.push_back(sym);
-  this->hdr.size = syms.size() * E::word_size;
+  this->hdr.size = syms.size() * word_size;
 }
 
 template <typename E>

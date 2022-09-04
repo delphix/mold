@@ -250,16 +250,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       write32s(S + A);
       continue;
     case R_X86_64_64:
-      if (sym.is_absolute() || !ctx.arg.pic) {
-        write64(S + A);
-      } else if (sym.is_imported) {
-        *dynrel++ = ElfRel<E>(P, R_X86_64_64, sym.get_dynsym_idx(ctx), A);
-        write64(A);
-      } else {
-        if (!is_relr_reloc(ctx, rel))
-          *dynrel++ = ElfRel<E>(P, R_X86_64_RELATIVE, 0, S + A);
-        write64(S + A);
-      }
+      apply_abs_dyn_rel(ctx, sym, rel, loc, S, A, P, dynrel);
       continue;
     case R_X86_64_PC8:
       write8s(S + A - P);
@@ -271,12 +262,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       write32s(S + A - P);
       continue;
     case R_X86_64_PC64:
-      if (sym.is_absolute() || !sym.is_imported || !ctx.arg.shared) {
-        write64(S + A - P);
-      } else {
-        *dynrel++ = ElfRel<E>(P, R_X86_64_64, sym.get_dynsym_idx(ctx), A);
-        write64(A);
-      }
+      write64(S + A - P);
       continue;
     case R_X86_64_PLT32:
       write32s(S + A - P);
@@ -608,62 +594,25 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       continue;
     }
 
-    if (sym.get_type() == STT_GNU_IFUNC) {
-      sym.flags |= NEEDS_GOT;
-      sym.flags |= NEEDS_PLT;
-    }
+    if (sym.get_type() == STT_GNU_IFUNC)
+      sym.flags |= (NEEDS_GOT | NEEDS_PLT);
 
     switch (rel.r_type) {
     case R_X86_64_8:
     case R_X86_64_16:
     case R_X86_64_32:
-    case R_X86_64_32S: {
-      // Dynamic linker does not support 8, 16 or 32-bit dynamic
-      // relocations for these types of relocations. We report an
-      // error if we cannot relocate them even at load-time.
-      Action table[][4] = {
-        // Absolute  Local  Imported data  Imported code
-        {  NONE,     ERROR, ERROR,         ERROR },      // DSO
-        {  NONE,     ERROR, ERROR,         ERROR },      // PIE
-        {  NONE,     NONE,  COPYREL,       CPLT  },      // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
+    case R_X86_64_32S:
+      scan_abs_rel(ctx, sym, rel);
       break;
-    }
-    case R_X86_64_64: {
-      // Unlike the above, we can use R_X86_64_RELATIVE and R_86_64_64
-      // relocations.
-      Action table[][4] = {
-        // Absolute  Local    Imported data  Imported code
-        {  NONE,     BASEREL, DYNREL,        DYNREL },     // DSO
-        {  NONE,     BASEREL, DYNREL,        DYNREL },     // PIE
-        {  NONE,     NONE,    COPYREL,       CPLT   },     // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
+    case R_X86_64_64:
+      scan_abs_dyn_rel(ctx, sym, rel);
       break;
-    }
     case R_X86_64_PC8:
     case R_X86_64_PC16:
-    case R_X86_64_PC32: {
-      Action table[][4] = {
-        // Absolute  Local  Imported data  Imported code
-        {  ERROR,    NONE,  ERROR,         ERROR },      // DSO
-        {  ERROR,    NONE,  COPYREL,       PLT   },      // PIE
-        {  NONE,     NONE,  COPYREL,       PLT   },      // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
+    case R_X86_64_PC32:
+    case R_X86_64_PC64:
+      scan_pcrel_rel(ctx, sym, rel);
       break;
-    }
-    case R_X86_64_PC64: {
-      Action table[][4] = {
-        // Absolute  Local  Imported data  Imported code
-        {  ERROR,    NONE,  DYNREL,        DYNREL },     // DSO
-        {  ERROR,    NONE,  COPYREL,       PLT    },     // PIE
-        {  NONE,     NONE,  COPYREL,       PLT    },     // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
-      break;
-    }
     case R_X86_64_GOT32:
     case R_X86_64_GOT64:
     case R_X86_64_GOTPC32:
@@ -693,16 +642,10 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       break;
     }
     case R_X86_64_PLT32:
-    case R_X86_64_PLTOFF64: {
-      Action table[][4] = {
-        // Absolute  Local  Imported data  Imported code
-        {  NONE,     NONE,  PLT,           PLT    },     // DSO
-        {  NONE,     NONE,  PLT,           PLT    },     // PIE
-        {  NONE,     NONE,  PLT,           PLT    },     // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
+    case R_X86_64_PLTOFF64:
+      if (sym.is_imported)
+        sym.flags |= NEEDS_PLT;
       break;
-    }
     case R_X86_64_TLSGD: {
       if (i + 1 == rels.size())
         Fatal(ctx) << *this << ": TLSGD reloc must be followed by PLT or GOTPCREL";

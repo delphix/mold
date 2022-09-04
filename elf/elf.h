@@ -35,6 +35,19 @@ template <typename E> struct ElfChdr;
 
 enum class MachineType { NONE, X86_64, I386, ARM64, ARM32, RISCV64, RISCV32 };
 
+inline std::ostream &operator<<(std::ostream &out, MachineType mt) {
+  switch (mt) {
+  case MachineType::NONE:    out << "none";    break;
+  case MachineType::X86_64:  out << "x86_64";  break;
+  case MachineType::I386:    out << "i386";    break;
+  case MachineType::ARM64:   out << "arm64";   break;
+  case MachineType::ARM32:   out << "arm32";   break;
+  case MachineType::RISCV64: out << "riscv64"; break;
+  case MachineType::RISCV32: out << "riscv32"; break;
+  }
+  return out;
+}
+
 template <typename E>
 std::string rel_to_string(u32 r_type);
 
@@ -1136,14 +1149,7 @@ struct Elf64Sym {
   bool is_abs() const { return st_shndx == SHN_ABS; }
   bool is_common() const { return st_shndx == SHN_COMMON; }
   bool is_weak() const { return st_bind == STB_WEAK; }
-
-  bool is_undef_strong() const {
-    return st_shndx == SHN_UNDEF && st_bind != STB_WEAK;
-  }
-
-  bool is_undef_weak() const {
-    return st_shndx == SHN_UNDEF && st_bind == STB_WEAK;
-  }
+  bool is_undef_weak() const { return is_undef() && is_weak(); }
 
   ul32 st_name;
   u8 st_type : 4;
@@ -1160,14 +1166,7 @@ struct Elf32Sym {
   bool is_abs() const { return st_shndx == SHN_ABS; }
   bool is_common() const { return st_shndx == SHN_COMMON; }
   bool is_weak() const { return st_bind == STB_WEAK; }
-
-  bool is_undef_strong() const {
-    return st_shndx == SHN_UNDEF && st_bind != STB_WEAK;
-  }
-
-  bool is_undef_weak() const {
-    return st_shndx == SHN_UNDEF && st_bind == STB_WEAK;
-  }
+  bool is_undef_weak() const { return is_undef() && is_weak(); }
 
   ul32 st_name;
   ul32 st_value;
@@ -1260,6 +1259,24 @@ struct Elf32Phdr {
   ul32 p_align;
 };
 
+// Depending on the target, ElfRel may or may not contain r_addend member.
+// The relocation record containing r_addend is called RELA, and that
+// without r_addend is called REL.
+//
+// If REL, relocation addends are stored as parts of section contents.
+// That means we add a computed value to an existing value when writing a
+// relocated value if REL. If RELA, we just overwrite an existing value
+// with a newly computed value.
+//
+// We don't want to have too many `if (REL)`s and `if (RELA)`s in our
+// codebase, so we write dynamic relocations in the following manner:
+//
+// - We always create a dynamic relocation with an addend. If it's REL,
+//   the addend will be discarded.
+//
+// - We also always write an addend to the relocated place even though
+//   it's redundant for RELA. If RELA, the written value will be
+//   ovewritten by the dynamic linker at load-time.
 struct Elf64Rel {
   Elf64Rel(u64 r_offset, u32 r_type, u32 r_sym, i64 r_addend = 0)
     : r_offset(r_offset), r_type(r_type), r_sym(r_sym) {}
@@ -1358,8 +1375,24 @@ struct ElfNhdr {
   ul32 n_type;
 };
 
+template <typename E>
+inline constexpr bool is_rela = requires(ElfRel<E> r) { r.r_addend; };
+
+template <typename E>
+inline constexpr bool supports_tlsdesc = requires { E::R_TLSDESC; };
+
+template <typename E>
+inline constexpr bool needs_thunk = requires { E::thunk_size; };
+
+template <typename E>
+inline constexpr bool is_riscv =
+  std::is_same_v<E, RISCV64> || std::is_same_v<E, RISCV32>;
+
+template <typename E>
+using Word = typename E::Word;
+
 struct X86_64 {
-  using WordTy = ul64;
+  using Word = ul64;
 
   static constexpr u32 R_NONE = R_X86_64_NONE;
   static constexpr u32 R_COPY = R_X86_64_COPY;
@@ -1374,14 +1407,12 @@ struct X86_64 {
   static constexpr u32 R_TLSDESC = R_X86_64_TLSDESC;
 
   static constexpr MachineType machine_type = MachineType::X86_64;
-  static constexpr u32 word_size = 8;
   static constexpr u32 page_size = 4096;
   static constexpr u32 e_machine = EM_X86_64;
   static constexpr u32 plt_hdr_size = 32;
   static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 16;
-  static constexpr bool is_rel = false;
-  static constexpr bool supports_tlsdesc = true;
+  static constexpr u32 tls_dtv_offset = 0;
 };
 
 template <> struct ElfSym<X86_64> : public Elf64Sym {};
@@ -1393,7 +1424,7 @@ template <> struct ElfDyn<X86_64> : public Elf64Dyn {};
 template <> struct ElfChdr<X86_64> : public Elf64Chdr {};
 
 struct I386 {
-  using WordTy = ul32;
+  using Word = ul32;
 
   static constexpr u32 R_NONE = R_386_NONE;
   static constexpr u32 R_COPY = R_386_COPY;
@@ -1408,14 +1439,12 @@ struct I386 {
   static constexpr u32 R_TLSDESC = R_386_TLS_DESC;
 
   static constexpr MachineType machine_type = MachineType::I386;
-  static constexpr u32 word_size = 4;
   static constexpr u32 page_size = 4096;
   static constexpr u32 e_machine = EM_386;
   static constexpr u32 plt_hdr_size = 16;
   static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 8;
-  static constexpr bool is_rel = true;
-  static constexpr bool supports_tlsdesc = true;
+  static constexpr u32 tls_dtv_offset = 0;
 };
 
 template <> struct ElfSym<I386> : public Elf32Sym {};
@@ -1427,7 +1456,7 @@ template <> struct ElfDyn<I386> : public Elf32Dyn {};
 template <> struct ElfChdr<I386> : public Elf32Chdr {};
 
 struct ARM64 {
-  using WordTy = ul64;
+  using Word = ul64;
 
   static constexpr u32 R_NONE = R_AARCH64_NONE;
   static constexpr u32 R_COPY = R_AARCH64_COPY;
@@ -1442,15 +1471,27 @@ struct ARM64 {
   static constexpr u32 R_TLSDESC = R_AARCH64_TLSDESC;
 
   static constexpr MachineType machine_type = MachineType::ARM64;
-  static constexpr u32 word_size = 8;
   static constexpr u32 page_size = 65536;
   static constexpr u32 e_machine = EM_AARCH64;
   static constexpr u32 plt_hdr_size = 32;
   static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 16;
-  static constexpr u32 tls_offset = 16;
-  static constexpr bool is_rel = false;
-  static constexpr bool supports_tlsdesc = true;
+
+  // Each thread has its own value in TP (thread pointer) register, and
+  // TLVs defined in the main executable are accessed relative to TP.
+  // ARM runtime reserves two words right at TP, so the TLVs start at
+  // TP + 16 (or TP + 8 on ARM32).
+  static constexpr u32 tls_tp_offset = 16;
+
+  static constexpr u32 tls_dtv_offset = 0;
+
+  // For ARM, we need to insert a piece of code between a function call
+  // site and the callee if they are not reachable with a single branch
+  // instruction. Here are parameters for the thunk creation function.
+  static constexpr u32 thunk_hdr_size = 0;
+  static constexpr u32 thunk_size = 12;
+  static constexpr u32 thunk_max_distance = 100 * 1024 * 1024;
+  static constexpr u32 thunk_group_size = 10 * 1024 * 1024;
 };
 
 template <> struct ElfSym<ARM64> : public Elf64Sym {};
@@ -1462,7 +1503,7 @@ template <> struct ElfDyn<ARM64> : public Elf64Dyn {};
 template <> struct ElfChdr<ARM64> : public Elf64Chdr {};
 
 struct ARM32 {
-  using WordTy = ul32;
+  using Word = ul32;
 
   static constexpr u32 R_NONE = R_ARM_NONE;
   static constexpr u32 R_COPY = R_ARM_COPY;
@@ -1477,15 +1518,18 @@ struct ARM32 {
   static constexpr u32 R_TLSDESC = R_ARM_TLS_DESC;
 
   static constexpr MachineType machine_type = MachineType::ARM32;
-  static constexpr u32 word_size = 4;
   static constexpr u32 page_size = 4096;
   static constexpr u32 e_machine = EM_ARM;
   static constexpr u32 plt_hdr_size = 32;
   static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 16;
-  static constexpr u32 tls_offset = 8;
-  static constexpr bool is_rel = true;
-  static constexpr bool supports_tlsdesc = true;
+  static constexpr u32 tls_tp_offset = 8;
+  static constexpr u32 tls_dtv_offset = 0;
+
+  static constexpr u32 thunk_hdr_size = 12;
+  static constexpr u32 thunk_size = 20;
+  static constexpr u32 thunk_max_distance = 10 * 1024 * 1024;
+  static constexpr u32 thunk_group_size = 2 * 1024 * 1024;
 };
 
 template <> struct ElfSym<ARM32> : public Elf32Sym {};
@@ -1497,7 +1541,7 @@ template <> struct ElfDyn<ARM32> : public Elf32Dyn {};
 template <> struct ElfChdr<ARM32> : public Elf32Chdr {};
 
 struct RISCV64 {
-  using WordTy = ul64;
+  using Word = ul64;
 
   static constexpr u32 R_NONE = R_RISCV_NONE;
   static constexpr u32 R_COPY = R_RISCV_COPY;
@@ -1511,15 +1555,35 @@ struct RISCV64 {
   static constexpr u32 R_DTPMOD = R_RISCV_TLS_DTPMOD64;
 
   static constexpr MachineType machine_type = MachineType::RISCV64;
-  static constexpr u32 word_size = 8;
   static constexpr u32 page_size = 4096;
   static constexpr u32 e_machine = EM_RISCV;
   static constexpr u32 plt_hdr_size = 32;
   static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 16;
-  static constexpr u32 tls_offset = 0;
-  static constexpr bool is_rel = false;
-  static constexpr bool supports_tlsdesc = false;
+  static constexpr u32 tls_tp_offset = 0;
+
+  // When __tls_get_addr is called to resolve a thread-local variable's
+  // address, the following two arguments are passed to the function:
+  //
+  // 1. the module number that the variable belongs, and
+  // 2. the variable's offset within the module's TLS block.
+  //
+  // These values are usually computed by the dynamic linker and set to
+  // GOT slots as a result of resolving R_DTPMOD and R_DTPOFF dynamic
+  // relocations.
+  //
+  // On RISC-V, R_DTPOFF is resolved to the address 0x800 past the start
+  // of the TLS block. The bias maximizes the accessible range for
+  // load/store instructions with 12-bits signed immediates. That is, if
+  // the offset was right at the beginning of the start of the TLS block,
+  // the half of addressible space (negative immediates) would have been
+  // wasted.
+  //
+  // In most cases we don't have to think about the bias, as the DTPOFF
+  // values are usually computed and used only by runtime. But when we do
+  // compute DTPOFF for statically-linked executable, we need to offset
+  // the bias by subtracting 0x800.
+  static constexpr u32 tls_dtv_offset = 0x800;
 };
 
 template <> struct ElfSym<RISCV64> : public Elf64Sym {};
@@ -1531,7 +1595,7 @@ template <> struct ElfDyn<RISCV64> : public Elf64Dyn {};
 template <> struct ElfChdr<RISCV64> : public Elf64Chdr {};
 
 struct RISCV32 {
-  using WordTy = ul32;
+  using Word = ul32;
 
   static constexpr u32 R_NONE = R_RISCV_NONE;
   static constexpr u32 R_COPY = R_RISCV_COPY;
@@ -1545,15 +1609,13 @@ struct RISCV32 {
   static constexpr u32 R_DTPMOD = R_RISCV_TLS_DTPMOD32;
 
   static constexpr MachineType machine_type = MachineType::RISCV32;
-  static constexpr u32 word_size = 4;
   static constexpr u32 page_size = 4096;
   static constexpr u32 e_machine = EM_RISCV;
   static constexpr u32 plt_hdr_size = 32;
   static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 16;
-  static constexpr u32 tls_offset = 0;
-  static constexpr bool is_rel = false;
-  static constexpr bool supports_tlsdesc = false;
+  static constexpr u32 tls_tp_offset = 0;
+  static constexpr u32 tls_dtv_offset = 0x800;
 };
 
 template <> struct ElfSym<RISCV32> : public Elf32Sym {};

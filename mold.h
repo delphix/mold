@@ -25,21 +25,19 @@
 #include <vector>
 
 #ifdef _WIN32
-#include <io.h>
+# include <io.h>
 #else
-#include <sys/mman.h>
-#include <unistd.h>
+# include <sys/mman.h>
+# include <unistd.h>
 #endif
 
 #define XXH_INLINE_ALL 1
 #include "third-party/xxhash/xxhash.h"
 
-#ifdef _MSC_VER
-#  define unreachable() __assume(0)
-#elif defined(NDEBUG)
-#  define unreachable() __builtin_unreachable()
+#ifdef NDEBUG
+# define unreachable() __builtin_unreachable()
 #else
-#  define unreachable() assert(0 && "unreachable")
+# define unreachable() assert(0 && "unreachable")
 #endif
 
 inline uint64_t hash_string(std::string_view str) {
@@ -290,6 +288,20 @@ inline void encode_uleb(std::vector<u8> &vec, u64 val) {
     val >>= 7;
     vec.push_back(val ? (byte | 0x80) : byte);
   } while (val);
+}
+
+inline void encode_sleb(std::vector<u8> &vec, i64 val) {
+  for (;;) {
+    u8 byte = val & 0x7f;
+    val >>= 7;
+
+    bool neg = (byte & 0x40);
+    if ((val == 0 && !neg) || (val == -1 && neg)) {
+      vec.push_back(byte);
+      break;
+    }
+    vec.push_back(byte | 0x80);
+  }
 }
 
 inline i64 write_uleb(u8 *buf, u64 val) {

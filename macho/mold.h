@@ -459,7 +459,9 @@ class BindEncoder {
 public:
   BindEncoder();
 
-  template <typename E> void add(Symbol<E> &sym, i64 seg_idx, i64 offset);
+  template <typename E>
+  void add(Symbol<E> &sym, i64 seg_idx, i64 offset, i64 addend);
+
   void finish();
 
   std::vector<u8> buf;
@@ -469,7 +471,8 @@ private:
   i64 last_flags = -1;
   i64 last_dylib = -1;
   i64 last_seg = -1;
-  i64 last_off = -1;
+  i64 last_offset = -1;
+  i64 last_addend = 0;
 };
 
 template <typename E>
@@ -1017,13 +1020,13 @@ u64 Symbol<E>::get_addr(Context<E> &ctx) const {
 template <typename E>
 u64 Symbol<E>::get_got_addr(Context<E> &ctx) const {
   assert(got_idx != -1);
-  return ctx.got.hdr.addr + got_idx * E::word_size;
+  return ctx.got.hdr.addr + got_idx * word_size;
 }
 
 template <typename E>
 u64 Symbol<E>::get_tlv_addr(Context<E> &ctx) const {
   assert(tlv_idx != -1);
-  return ctx.thread_ptrs.hdr.addr + tlv_idx * E::word_size;
+  return ctx.thread_ptrs.hdr.addr + tlv_idx * word_size;
 }
 
 template <typename E>

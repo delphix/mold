@@ -24,7 +24,7 @@ static u32 utype(u32 val) {
   // of a register. I-type insn sign-extends a 12-bits immediate and
   // add it to a register value to construct a complete value. 0x800
   // is added here to compensate for the sign-extension.
-  return bits(val + 0x800, 31, 12) << 12;
+  return (val + 0x800) & 0xffff'f000;
 }
 
 static u32 jtype(u32 val) {
@@ -43,6 +43,10 @@ static u32 cjtype(u32 val) {
          bit(val, 8)  << 9  | bit(val, 10) << 8  | bit(val, 6) << 7  |
          bit(val, 7)  << 6  | bit(val, 3)  << 5  | bit(val, 2) << 4  |
          bit(val, 1)  << 3  | bit(val, 5)  << 2;
+}
+
+static u32 get_rd(u32 val) {
+  return bits(val, 11, 7);
 }
 
 static void write_itype(u8 *loc, u32 val) {
@@ -101,12 +105,12 @@ static void write_plt_header(Context<E> &ctx) {
     0x0003ae03, // lw     t3, %pcrel_lo(1b)(t2)    # _dl_runtime_resolve
     0xfd430313, // addi   t1, t1, -44              # .plt entry
     0x00038293, // addi   t0, t2, %pcrel_lo(1b)    # &.got.plt
-    0x00135313, // srli   t1, t1, 1                # .plt entry offset
-    0x0082a283, // lw     t0, 8(t0)                # link map
+    0x00235313, // srli   t1, t1, 2                # .plt entry offset
+    0x0042a283, // lw     t0, 4(t0)                # link map
     0x000e0067, // jr     t3
   };
 
-  if constexpr (E::word_size == 8)
+  if constexpr (sizeof(Word<E>) == 8)
     memcpy(buf, plt0_64, sizeof(plt0_64));
   else
     memcpy(buf, plt0_32, sizeof(plt0_32));
@@ -144,7 +148,7 @@ void PltSection<E>::copy_buf(Context<E> &ctx) {
     u64 gotplt = sym->get_gotplt_addr(ctx);
     u64 plt = sym->get_plt_addr(ctx);
 
-    if constexpr (E::word_size == 8)
+    if constexpr (sizeof(Word<E>) == 8)
       memcpy(ent, plt_entry_64, sizeof(plt_entry_64));
     else
       memcpy(ent, plt_entry_32, sizeof(plt_entry_32));
@@ -163,7 +167,7 @@ void PltGotSection<E>::copy_buf(Context<E> &ctx) {
     u64 got = sym->get_got_addr(ctx);
     u64 plt = sym->get_plt_addr(ctx);
 
-    if constexpr (E::word_size == 8)
+    if constexpr (sizeof(Word<E>) == 8)
       memcpy(ent, plt_entry_64, sizeof(plt_entry_64));
     else
       memcpy(ent, plt_entry_32, sizeof(plt_entry_32));
@@ -230,51 +234,70 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
-    i64 r_offset = rel.r_offset + extra.r_deltas[i];
+    i64 r_offset = rel.r_offset - extra.r_deltas[i];
+    i64 delta = extra.r_deltas[i + 1] - extra.r_deltas[i];
     u8 *loc = base + r_offset;
 
     const SectionFragmentRef<E> *frag_ref = nullptr;
     if (rel_fragments && rel_fragments[frag_idx].idx == i)
       frag_ref = &rel_fragments[frag_idx++];
 
+    auto overflow_check = [&](i64 val, i64 lo, i64 hi) {
+      if (val < lo || hi <= val)
+        Error(ctx) << *this << ": relocation " << rel << " against "
+                   << sym << " out of range: " << val << " is not in ["
+                   << lo << ", " << hi << ")";
+    };
+
 #define S   (frag_ref ? frag_ref->frag->get_addr(ctx) : sym.get_addr(ctx))
 #define A   (frag_ref ? (u64)frag_ref->addend : (u64)rel.r_addend)
-#define P   (output_section->shdr.sh_addr + offset + r_offset)
-#define G   (sym.get_got_addr(ctx) - ctx.got->shdr.sh_addr)
+#define P   (get_addr() + r_offset)
+#define G   (sym.get_got_idx(ctx) * sizeof(Word<E>))
 #define GOT ctx.got->shdr.sh_addr
 
     switch (rel.r_type) {
     case R_RISCV_32:
-      *(ul32 *)loc = S + A;
+      if constexpr (sizeof(Word<E>) == 4)
+        apply_abs_dyn_rel(ctx, sym, rel, loc, S, A, P, dynrel);
+      else
+        *(ul32 *)loc = S + A;
       break;
     case R_RISCV_64:
-      if (sym.is_absolute() || !ctx.arg.pic) {
-        *(ul64 *)loc = S + A;
-      } else if (sym.is_imported) {
-        *dynrel++ = ElfRel<E>(P, R_RISCV_64, sym.get_dynsym_idx(ctx), A);
-        *(ul64 *)loc = A;
-      } else {
-        if (!is_relr_reloc(ctx, rel))
-          *dynrel++ = ElfRel<E>(P, R_RISCV_RELATIVE, 0, S + A);
-        *(ul64 *)loc = S + A;
-      }
+      assert(sizeof(Word<E>) == 8);
+      apply_abs_dyn_rel(ctx, sym, rel, loc, S, A, P, dynrel);
       break;
-    case R_RISCV_BRANCH:
-      write_btype(loc, S + A - P);
+    case R_RISCV_BRANCH: {
+      i64 val = S + A - P;
+      overflow_check(val, -(1 << 12), 1 << 12);
+      write_btype(loc, val);
       break;
-    case R_RISCV_JAL:
-      write_jtype(loc, S + A - P);
+    }
+    case R_RISCV_JAL: {
+      i64 val = S + A - P;
+      overflow_check(val, -(1 << 20), 1 << 20);
+      write_jtype(loc, val);
       break;
+    }
     case R_RISCV_CALL:
     case R_RISCV_CALL_PLT: {
-      if (extra.r_deltas[i + 1] - extra.r_deltas[i] != 0) {
+      u32 rd = get_rd(*(ul32 *)(contents.data() + rel.r_offset + 4));
+      if (delta == 4) {
         // auipc + jalr -> jal
-        assert(extra.r_deltas[i + 1] - extra.r_deltas[i] == -4);
-        u32 jalr = *(ul32 *)&contents[rels[i].r_offset + 4];
-        *(ul32 *)loc = (0b11111'000000 & jalr) | 0b101111;
+        *(ul32 *)loc = (rd << 7) | 0b1101111;
         write_jtype(loc, S + A - P);
+      } else if (delta == 6 && rd == 0) {
+        // auipc + jalr -> c.j
+        *(ul16 *)loc = 0b101'00000000000'01;
+        write_cjtype(loc, S + A - P);
+      } else if (delta == 6 && rd == 1) {
+        // auipc + jalr -> c.jal
+        assert(sizeof(Word<E>) == 4);
+        *(ul16 *)loc = 0b001'00000000000'01;
+        write_cjtype(loc, S + A - P);
       } else {
+        assert(delta == 0);
         u64 val = sym.esym().is_undef_weak() ? 0 : S + A - P;
+        overflow_check(val, -(1LL << 31), 1LL << 31);
         write_utype(loc, val);
         write_itype(loc + 4, val);
       }
@@ -300,21 +323,39 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       }
       break;
     case R_RISCV_LO12_I:
-    case R_RISCV_TPREL_LO12_I:
       write_itype(loc, S + A);
       break;
     case R_RISCV_LO12_S:
-    case R_RISCV_TPREL_LO12_S:
       write_stype(loc, S + A);
       break;
-    case R_RISCV_HI20:
-      write_utype(loc, S + A);
+    case R_RISCV_HI20: {
+      i64 val = S + A;
+      overflow_check(val, -(1LL << 31), 1LL << 31);
+      write_utype(loc, val);
       break;
+    }
     case R_RISCV_TPREL_HI20:
-      write_utype(loc, S + A - ctx.tls_begin);
+      assert(delta == 0 || delta == 4);
+      if (delta == 0)
+        write_utype(loc, S + A - ctx.tls_begin);
       break;
     case R_RISCV_TPREL_ADD:
       break;
+    case R_RISCV_TPREL_LO12_I:
+    case R_RISCV_TPREL_LO12_S: {
+      i64 val = S + A - ctx.tls_begin;
+      if (rel.r_type == R_RISCV_TPREL_LO12_I)
+        write_itype(loc, val);
+      else
+        write_stype(loc, val);
+
+      // Rewrite `lw t1, 0(t0)` with `lw t1, 0(tp)` if the address is
+      // directly accessible using tp. tp is x4.
+      if (sign_extend(val, 11) == val)
+        *(ul32 *)loc = (*(ul32 *)loc & 0b111111'11111'00000'111'11111'1111111) |
+                       (4 << 15);
+      break;
+    }
     case R_RISCV_ADD8:
       loc += S + A;
       break;
@@ -339,25 +380,36 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_RISCV_SUB64:
       *(ul64 *)loc -= S + A;
       break;
-    case R_RISCV_ALIGN:
-      // A R_RISCV_ALIGN is followed by nops. We sometimes have to not
-      // just remove nops but rewrite a nop with a c.nop. Here, we always
-      // rewrite all nops for the sake of simplicity.
-      if (i64 padding_size = align_to(P, bit_ceil(rel.r_addend)) - P) {
-        assert(padding_size % 2 == 0);
-        i64 i = 0;
-        for (; i <= padding_size - 4; i += 4)
-          *(ul32 *)(loc + i) = 0x00000013; // nop
-        if (i != padding_size)
-          *(ul16 *)(loc + i) = 0x0001;     // c.nop
-      }
+    case R_RISCV_ALIGN: {
+      // A R_RISCV_ALIGN is followed by a NOP sequence. We need to remove
+      // zero or more bytes so that the instruction after R_RISCV_ALIGN is
+      // aligned to a given alignment boundary.
+      //
+      // We need to guarantee that the NOP sequence is valid after byte
+      // removal (e.g. we can't remove 2 bytes from a 4-byte NOP). For the
+      // sake of simplicity, we always rewrite the entire NOP sequence.
+      i64 padding_size = align_to(P, bit_ceil(rel.r_addend + 1)) - P;
+      assert(padding_size % 2 == 0);
+
+      i64 i = 0;
+      for (; i <= padding_size - 4; i += 4)
+        *(ul32 *)(loc + i) = 0x00000013; // nop
+      if (i != padding_size)
+        *(ul16 *)(loc + i) = 0x0001;     // c.nop
       break;
-    case R_RISCV_RVC_BRANCH:
-      write_cbtype(loc, S + A - P);
+    }
+    case R_RISCV_RVC_BRANCH: {
+      i64 val = S + A - P;
+      overflow_check(val, -(1 << 8), 1 << 8);
+      write_cbtype(loc, val);
       break;
-    case R_RISCV_RVC_JUMP:
-      write_cjtype(loc, S + A - P);
+    }
+    case R_RISCV_RVC_JUMP: {
+      i64 val = S + A - P;
+      overflow_check(val, -(1 << 11), 1 << 11);
+      write_cjtype(loc, val);
       break;
+    }
     case R_RISCV_SUB6:
       *loc = (*loc & 0b1100'0000) | ((*loc - (S + A)) & 0b0011'1111);
       break;
@@ -395,20 +447,20 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
   // relocations overwrote instructions with full 32-bit values to allow
   // their corresponding LO12 relocations to read their values.
   for (i64 i = 0; i < rels.size(); i++) {
-    const ElfRel<E> &r = rels[i];
-    if (r.r_type != R_RISCV_PCREL_LO12_I && r.r_type != R_RISCV_PCREL_LO12_S)
-      continue;
+    switch (rels[i].r_type)
+    case R_RISCV_PCREL_LO12_I:
+    case R_RISCV_PCREL_LO12_S: {
+      Symbol<E> &sym = *file.symbols[rels[i].r_sym];
+      assert(sym.get_input_section() == this);
 
-    Symbol<E> &sym = *file.symbols[r.r_sym];
-    assert(sym.get_input_section() == this);
+      u8 *loc = base + rels[i].r_offset - extra.r_deltas[i];
+      u32 val = *(ul32 *)(base + sym.value);
 
-    u8 *loc = base + r.r_offset + extra.r_deltas[i];
-    u32 val = *(ul32 *)(base + sym.value);
-
-    if (r.r_type == R_RISCV_PCREL_LO12_I)
-      write_itype(loc, val);
-    else
-      write_stype(loc, val);
+      if (rels[i].r_type == R_RISCV_PCREL_LO12_I)
+        write_itype(loc, val);
+      else
+        write_stype(loc, val);
+    }
   }
 
   // Restore the original instructions HI20 relocations overwrote.
@@ -418,9 +470,9 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_RISCV_PCREL_HI20:
     case R_RISCV_TLS_GOT_HI20:
     case R_RISCV_TLS_GD_HI20: {
-      u8 *loc = base + rels[i].r_offset + extra.r_deltas[i];
+      u8 *loc = base + rels[i].r_offset - extra.r_deltas[i];
       u32 val = *(ul32 *)loc;
-      *(ul32 *)loc = *(ul32 *)&contents[rels[i].r_offset];
+      *(ul32 *)loc = *(ul32 *)(contents.data() + rels[i].r_offset);
       write_utype(loc, val);
     }
     }
@@ -534,12 +586,12 @@ void InputSection<E>::copy_contents_riscv(Context<E> &ctx, u8 *buf) {
     i64 delta = extra.r_deltas[i + 1] - extra.r_deltas[i];
     if (delta == 0)
       continue;
-    assert(delta < 0);
+    assert(delta > 0);
 
     const ElfRel<E> &r = rels[i];
     memcpy(buf, contents.data() + pos, r.r_offset - pos);
     buf += r.r_offset - pos;
-    pos = r.r_offset - delta;
+    pos = r.r_offset + delta;
   }
 
   memcpy(buf, contents.data() + pos, contents.size() - pos);
@@ -565,33 +617,24 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       continue;
     }
 
-    if (sym.get_type() == STT_GNU_IFUNC) {
-      sym.flags |= NEEDS_GOT;
-      sym.flags |= NEEDS_PLT;
-    }
+    if (sym.get_type() == STT_GNU_IFUNC)
+      sym.flags |= (NEEDS_GOT | NEEDS_PLT);
 
     switch (rel.r_type) {
     case R_RISCV_32:
-    case R_RISCV_HI20: {
-      Action table[][4] = {
-        // Absolute  Local    Imported data  Imported code
-        {  NONE,     ERROR,   ERROR,         ERROR },      // DSO
-        {  NONE,     ERROR,   ERROR,         ERROR },      // PIE
-        {  NONE,     NONE,    COPYREL,       CPLT  },      // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
+      if constexpr (sizeof(Word<E>) == 8)
+        scan_abs_rel(ctx, sym, rel);
+      else
+        scan_abs_dyn_rel(ctx, sym, rel);
       break;
-    }
-    case R_RISCV_64: {
-      Action table[][4] = {
-        // Absolute  Local    Imported data  Imported code
-        {  NONE,     BASEREL, DYNREL,        DYNREL },     // DSO
-        {  NONE,     BASEREL, DYNREL,        DYNREL },     // PIE
-        {  NONE,     NONE,    COPYREL,       CPLT   },     // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
+    case R_RISCV_HI20:
+      scan_abs_rel(ctx, sym, rel);
       break;
-    }
+    case R_RISCV_64:
+      if constexpr (sizeof(Word<E>) == 4)
+        Fatal(ctx) << *this << ": R_RISCV_64 cannot be used on RV32";
+      scan_abs_dyn_rel(ctx, sym, rel);
+      break;
     case R_RISCV_CALL:
     case R_RISCV_CALL_PLT:
       if (sym.is_imported)
@@ -607,16 +650,9 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_RISCV_TLS_GD_HI20:
       sym.flags |= NEEDS_TLSGD;
       break;
-    case R_RISCV_32_PCREL: {
-      Action table[][4] = {
-        // Absolute  Local  Imported data  Imported code
-        {  ERROR,    NONE,  ERROR,         ERROR },      // DSO
-        {  ERROR,    NONE,  COPYREL,       PLT   },      // PIE
-        {  NONE,     NONE,  COPYREL,       PLT   },      // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
+    case R_RISCV_32_PCREL:
+      scan_pcrel_rel(ctx, sym, rel);
       break;
-    }
     case R_RISCV_BRANCH:
     case R_RISCV_JAL:
     case R_RISCV_PCREL_HI20:
@@ -672,7 +708,7 @@ template <typename E>
 static i64 compute_distance(Context<E> &ctx, Symbol<E> &sym,
                             InputSection<E> &isec, const ElfRel<E> &rel) {
   // We handle absolute symbols as if they were infinitely far away
-  // because `relax_section` may increase a distance between a branch
+  // because `shrink_section` may increase a distance between a branch
   // instruction and an absolute symbol. Branching to an absolute
   // location is extremely rare in real code, though.
   if (sym.is_absolute())
@@ -689,71 +725,109 @@ static i64 compute_distance(Context<E> &ctx, Symbol<E> &sym,
   return S + A - P;
 }
 
-// Relax R_RISCV_CALL and R_RISCV_CALL_PLT relocations.
+// Scan relocations to shrink sections.
 template <typename E>
-static void relax_section(Context<E> &ctx, InputSection<E> &isec) {
-  std::vector<Symbol<E> *> vec = get_sorted_symbols(isec);
-  std::span<Symbol<E> *> syms = vec;
-  i64 delta = 0;
-
+static void shrink_section(Context<E> &ctx, InputSection<E> &isec, bool use_rvc) {
   std::span<const ElfRel<E>> rels = isec.get_rels(ctx);
   isec.extra.r_deltas.resize(rels.size() + 1);
 
+  i64 delta = 0;
+
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &r = rels[i];
-    i64 delta2 = 0;
-
+    Symbol<E> &sym = *isec.file.symbols[r.r_sym];
     isec.extra.r_deltas[i] = delta;
 
-    switch (r.r_type) {
-    case R_RISCV_ALIGN: {
-      // R_RISCV_ALIGN refers NOP instructions. We need to eliminate
-      // some or all of the instructions so that the instruction that
-      // immediately follows the NOPs is aligned to a specified
-      // alignment boundary.
-      u64 loc = isec.get_addr() + r.r_offset + delta;
-
+    // Handling R_RISCV_ALIGN is mandatory.
+    //
+    // R_RISCV_ALIGN refers NOP instructions. We need to eliminate some
+    // or all of the instructions so that the instruction that immediately
+    // follows the NOPs is aligned to a specified alignment boundary.
+    if (r.r_type == R_RISCV_ALIGN) {
       // The total bytes of NOPs is stored to r_addend, so the next
       // instruction is r_addend away.
+      u64 loc = isec.get_addr() + r.r_offset - delta;
       u64 next_loc = loc + r.r_addend;
       u64 alignment = bit_ceil(r.r_addend + 1);
       assert(alignment <= (1 << isec.p2align));
-
-      if (next_loc % alignment)
-        delta2 = align_to(loc, alignment) - next_loc;
-      break;
-    }
-    case R_RISCV_CALL:
-    case R_RISCV_CALL_PLT:
-      if (ctx.arg.relax) {
-        if (i == rels.size() - 1 || rels[i + 1].r_type != R_RISCV_RELAX)
-          break;
-
-        // If the jump target is within ±1 MiB, we can replace AUIPC+JALR
-        // with JAL, saving 4 bytes.
-        Symbol<E> &sym = *isec.file.symbols[r.r_sym];
-        i64 dist = compute_distance(ctx, sym, isec, r);
-        if (dist % 2 == 0 && -(1 << 20) <= dist && dist < (1 << 20))
-          delta2 = -4;
-      }
+      delta += next_loc - align_to(loc, alignment);
+      continue;
     }
 
-    if (delta2 == 0)
+    // Handling other relocations is optional.
+    if (!ctx.arg.relax || i == rels.size() - 1 ||
+        rels[i + 1].r_type != R_RISCV_RELAX)
       continue;
 
-    while (!syms.empty() && syms[0]->value <= r.r_offset) {
-      syms[0]->value += delta;
-      syms = syms.subspan(1);
-    }
+    switch (r.r_type) {
+    case R_RISCV_CALL:
+    case R_RISCV_CALL_PLT: {
+      // These relocations refer  an AUIPC + JALR instruction pair to
+      // allow to jump to anywhere in PC ± 2 GiB. If the jump target is
+      // close enough to PC, we can use C.J, C.JAL or JAL instead.
+      i64 dist = compute_distance(ctx, sym, isec, r);
+      if (dist % 2)
+        break;
 
-    delta += delta2;
+      std::string_view contents = isec.contents;
+      i64 rd = get_rd(*(ul32 *)(contents.data() + r.r_offset + 4));
+
+      if (rd == 0 && sign_extend(dist, 11) == dist && use_rvc) {
+        // If rd is x0 and the jump target is within ±2 KiB, we can use
+        // C.J, saving 6 bytes.
+        delta += 6;
+      } else if (rd == 1 && sign_extend(dist, 11) == dist
+                 && use_rvc && sizeof(Word<E>) == 4) {
+        // If rd is x1 and the jump target is within ±2 KiB, we can use
+        // C.JAL. This is RV32 only because C.JAL is RV32-only instruction.
+        delta += 6;
+      } else if (sign_extend(dist, 20) == dist) {
+        // If the jump target is within ±1 MiB, we can use JAL.
+        delta += 4;
+      }
+      break;
+    }
+    case R_RISCV_TPREL_HI20:
+    case R_RISCV_TPREL_ADD: {
+      // These relocations are used to materialize the upper 20 bits of
+      // an address relative to the thread pointer as follows:
+      //
+      //  lui  a5,%tprel_hi(foo)         # R_RISCV_TPREL_HI20 (symbol)
+      //  add  a5,a5,tp,%tprel_add(foo)  # R_RISCV_TPREL_ADD (symbol)
+      //
+      // Then thread-local variable `foo` is accessed with a 12-bit offset
+      // like this:
+      //
+      //  sw   t0,%tprel_lo(foo)(a5)     # R_RISCV_TPREL_LO12_S (symbol)
+      //
+      // However, if the offset is ±2 KiB, we don't need to materialize
+      // the upper 20 bits in a register. We can instead access the
+      // thread-local variable directly with TP like this:
+      //
+      //  sw   t0,%tprel_lo(foo)(tp)
+      //
+      // Here, we remove `lui` and `add` if the offset is within ±2 KiB.
+      i64 val = sym.get_addr(ctx) + r.r_addend - ctx.tls_begin;
+      if (sign_extend(val, 11) == val)
+        delta += 4;
+      break;
+    }
+    }
   }
 
-  for (Symbol<E> *sym : syms)
-    sym->value += delta;
   isec.extra.r_deltas[rels.size()] = delta;
+  isec.sh_size -= delta;
+}
 
-  isec.sh_size += delta;
+template <typename E>
+static void update_symbol_values(Context<E> &ctx, InputSection<E> &isec) {
+  std::span<const ElfRel<E>> rels = isec.get_rels(ctx);
+  i64 i = 0;
+  for (Symbol<E> *sym : get_sorted_symbols(isec)) {
+    while (i < rels.size() && rels[i].r_offset < sym->value)
+      i++;
+    sym->value -= isec.extra.r_deltas[i];
+  }
 }
 
 // RISC-V instructions are 16 or 32 bits long, so immediates encoded
@@ -803,12 +877,21 @@ template <typename E>
 i64 riscv_resize_sections(Context<E> &ctx) {
   Timer t(ctx, "riscv_resize_sections");
 
+  // True if we can use the 2-byte instructions.
+  bool use_rvc = get_eflags(ctx) & EF_RISCV_RVC;
+
   // Find R_RISCV_CALL AND R_RISCV_CALL_PLT that can be relaxed.
   // This step should only shrink sections.
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     for (std::unique_ptr<InputSection<E>> &isec : file->sections)
       if (is_resizable(ctx, isec.get()))
-        relax_section(ctx, *isec);
+        shrink_section(ctx, *isec, use_rvc);
+  });
+
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    for (std::unique_ptr<InputSection<E>> &isec : file->sections)
+      if (is_resizable(ctx, isec.get()))
+        update_symbol_values(ctx, *isec);
   });
 
   // Re-compute section offset again to finalize them.

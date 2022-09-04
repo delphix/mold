@@ -9,7 +9,7 @@
 #include <unordered_set>
 
 #ifndef _WIN32
-#include <unistd.h>
+# include <unistd.h>
 #endif
 
 namespace mold::macho {
@@ -208,6 +208,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   std::vector<std::string> framework_paths;
   std::vector<std::string> library_paths;
   bool nostdlib = false;
+  bool version_shown = false;
   std::optional<i64> pagezero_size;
 
   while (i < args.size()) {
@@ -480,6 +481,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
                      << ": invalid glob pattern: " << pat;
     } else if (read_flag("-v")) {
       SyncOut(ctx) << mold_version;
+      version_shown = true;
     } else if (read_arg("-weak_framework")) {
       remaining.push_back("-weak_framework");
       remaining.push_back(std::string(arg));
@@ -557,6 +559,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if (ctx.arg.uuid == UUID_RANDOM)
     memcpy(ctx.uuid, get_uuid_v4().data(), 16);
 
+  if (version_shown && remaining.empty())
+    exit(0);
   return remaining;
 }
 
