@@ -17,14 +17,6 @@
 #include <unordered_set>
 #include <variant>
 
-#if MOLD_DEBUG_X86_64_ONLY
-# define INSTANTIATE_ALL INSTANTIATE(X86_64)
-#else
-# define INSTANTIATE_ALL                        \
-  INSTANTIATE(X86_64);                          \
-  INSTANTIATE(ARM64);
-#endif
-
 namespace mold::macho {
 
 static constexpr i64 COMMON_PAGE_SIZE = 0x4000;
@@ -987,6 +979,9 @@ struct Context {
   OutputSection<E> *bss = nullptr;
   OutputSection<E> *common = nullptr;
 };
+
+template <typename E>
+int macho_main(int argc, char **argv);
 
 int main(int argc, char **argv);
 

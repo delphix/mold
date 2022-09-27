@@ -2,6 +2,7 @@
 
 #include <limits>
 #include <zlib.h>
+#include <zstd.h>
 
 namespace mold::elf {
 
@@ -25,7 +26,7 @@ bool CieRecord<E>::equals(const CieRecord<E> &other) const {
   return true;
 }
 
-static inline i64 to_p2align(u64 alignment) {
+static i64 to_p2align(u64 alignment) {
   if (alignment == 0)
     return 0;
   return std::countr_zero(alignment);
@@ -38,19 +39,13 @@ InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file,
   if (shndx < file.elf_sections.size())
     contents = {(char *)file.mf->data + shdr().sh_offset, (size_t)shdr().sh_size};
 
-  if (name.starts_with(".zdebug")) {
-    sh_size = *(ub64 *)&contents[4];
-    p2align = to_p2align(shdr().sh_addralign);
-    compressed = true;
-  } else if (shdr().sh_flags & SHF_COMPRESSED) {
+  if (shdr().sh_flags & SHF_COMPRESSED) {
     ElfChdr<E> &chdr = *(ElfChdr<E> *)&contents[0];
     sh_size = chdr.ch_size;
     p2align = to_p2align(chdr.ch_addralign);
-    compressed = true;
   } else {
     sh_size = shdr().sh_size;
     p2align = to_p2align(shdr().sh_addralign);
-    compressed = false;
   }
 
   // Sections may have been compressed. We usually uncompress them
@@ -67,7 +62,7 @@ InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file,
 
 template <typename E>
 void InputSection<E>::uncompress(Context<E> &ctx) {
-  if (!compressed || uncompressed)
+  if (!(shdr().sh_flags & SHF_COMPRESSED) || uncompressed)
     return;
 
   u8 *buf = new u8[sh_size];
@@ -79,37 +74,33 @@ void InputSection<E>::uncompress(Context<E> &ctx) {
 
 template <typename E>
 void InputSection<E>::uncompress_to(Context<E> &ctx, u8 *buf) {
-  if (!compressed || uncompressed) {
+  if (!(shdr().sh_flags & SHF_COMPRESSED) || uncompressed) {
     memcpy(buf, contents.data(), contents.size());
     return;
   }
 
-  auto do_uncompress = [&](std::string_view data) {
-    unsigned long size = sh_size;
-    if (::uncompress(buf, &size, (u8 *)data.data(), data.size()) != Z_OK)
-      Fatal(ctx) << *this << ": uncompress failed";
-    assert(size == sh_size);
-  };
-
-  if (name().starts_with(".zdebug")) {
-    // Old-style compressed section
-    if (!contents.starts_with("ZLIB") || contents.size() <= 12)
-      Fatal(ctx) << *this << ": corrupted compressed section";
-    do_uncompress(contents.substr(12));
-    return;
-  }
-
-  assert(shdr().sh_flags & SHF_COMPRESSED);
-
-  // New-style compressed section
   if (contents.size() < sizeof(ElfChdr<E>))
     Fatal(ctx) << *this << ": corrupted compressed section";
 
   ElfChdr<E> &hdr = *(ElfChdr<E> *)&contents[0];
-  if (hdr.ch_type != ELFCOMPRESS_ZLIB)
+  std::string_view data = contents.substr(sizeof(ElfChdr<E>));
+
+  switch (hdr.ch_type) {
+  case ELFCOMPRESS_ZLIB: {
+    unsigned long size = sh_size;
+    if (::uncompress(buf, &size, (u8 *)data.data(), data.size()) != Z_OK)
+      Fatal(ctx) << *this << ": uncompress failed";
+    assert(size == sh_size);
+    break;
+  }
+  case ELFCOMPRESS_ZSTD:
+    if (ZSTD_decompress(buf, sh_size, (u8 *)data.data(), data.size()) != sh_size)
+      Fatal(ctx) << *this << ": ZSTD_decompress failed";
+    break;
+  default:
     Fatal(ctx) << *this << ": unsupported compression type: 0x"
                << std::hex << hdr.ch_type;
-  do_uncompress(contents.substr(sizeof(ElfChdr<E>)));
+  }
 }
 
 typedef enum { NONE, ERROR, COPYREL, PLT, CPLT, DYNREL, BASEREL } Action;
@@ -218,10 +209,25 @@ void InputSection<E>::scan_abs_rel(Context<E> &ctx, Symbol<E> &sym,
 }
 
 template <typename E>
-static Action get_abs_dyn_action(Context<E> &ctx, Symbol<E> &sym) {
+static Action get_abs_dyn_action(Context<E> &ctx, Symbol<E> &sym,
+                                 InputSection<E> &isec) {
+  if (is_ppc<E> && isec.name() == ".toc") {
+    // As a special case, we do not create copy relocations nor canonical
+    // PLTs for PPC64 .toc sections. PPC64's .toc is a compiler-generated
+    // GOT-like section, and no user-generated code directly uses values
+    // in it.
+    constexpr Action table[][4] = {
+      // Absolute  Local    Imported data  Imported code
+      {  NONE,     BASEREL, DYNREL,        DYNREL },  // Shared object
+      {  NONE,     BASEREL, DYNREL,        DYNREL },  // Position-independent exec
+      {  NONE,     NONE,    DYNREL,        DYNREL },  // Position-dependent exec
+    };
+    return get_rel_action(ctx, table, sym);
+  }
+
   // This is a decision table for absolute relocations for the word
-  // size data (e.g. R_X86_64_64). Unlike the above, we can emit a
-  // dynamic relocation if we cannot resolve its address at link-time.
+  // size data (e.g. R_X86_64_64). Unlike the scan_abs_rel, we can emit
+  // a dynamic relocation if we cannot resolve an address at link-time.
   constexpr Action table[][4] = {
     // Absolute  Local    Imported data  Imported code
     {  NONE,     BASEREL, DYNREL,        DYNREL },  // Shared object
@@ -234,7 +240,7 @@ static Action get_abs_dyn_action(Context<E> &ctx, Symbol<E> &sym) {
 template <typename E>
 void InputSection<E>::scan_abs_dyn_rel(Context<E> &ctx, Symbol<E> &sym,
                                        const ElfRel<E> &rel) {
-  Action action = get_abs_dyn_action(ctx, sym);
+  Action action = get_abs_dyn_action(ctx, sym, *this);
   dispatch(ctx, *this, action, sym, rel);
 }
 
@@ -258,20 +264,25 @@ template <typename E>
 void InputSection<E>::apply_abs_dyn_rel(Context<E> &ctx, Symbol<E> &sym,
                                         const ElfRel<E> &rel, u8 *loc,
                                         u64 S, i64 A, u64 P, ElfRel<E> *&dynrel) {
-  switch (get_abs_dyn_action(ctx, sym)) {
+  switch (get_abs_dyn_action(ctx, sym, *this)) {
   case COPYREL:
   case CPLT:
   case NONE:
     *(Word<E> *)loc = S + A;
     break;
   case BASEREL:
-    if (!is_relr_reloc(ctx, rel))
+    if (is_relr_reloc(ctx, rel)) {
+      *(Word<E> *)loc = S + A;
+    } else {
       *dynrel++ = ElfRel<E>(P, E::R_RELATIVE, 0, S + A);
-    *(Word<E> *)loc = S + A;
+      if (ctx.arg.apply_dynamic_relocs)
+        *(Word<E> *)loc = S + A;
+    }
     break;
   case DYNREL:
     *dynrel++ = ElfRel<E>(P, E::R_ABS, sym.get_dynsym_idx(ctx), A);
-    *(Word<E> *)loc = A;
+    if (ctx.arg.apply_dynamic_relocs)
+      *(Word<E> *)loc = A;
     break;
   default:
     unreachable();
@@ -286,10 +297,8 @@ void InputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
   // Copy data
   if constexpr (is_riscv<E>) {
     copy_contents_riscv(ctx, buf);
-  } else if (compressed) {
-    uncompress_to(ctx, buf);
   } else {
-    memcpy(buf, contents.data(), contents.size());
+    uncompress_to(ctx, buf);
   }
 
   // Apply relocations
@@ -365,12 +374,10 @@ void report_undef_errors(Context<E> &ctx) {
   ctx.checkpoint();
 }
 
-#define INSTANTIATE(E)                                                  \
-  template struct CieRecord<E>;                                         \
-  template class InputSection<E>;                                       \
-  template void report_undef_errors(Context<E> &)
+using E = MOLD_TARGET;
 
-
-INSTANTIATE_ALL;
+template struct CieRecord<E>;
+template class InputSection<E>;
+template void report_undef_errors(Context<E> &);
 
 } // namespace mold::elf

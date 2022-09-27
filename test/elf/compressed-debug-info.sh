@@ -12,7 +12,7 @@ echo -n "Testing $testname ... "
 t=out/test/elf/$MACHINE/$testname
 mkdir -p $t
 
-which dwarfdump >& /dev/null || { echo skipped; exit; }
+command -v dwarfdump >& /dev/null || { echo skipped; exit; }
 
 cat <<EOF | $CXX -c -o $t/a.o -g -gz=zlib -xc++ -
 int main() {
@@ -28,6 +28,6 @@ EOF
 
 $CC -B. -o $t/exe $t/a.o $t/b.o
 dwarfdump $t/exe > /dev/null
-readelf --sections $t/exe | fgrep -q .debug_info
+readelf --sections $t/exe | grep -Fq .debug_info
 
 echo ' OK'

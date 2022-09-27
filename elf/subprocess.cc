@@ -1,3 +1,5 @@
+#ifndef _WIN32
+
 #include "mold.h"
 
 #include <filesystem>
@@ -10,6 +12,7 @@
 
 namespace mold::elf {
 
+#ifdef MOLD_X86_64
 // Exiting from a program with large memory usage is slow --
 // it may take a few hundred milliseconds. To hide the latency,
 // we fork a child and let it do the actual linking work.
@@ -49,10 +52,11 @@ std::function<void()> fork_child() {
 
   return [=] {
     char buf[] = {1};
-    int n = write(pipefd[1], buf, 1);
+    [[maybe_unused]] int n = write(pipefd[1], buf, 1);
     assert(n == 1);
   };
 }
+#endif
 
 template <typename E>
 static std::string find_dso(Context<E> &ctx, std::filesystem::path self) {
@@ -81,8 +85,8 @@ static std::string find_dso(Context<E> &ctx, std::filesystem::path self) {
 template <typename E>
 [[noreturn]]
 void process_run_subcommand(Context<E> &ctx, int argc, char **argv) {
-  std::string_view arg1 = argv[1];
-  assert(arg1 == "-run" || arg1 == "--run");
+  assert(argv[1] == "-run"s || argv[1] == "--run"s);
+
   if (!argv[2])
     Fatal(ctx) << "-run: argument missing";
 
@@ -110,9 +114,10 @@ void process_run_subcommand(Context<E> &ctx, int argc, char **argv) {
   Fatal(ctx) << "mold -run failed: " << argv[2] << ": " << errno_string();
 }
 
-#define INSTANTIATE(E)                                                  \
-  template void process_run_subcommand(Context<E> &, int, char **)
+using E = MOLD_TARGET;
 
-INSTANTIATE_ALL;
+template void process_run_subcommand(Context<E> &, int, char **);
 
 } // namespace mold::elf
+
+#endif

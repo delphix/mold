@@ -1,3 +1,30 @@
+// Supporting x86-64 is straightforward. Unlike its predecessor, i386,
+// x86-64 supports PC-relative addressing for position-independent code.
+// Being CISC, its instructions are variable in size. Branch instructions
+// take 4 bytes offsets, so we don't need range extension thunks.
+//
+// The psABI specifies %r11 as neither caller- nor callee-saved. It's
+// intentionally left out so that we can use it as a scratch register in
+// PLT.
+//
+// Thread Pointer (TP) is stored not to a general-purpose register but to
+// FS segment register. Segment register is a 64-bits register which can
+// be used as a base address for memory access. Each thread has a unique
+// FS value, and they access their thread-local variables relative to FS
+// as %fs:offset_from_tp.
+//
+// The value of a segment register itself is not generally readable from
+// the user space. As a workaround, libc initializes %fs:0 (the first word
+// referenced by FS) to the value of %fs itself. So we can obtain TP just
+// by `mov %fs:0, %rax` if we need it.
+//
+// For historical reasons, TP points past the end of the TLS block on x86.
+// This is contrary to other psABIs which usually use the beginning of the
+// TLS block as TP (with some addend). As a result, offsets from TP to
+// thread-local variables (TLVs) in the main executable are all negative.
+//
+// https://github.com/rui314/mold/wiki/x86-64-psabi.pdf
+
 #include "mold.h"
 
 namespace mold::elf {
@@ -72,22 +99,23 @@ void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
   u8 *loc = ctx.buf + this->shdr.sh_offset + offset;
 
   switch (rel.r_type) {
-  case R_X86_64_NONE:
-    return;
+  case R_NONE:
+    break;
   case R_X86_64_32:
     *(ul32 *)loc = val;
-    return;
+    break;
   case R_X86_64_64:
     *(ul64 *)loc = val;
-    return;
+    break;
   case R_X86_64_PC32:
     *(ul32 *)loc = val - this->shdr.sh_addr - offset;
-    return;
+    break;
   case R_X86_64_PC64:
     *(ul64 *)loc = val - this->shdr.sh_addr - offset;
-    return;
+    break;
+  default:
+    Fatal(ctx) << "unsupported relocation in .eh_frame: " << rel;
   }
-  unreachable();
 }
 
 static u32 relax_gotpcrelx(u8 *loc) {
@@ -169,128 +197,107 @@ static u32 relax_gotpc32_tlsdesc(u8 *loc) {
 // scan_relocations().
 template <>
 void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
-  ElfRel<E> *dynrel = nullptr;
   std::span<const ElfRel<E>> rels = get_rels(ctx);
-  i64 frag_idx = 0;
 
+  ElfRel<E> *dynrel = nullptr;
   if (ctx.reldyn)
     dynrel = (ElfRel<E> *)(ctx.buf + ctx.reldyn->shdr.sh_offset +
-                                file.reldyn_offset + this->reldyn_offset);
+                           file.reldyn_offset + this->reldyn_offset);
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_X86_64_NONE)
+    if (rel.r_type == R_NONE)
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
     u8 *loc = base + rel.r_offset;
 
-    const SectionFragmentRef<E> *frag_ref = nullptr;
-    if (rel_fragments && rel_fragments[frag_idx].idx == i)
-      frag_ref = &rel_fragments[frag_idx++];
-
-    auto overflow_check = [&](i64 val, i64 lo, i64 hi) {
+    auto check = [&](i64 val, i64 lo, i64 hi) {
       if (val < lo || hi <= val)
         Error(ctx) << *this << ": relocation " << rel << " against "
                    << sym << " out of range: " << val << " is not in ["
                    << lo << ", " << hi << ")";
     };
 
-    auto write8 = [&](u64 val) {
-      overflow_check(val, 0, 1 << 8);
-      *loc = val;
-    };
-
-    auto write8s = [&](u64 val) {
-      overflow_check(val, -(1 << 7), 1 << 7);
-      *loc = val;
-    };
-
-    auto write16 = [&](u64 val) {
-      overflow_check(val, 0, 1 << 16);
-      *(ul16 *)loc = val;
-    };
-
-    auto write16s = [&](u64 val) {
-      overflow_check(val, -(1 << 15), 1 << 15);
-      *(ul16 *)loc = val;
-    };
-
     auto write32 = [&](u64 val) {
-      overflow_check(val, 0, (i64)1 << 32);
+      check(val, 0, 1LL << 32);
       *(ul32 *)loc = val;
     };
 
     auto write32s = [&](u64 val) {
-      overflow_check(val, -((i64)1 << 31), (i64)1 << 31);
+      check(val, -(1LL << 31), 1LL << 31);
       *(ul32 *)loc = val;
     };
 
-    auto write64 = [&](u64 val) {
-      *(ul64 *)loc = val;
-    };
-
-#define S   (frag_ref ? frag_ref->frag->get_addr(ctx) : sym.get_addr(ctx))
-#define A   (frag_ref ? (u64)frag_ref->addend : (u64)rel.r_addend)
-#define P   (output_section->shdr.sh_addr + offset + rel.r_offset)
+#define S   sym.get_addr(ctx)
+#define A   rel.r_addend
+#define P   (get_addr() + rel.r_offset)
 #define G   (sym.get_got_addr(ctx) - ctx.gotplt->shdr.sh_addr)
 #define GOT ctx.gotplt->shdr.sh_addr
 
     switch (rel.r_type) {
-    case R_X86_64_8:
-      write8(S + A);
-      continue;
-    case R_X86_64_16:
-      write16(S + A);
-      continue;
+    case R_X86_64_8: {
+      i64 val = S + A;
+      check(val, 0, 1 << 8);
+      *loc = val;
+      break;
+    }
+    case R_X86_64_16: {
+      i64 val = S + A;
+      check(val, 0, 1 << 16);
+      *(ul16 *)loc = val;
+      break;
+    }
     case R_X86_64_32:
       write32(S + A);
-      continue;
+      break;
     case R_X86_64_32S:
       write32s(S + A);
-      continue;
+      break;
     case R_X86_64_64:
       apply_abs_dyn_rel(ctx, sym, rel, loc, S, A, P, dynrel);
-      continue;
-    case R_X86_64_PC8:
-      write8s(S + A - P);
-      continue;
-    case R_X86_64_PC16:
-      write16s(S + A - P);
-      continue;
+      break;
+    case R_X86_64_PC8: {
+      i64 val = S + A - P;
+      check(val, -(1 << 7), 1 << 7);
+      *loc = val;
+      break;
+    }
+    case R_X86_64_PC16: {
+      i64 val = S + A - P;
+      check(val, -(1 << 15), 1 << 15);
+      *(ul16 *)loc = val;
+      break;
+    }
     case R_X86_64_PC32:
-      write32s(S + A - P);
-      continue;
-    case R_X86_64_PC64:
-      write64(S + A - P);
-      continue;
     case R_X86_64_PLT32:
       write32s(S + A - P);
-      continue;
-    case R_X86_64_PLTOFF64:
-      write64(S + A - GOT);
+      break;
+    case R_X86_64_PC64:
+      *(ul64 *)loc = S + A - P;
       break;
     case R_X86_64_GOT32:
       write32s(G + A);
-      continue;
+      break;
     case R_X86_64_GOT64:
-      write64(G + A);
-      continue;
+      *(ul64 *)loc = G + A;
+      break;
     case R_X86_64_GOTOFF64:
-      write64(S + A - GOT);
-      continue;
+    case R_X86_64_PLTOFF64:
+      *(ul64 *)loc = S + A - GOT;
+      break;
     case R_X86_64_GOTPC32:
       write32s(GOT + A - P);
-      continue;
+      break;
     case R_X86_64_GOTPC64:
-      write64(GOT + A - P);
-      continue;
+      *(ul64 *)loc = GOT + A - P;
+      break;
     case R_X86_64_GOTPCREL:
       write32s(G + GOT + A - P);
-      continue;
+      break;
     case R_X86_64_GOTPCREL64:
-      write64(G + GOT + A - P);
-      continue;
+      *(ul64 *)loc = G + GOT + A - P;
+      break;
     case R_X86_64_GOTPCRELX:
       if (sym.get_got_idx(ctx) == -1) {
         u32 insn = relax_gotpcrelx(loc - 2);
@@ -300,7 +307,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       } else {
         write32s(G + GOT + A - P);
       }
-      continue;
+      break;
     case R_X86_64_REX_GOTPCRELX:
       if (sym.get_got_idx(ctx) == -1) {
         u32 insn = relax_rex_gotpcrelx(loc - 3);
@@ -311,29 +318,47 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       } else {
         write32s(G + GOT + A - P);
       }
-      continue;
+      break;
     case R_X86_64_TLSGD:
       if (sym.get_tlsgd_idx(ctx) == -1) {
-        // Relax GD to LE
-        i64 val = S - ctx.tls_end + A + 4;
-        overflow_check(val, -((i64)1 << 31), (i64)1 << 31);
+        // Relax GD to LE. If we are creating an exectuable, the offset of
+        // a thread-local variable from TP is a link-time constant. So we
+        // don't need to call __tls_get_addr to obtain the address of a TLV.
+        i64 val = S - ctx.tp_addr;
+        assert(A == -4);
+        check(val, -(1LL << 31), 1LL << 31);
 
         switch (rels[i + 1].r_type) {
         case R_X86_64_PLT32:
         case R_X86_64_GOTPCREL:
         case R_X86_64_GOTPCRELX: {
+          // The original instructions are the following:
+          //
+          //  66 48 8d 3d 00 00 00 00    lea  foo@tlsgd(%rip), %rdi
+          //  66 66 48 e8 00 00 00 00    call __tls_get_addr
+          //
+          // or
+          //
+          //  66 48 8d 3d 00 00 00 00    lea foo@tlsgd(%rip), %rdi
+          //  66 48 ff 15 00 00 00 00    call *__tls_get_addr@GOT(%rip)
           static const u8 insn[] = {
             0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, // mov %fs:0, %rax
-            0x48, 0x8d, 0x80, 0,    0,    0, 0,       // lea 0(%rax), %rax
+            0x48, 0x81, 0xc0, 0, 0, 0, 0,             // add $val, %rax
           };
           memcpy(loc - 4, insn, sizeof(insn));
           *(ul32 *)(loc + 8) = val;
           break;
         }
         case R_X86_64_PLTOFF64: {
+          // The original instructions are the following:
+          //
+          //  48 8d 3d 00 00 00 00           lea    foo@tlsgd(%rip), %rdi
+          //  48 b8 00 00 00 00 00 00 00 00  movabs __tls_get_addr, %rax
+          //  48 01 d8                       add    %rbx, %rax
+          //  ff d0                          call   *%rax
           static const u8 insn[] = {
             0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, // mov %fs:0, %rax
-            0x48, 0x8d, 0x80, 0,    0,    0, 0,       // lea 0(%rax), %rax
+            0x48, 0x81, 0xc0, 0, 0, 0, 0,             // add $val, %rax
             0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00,       // nop
           };
           memcpy(loc - 3, insn, sizeof(insn));
@@ -348,34 +373,56 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       } else {
         write32s(sym.get_tlsgd_addr(ctx) + A - P);
       }
-      continue;
+      break;
     case R_X86_64_TLSLD:
       if (ctx.got->tlsld_idx == -1) {
-        // Relax LD to LE
+        // Relax LD to LE. If we are creating an executable, we don't need
+        // to call __tls_get_addr to obtain the address of the beginning
+        // of the current TLS block. TP points past the end of the TLS
+        // block, and we know the exact size of the TLS block we have
+        // created, so we can just subtract it from TP.
         switch (rels[i + 1].r_type) {
         case R_X86_64_PLT32: {
+          // The original instructions are the following:
+          //
+          //  48 8d 3d 00 00 00 00    lea    foo@tlsld(%rip), %rdi
+          //  e8 00 00 00 00          call   __tls_get_addr
           static const u8 insn[] = {
-            0x66, 0x66, 0x66,                         // (padding)
-            0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, // mov %fs:0, %rax
+            0x31, 0xc0,                   // xor %eax, %eax
+            0x64, 0x48, 0x8b, 0x00,       // mov %fs:(%rax), %rax
+            0x48, 0x2d, 0, 0, 0, 0,       // sub $tls_size, %rax
           };
           memcpy(loc - 3, insn, sizeof(insn));
           break;
         }
         case R_X86_64_GOTPCREL:
         case R_X86_64_GOTPCRELX: {
+          // The original instructions are the following:
+          //
+          //  48 8d 3d 00 00 00 00    lea    foo@tlsld(%rip), %rdi
+          //  ff 15 00 00 00 00       call   *__tls_get_addr@GOT(%rip)
           static const u8 insn[] = {
-            0x66, 0x66, 0x66,                         // (padding)
-            0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, // mov %fs:0, %rax
-            0x90,                                     // nop
+            0x31, 0xc0,                   // xor %eax, %eax
+            0x64, 0x48, 0x8b, 0x00,       // mov %fs:(%rax), %rax
+            0x48, 0x2d, 0, 0, 0, 0,       // sub $tls_size, %rax
+            0x90,                         // nop
           };
           memcpy(loc - 3, insn, sizeof(insn));
           break;
         }
         case R_X86_64_PLTOFF64: {
+          // The original instructions are the following:
+          //
+          //  48 8d 3d 00 00 00 00           lea    foo@tlsld(%rip), %rdi
+          //  48 b8 00 00 00 00 00 00 00 00  movabs __tls_get_addr@GOTOFF, %rax
+          //  48 01 d8                       add    %rbx, %rax
+          //  ff d0                          call   *%rax
           static const u8 insn[] = {
-            0x66, 0x66, 0x66,                         // (padding)
-            0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, // mov %fs:0, %rax
-            0x66, 0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, // nop
+            0x31, 0xc0,                   // xor %eax, %eax
+            0x64, 0x48, 0x8b, 0x00,       // mov %fs:(%rax), %rax
+            0x48, 0x2d, 0, 0, 0, 0,       // sub $tls_size, %rax
+            0x0f, 0x1f, 0x44, 0x00, 0x00, // nop
+            0x0f, 0x1f, 0x44, 0x00, 0x00, // nop
           };
           memcpy(loc - 3, insn, sizeof(insn));
           break;
@@ -384,64 +431,62 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
           unreachable();
         }
 
+        *(ul32 *)(loc + 5) = ctx.tp_addr - ctx.tls_begin;
+        assert(A == -4);
         i++;
       } else {
         write32s(ctx.got->get_tlsld_addr(ctx) + A - P);
       }
-      continue;
+      break;
     case R_X86_64_DTPOFF32:
-      if (ctx.arg.relax && !ctx.arg.shared)
-        write32s(S + A - ctx.tls_end);
-      else
-        write32s(S + A - ctx.tls_begin);
-      continue;
+      write32s(S + A - ctx.tls_begin);
+      break;
     case R_X86_64_DTPOFF64:
-      if (ctx.arg.relax && !ctx.arg.shared)
-        write64(S + A - ctx.tls_end);
-      else
-        write64(S + A - ctx.tls_begin);
-      continue;
+      *(ul64 *)loc = S + A - ctx.tls_begin;
+      break;
     case R_X86_64_TPOFF32:
-      write32s(S + A - ctx.tls_end);
-      continue;
+      write32s(S + A - ctx.tp_addr);
+      break;
     case R_X86_64_TPOFF64:
-      write64(S + A - ctx.tls_end);
-      continue;
+      *(ul64 *)loc = S + A - ctx.tp_addr;
+      break;
     case R_X86_64_GOTTPOFF:
       if (sym.get_gottp_idx(ctx) == -1) {
         u32 insn = relax_gottpoff(loc - 3);
         loc[-3] = insn >> 16;
         loc[-2] = insn >> 8;
         loc[-1] = insn;
-        write32s(S + A - ctx.tls_end + 4);
+        write32s(S - ctx.tp_addr);
+        assert(A == -4);
       } else {
         write32s(sym.get_gottp_addr(ctx) + A - P);
       }
-      continue;
+      break;
     case R_X86_64_GOTPC32_TLSDESC:
       if (sym.get_tlsdesc_idx(ctx) == -1) {
         u32 insn = relax_gotpc32_tlsdesc(loc - 3);
         loc[-3] = insn >> 16;
         loc[-2] = insn >> 8;
         loc[-1] = insn;
-        write32s(S + A - ctx.tls_end + 4);
+        write32s(S - ctx.tp_addr);
+        assert(A == -4);
       } else {
         write32s(sym.get_tlsdesc_addr(ctx) + A - P);
       }
-      continue;
+      break;
     case R_X86_64_SIZE32:
       write32(sym.esym().st_size + A);
-      continue;
+      break;
     case R_X86_64_SIZE64:
-      write64(sym.esym().st_size + A);
-      continue;
+      *(ul64 *)loc = sym.esym().st_size + A;
+      break;
     case R_X86_64_TLSDESC_CALL:
       if (sym.get_tlsdesc_idx(ctx) == -1) {
         // call *(%rax) -> nop
         loc[0] = 0x66;
         loc[1] = 0x90;
       }
-      continue;
+      break;
     default:
       unreachable();
     }
@@ -472,7 +517,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_X86_64_NONE)
+    if (rel.r_type == R_NONE)
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
@@ -483,47 +528,43 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       continue;
     }
 
-    SectionFragment<E> *frag;
-    i64 addend;
-    std::tie(frag, addend) = get_fragment(ctx, rel);
-
-    auto overflow_check = [&](i64 val, i64 lo, i64 hi) {
+    auto check = [&](i64 val, i64 lo, i64 hi) {
       if (val < lo || hi <= val)
         Error(ctx) << *this << ": relocation " << rel << " against "
                    << sym << " out of range: " << val << " is not in ["
                    << lo << ", " << hi << ")";
     };
 
-    auto write8 = [&](u64 val) {
-      overflow_check(val, 0, 1 << 8);
-      *loc = val;
-    };
-
-    auto write16 = [&](u64 val) {
-      overflow_check(val, 0, 1 << 16);
-      *(ul16 *)loc = val;
-    };
-
     auto write32 = [&](u64 val) {
-      overflow_check(val, 0, (i64)1 << 32);
+      check(val, 0, 1LL << 32);
       *(ul32 *)loc = val;
     };
 
     auto write32s = [&](u64 val) {
-      overflow_check(val, -((i64)1 << 31), (i64)1 << 31);
+      check(val, -(1LL << 31), 1LL << 31);
       *(ul32 *)loc = val;
     };
 
+    SectionFragment<E> *frag;
+    i64 frag_addend;
+    std::tie(frag, frag_addend) = get_fragment(ctx, rel);
+
 #define S (frag ? frag->get_addr(ctx) : sym.get_addr(ctx))
-#define A (frag ? (u64)addend : (u64)rel.r_addend)
+#define A (frag ? frag_addend : (i64)rel.r_addend)
 
     switch (rel.r_type) {
-    case R_X86_64_8:
-      write8(S + A);
+    case R_X86_64_8: {
+      i64 val = S + A;
+      check(val, 0, 1 << 8);
+      *loc = val;
       break;
-    case R_X86_64_16:
-      write16(S + A);
+    }
+    case R_X86_64_16: {
+      i64 val = S + A;
+      check(val, 0, 1 << 16);
+      *(ul16 *)loc = val;
       break;
+    }
     case R_X86_64_32:
       write32(S + A);
       break;
@@ -531,22 +572,19 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       write32s(S + A);
       break;
     case R_X86_64_64:
-      if (!frag) {
-        if (std::optional<u64> val = get_tombstone(sym)) {
-          *(ul64 *)loc = *val;
-          break;
-        }
-      }
-      *(ul64 *)loc = S + A;
+      if (std::optional<u64> val = get_tombstone(sym, frag))
+        *(ul64 *)loc = *val;
+      else
+        *(ul64 *)loc = S + A;
       break;
     case R_X86_64_DTPOFF32:
-      if (std::optional<u64> val = get_tombstone(sym))
+      if (std::optional<u64> val = get_tombstone(sym, frag))
         *(ul32 *)loc = *val;
       else
         write32s(S + A - ctx.tls_begin);
       break;
     case R_X86_64_DTPOFF64:
-      if (std::optional<u64> val = get_tombstone(sym))
+      if (std::optional<u64> val = get_tombstone(sym, frag))
         *(ul64 *)loc = *val;
       else
         *(ul64 *)loc = S + A - ctx.tls_begin;
@@ -583,7 +621,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
   // Scan relocations
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_X86_64_NONE)
+    if (rel.r_type == R_NONE)
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
@@ -647,6 +685,9 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
         sym.flags |= NEEDS_PLT;
       break;
     case R_X86_64_TLSGD: {
+      if (rel.r_addend != -4)
+        Fatal(ctx) << *this << ": bad r_addend for R_X86_64_TLSGD";
+
       if (i + 1 == rels.size())
         Fatal(ctx) << *this << ": TLSGD reloc must be followed by PLT or GOTPCREL";
 
@@ -662,6 +703,9 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       break;
     }
     case R_X86_64_TLSLD: {
+      if (rel.r_addend != -4)
+        Fatal(ctx) << *this << ": bad r_addend for R_X86_64_TLSLD";
+
       if (i + 1 == rels.size())
         Fatal(ctx) << *this << ": TLSLD reloc must be followed by PLT or GOTPCREL";
 
@@ -677,6 +721,9 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       break;
     }
     case R_X86_64_GOTTPOFF: {
+      if (rel.r_addend != -4)
+        Fatal(ctx) << *this << ": bad r_addend for R_X86_64_GOTTPOFF";
+
       ctx.has_gottp_rel = true;
 
       bool do_relax = ctx.arg.relax && !ctx.arg.shared &&
@@ -686,6 +733,9 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       break;
     }
     case R_X86_64_GOTPC32_TLSDESC: {
+      if (rel.r_addend != -4)
+        Fatal(ctx) << *this << ": bad r_addend for R_X86_64_GOTPC32_TLSDESC";
+
       if (relax_gotpc32_tlsdesc(loc - 3) == 0)
         Fatal(ctx) << *this << ": GOTPC32_TLSDESC relocation is used"
                    << " against an invalid code sequence";

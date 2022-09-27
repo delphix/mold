@@ -1,3 +1,22 @@
+// This file contains ARM64-specific code. Being new, the ARM64's ELF
+// psABI doesn't have anything peculiar. ARM64 is a clean RISC
+// instruction set that supports PC-relative load/store instructions.
+//
+// Unlike ARM32, instructions length doesn't vary. All ARM64
+// instructions are 4 bytes long.
+//
+// Branch instructions used for function call can jump within ±128 MiB.
+// We need to create range extension thunks to support binaries whose
+// .text is larger than that.
+//
+// Unlike most other targets, the TLSDESC access model is used by default
+// for -fPIC to access thread-local variables instead of the less
+// efficient GD model. You can still enable GD but it needs the
+// -mtls-dialect=trad flag. Since GD is used rarely, we don't need to
+// implement GD → LE relaxation.
+//
+// https://github.com/ARM-software/abi-aa/blob/main/aaelf64/aaelf64.rst
+
 #include "mold.h"
 
 namespace mold::elf {
@@ -7,32 +26,32 @@ using E = ARM64;
 static void write_adrp(u8 *buf, u64 val) {
   u32 hi = bits(val, 32, 14);
   u32 lo = bits(val, 13, 12);
-  u32 op = *(ul32 *)buf & 0b1001'1111'0000'0000'0000'0000'0001'1111;
-  *(ul32 *)buf = (lo << 29) | (hi << 5) | op;
+  *(ul32 *)buf &= 0b1001'1111'0000'0000'0000'0000'0001'1111;
+  *(ul32 *)buf |= (lo << 29) | (hi << 5);
 }
 
 static void write_adr(u8 *buf, u64 val) {
   u32 hi = bits(val, 20, 2);
   u32 lo = bits(val, 1, 0);
-  u32 op = *(ul32 *)buf & 0b1001'1111'0000'0000'0000'0000'0001'1111;
-  *(ul32 *)buf = (lo << 29) | (hi << 5) | op;
+  *(ul32 *)buf &= 0b1001'1111'0000'0000'0000'0000'0001'1111;
+  *(ul32 *)buf |= (lo << 29) | (hi << 5);
 }
 
 static u64 page(u64 val) {
-  return val & ~(u64)0xfff;
+  return val & 0xffff'ffff'ffff'f000;
 }
 
 static void write_plt_header(Context<E> &ctx, u8 *buf) {
   // Write PLT header
-  static const u32 plt0[] = {
-    0xa9bf7bf0, // stp  x16, x30, [sp,#-16]!
-    0x90000010, // adrp x16, .got.plt[2]
-    0xf9400211, // ldr  x17, [x16, .got.plt[2]]
-    0x91000210, // add  x16, x16, .got.plt[2]
-    0xd61f0220, // br   x17
-    0xd503201f, // nop
-    0xd503201f, // nop
-    0xd503201f, // nop
+  static const ul32 plt0[] = {
+    0xa9bf'7bf0, // stp  x16, x30, [sp,#-16]!
+    0x9000'0010, // adrp x16, .got.plt[2]
+    0xf940'0211, // ldr  x17, [x16, .got.plt[2]]
+    0x9100'0210, // add  x16, x16, .got.plt[2]
+    0xd61f'0220, // br   x17
+    0xd503'201f, // nop
+    0xd503'201f, // nop
+    0xd503'201f, // nop
   };
 
   u64 gotplt = ctx.gotplt->shdr.sh_addr + 16;
@@ -47,11 +66,11 @@ static void write_plt_header(Context<E> &ctx, u8 *buf) {
 static void write_plt_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
   u8 *ent = buf + E::plt_hdr_size + sym.get_plt_idx(ctx) * E::plt_size;
 
-  static const u32 data[] = {
-    0x90000010, // adrp x16, .got.plt[n]
-    0xf9400211, // ldr  x17, [x16, .got.plt[n]]
-    0x91000210, // add  x16, x16, .got.plt[n]
-    0xd61f0220, // br   x17
+  static const ul32 data[] = {
+    0x9000'0010, // adrp x16, .got.plt[n]
+    0xf940'0211, // ldr  x17, [x16, .got.plt[n]]
+    0x9100'0210, // add  x16, x16, .got.plt[n]
+    0xd61f'0220, // br   x17
   };
 
   u64 gotplt = sym.get_gotplt_addr(ctx);
@@ -76,13 +95,13 @@ void PltGotSection<E>::copy_buf(Context<E> &ctx) {
   u8 *buf = ctx.buf + this->shdr.sh_offset;
 
   for (Symbol<E> *sym : symbols) {
-    u8 *ent = buf + sym->get_pltgot_idx(ctx) * ARM64::pltgot_size;
+    u8 *ent = buf + sym->get_pltgot_idx(ctx) * E::pltgot_size;
 
-    static const u32 data[] = {
-      0x90000010, // adrp x16, GOT[n]
-      0xf9400211, // ldr  x17, [x16, GOT[n]]
-      0xd61f0220, // br   x17
-      0xd503201f, // nop
+    static const ul32 data[] = {
+      0x9000'0010, // adrp x16, GOT[n]
+      0xf940'0211, // ldr  x17, [x16, GOT[n]]
+      0xd61f'0220, // br   x17
+      0xd503'201f, // nop
     };
 
     u64 got = sym->get_got_addr(ctx);
@@ -100,117 +119,129 @@ void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
   u8 *loc = ctx.buf + this->shdr.sh_offset + offset;
 
   switch (rel.r_type) {
+  case R_NONE:
+    break;
   case R_AARCH64_ABS64:
     *(ul64 *)loc = val;
-    return;
+    break;
   case R_AARCH64_PREL32:
     *(ul32 *)loc = val - this->shdr.sh_addr - offset;
-    return;
+    break;
   case R_AARCH64_PREL64:
     *(ul64 *)loc = val - this->shdr.sh_addr - offset;
-    return;
+    break;
+  default:
+    Fatal(ctx) << "unsupported relocation in .eh_frame: " << rel;
   }
-  Fatal(ctx) << "unsupported relocation in .eh_frame: " << rel;
 }
 
 template <>
 void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
-  ElfRel<E> *dynrel = nullptr;
   std::span<const ElfRel<E>> rels = get_rels(ctx);
 
-  i64 frag_idx = 0;
-
+  ElfRel<E> *dynrel = nullptr;
   if (ctx.reldyn)
     dynrel = (ElfRel<E> *)(ctx.buf + ctx.reldyn->shdr.sh_offset +
                            file.reldyn_offset + this->reldyn_offset);
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_AARCH64_NONE)
+    if (rel.r_type == R_NONE)
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
     u8 *loc = base + rel.r_offset;
 
-    const SectionFragmentRef<E> *frag_ref = nullptr;
-    if (rel_fragments && rel_fragments[frag_idx].idx == i)
-      frag_ref = &rel_fragments[frag_idx++];
-
-    auto overflow_check = [&](i64 val, i64 lo, i64 hi) {
+    auto check = [&](i64 val, i64 lo, i64 hi) {
       if (val < lo || hi <= val)
         Error(ctx) << *this << ": relocation " << rel << " against "
                    << sym << " out of range: " << val << " is not in ["
                    << lo << ", " << hi << ")";
     };
 
-#define S   (frag_ref ? frag_ref->frag->get_addr(ctx) : sym.get_addr(ctx))
-#define A   (frag_ref ? (u64)frag_ref->addend : (u64)rel.r_addend)
-#define P   (output_section->shdr.sh_addr + offset + rel.r_offset)
+#define S   sym.get_addr(ctx)
+#define A   rel.r_addend
+#define P   (get_addr() + rel.r_offset)
 #define G   (sym.get_got_idx(ctx) * sizeof(Word<E>))
 #define GOT ctx.got->shdr.sh_addr
 
     switch (rel.r_type) {
     case R_AARCH64_ABS64:
       apply_abs_dyn_rel(ctx, sym, rel, loc, S, A, P, dynrel);
-      continue;
+      break;
     case R_AARCH64_LDST8_ABS_LO12_NC:
       *(ul32 *)loc |= bits(S + A, 11, 0) << 10;
-      continue;
+      break;
     case R_AARCH64_LDST16_ABS_LO12_NC:
       *(ul32 *)loc |= bits(S + A, 11, 1) << 10;
-      continue;
+      break;
     case R_AARCH64_LDST32_ABS_LO12_NC:
       *(ul32 *)loc |= bits(S + A, 11, 2) << 10;
-      continue;
+      break;
     case R_AARCH64_LDST64_ABS_LO12_NC:
       *(ul32 *)loc |= bits(S + A, 11, 3) << 10;
-      continue;
+      break;
     case R_AARCH64_LDST128_ABS_LO12_NC:
       *(ul32 *)loc |= bits(S + A, 11, 4) << 10;
-      continue;
+      break;
     case R_AARCH64_ADD_ABS_LO12_NC:
       *(ul32 *)loc |= bits(S + A, 11, 0) << 10;
-      continue;
-    case R_AARCH64_MOVW_UABS_G0:
+      break;
+    case R_AARCH64_MOVW_UABS_G0: {
+      i64 val = S + A;
+      check(val, 0, 1 << 16);
+      *(ul32 *)loc |= bits(val, 15, 0) << 5;
+      break;
+    }
     case R_AARCH64_MOVW_UABS_G0_NC:
       *(ul32 *)loc |= bits(S + A, 15, 0) << 5;
-      continue;
-    case R_AARCH64_MOVW_UABS_G1:
+      break;
+    case R_AARCH64_MOVW_UABS_G1: {
+      i64 val = S + A;
+      check(val, 0, 1LL << 32);
+      *(ul32 *)loc |= bits(val, 31, 16) << 5;
+      break;
+    }
     case R_AARCH64_MOVW_UABS_G1_NC:
       *(ul32 *)loc |= bits(S + A, 31, 16) << 5;
-      continue;
-    case R_AARCH64_MOVW_UABS_G2:
+      break;
+    case R_AARCH64_MOVW_UABS_G2: {
+      i64 val = S + A;
+      check(val, 0, 1LL << 48);
+      *(ul32 *)loc |= bits(val, 47, 32) << 5;
+      break;
+    }
     case R_AARCH64_MOVW_UABS_G2_NC:
       *(ul32 *)loc |= bits(S + A, 47, 32) << 5;
-      continue;
+      break;
     case R_AARCH64_MOVW_UABS_G3:
       *(ul32 *)loc |= bits(S + A, 63, 48) << 5;
-      continue;
+      break;
     case R_AARCH64_ADR_GOT_PAGE: {
       i64 val = page(G + GOT + A) - page(P);
-      overflow_check(val, -((i64)1 << 32), (i64)1 << 32);
+      check(val, -(1LL << 32), 1LL << 32);
       write_adrp(loc, val);
-      continue;
+      break;
     }
     case R_AARCH64_ADR_PREL_PG_HI21: {
       i64 val = page(S + A) - page(P);
-      overflow_check(val, -((i64)1 << 32), (i64)1 << 32);
+      check(val, -(1LL << 32), 1LL << 32);
       write_adrp(loc, val);
-      continue;
+      break;
     }
     case R_AARCH64_ADR_PREL_LO21: {
       i64 val = S + A - P;
-      overflow_check(val, -((i64)1 << 20), (i64)1 << 20);
+      check(val, -(1LL << 20), 1LL << 20);
       write_adr(loc, val);
-      continue;
+      break;
     }
     case R_AARCH64_CALL26:
     case R_AARCH64_JUMP26: {
-      if (sym.esym().is_undef_weak()) {
+      if (sym.is_remaining_undef_weak()) {
         // On ARM, calling an weak undefined symbol jumps to the
         // next instruction.
-        *(ul32 *)loc |= 1;
-        continue;
+        *(ul32 *)loc = 0xd503'201f; // nop
+        break;
       }
 
       i64 lo = -(1 << 27);
@@ -223,104 +254,104 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         assert(lo <= val && val < hi);
       }
 
-      *(ul32 *)loc |= (val >> 2) & 0x3ffffff;
-      continue;
+      *(ul32 *)loc |= (val >> 2) & 0x03ff'ffff;
+      break;
     }
     case R_AARCH64_CONDBR19:
     case R_AARCH64_LD_PREL_LO19: {
       i64 val = S + A - P;
-      overflow_check(val, -((i64)1 << 20), (i64)1 << 20);
+      check(val, -(1LL << 20), 1LL << 20);
       *(ul32 *)loc |= bits(val, 20, 2) << 5;
-      continue;
+      break;
     }
     case R_AARCH64_PREL16: {
       i64 val = S + A - P;
-      overflow_check(val, -((i64)1 << 15), (i64)1 << 15);
+      check(val, -(1LL << 15), 1LL << 15);
       *(ul16 *)loc = val;
-      continue;
+      break;
     }
     case R_AARCH64_PREL32: {
       i64 val = S + A - P;
-      overflow_check(val, -((i64)1 << 31), (i64)1 << 32);
+      check(val, -(1LL << 31), 1LL << 32);
       *(ul32 *)loc = val;
-      continue;
+      break;
     }
     case R_AARCH64_PREL64:
       *(ul64 *)loc = S + A - P;
-      continue;
+      break;
     case R_AARCH64_LD64_GOT_LO12_NC:
       *(ul32 *)loc |= bits(G + GOT + A, 11, 3) << 10;
-      continue;
+      break;
     case R_AARCH64_LD64_GOTPAGE_LO15: {
       i64 val = G + GOT + A - page(GOT);
-      overflow_check(val, 0, 1 << 15);
+      check(val, 0, 1 << 15);
       *(ul32 *)loc |= bits(val, 14, 3) << 10;
-      continue;
+      break;
     }
     case R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21: {
       i64 val = page(sym.get_gottp_addr(ctx) + A) - page(P);
-      overflow_check(val, -((i64)1 << 32), (i64)1 << 32);
+      check(val, -(1LL << 32), 1LL << 32);
       write_adrp(loc, val);
-      continue;
+      break;
     }
     case R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC:
       *(ul32 *)loc |= bits(sym.get_gottp_addr(ctx) + A, 11, 3) << 10;
-      continue;
+      break;
     case R_AARCH64_TLSLE_ADD_TPREL_HI12: {
-      i64 val = S + A - ctx.tls_begin + E::tls_tp_offset;
-      overflow_check(val, 0, (i64)1 << 24);
+      i64 val = S + A - ctx.tp_addr;
+      check(val, 0, 1LL << 24);
       *(ul32 *)loc |= bits(val, 23, 12) << 10;
-      continue;
+      break;
     }
     case R_AARCH64_TLSLE_ADD_TPREL_LO12:
     case R_AARCH64_TLSLE_ADD_TPREL_LO12_NC:
-      *(ul32 *)loc |= bits(S + A - ctx.tls_begin + E::tls_tp_offset, 11, 0) << 10;
-      continue;
+      *(ul32 *)loc |= bits(S + A - ctx.tp_addr, 11, 0) << 10;
+      break;
     case R_AARCH64_TLSGD_ADR_PAGE21: {
       i64 val = page(sym.get_tlsgd_addr(ctx) + A) - page(P);
-      overflow_check(val, -((i64)1 << 32), (i64)1 << 32);
+      check(val, -(1LL << 32), 1LL << 32);
       write_adrp(loc, val);
-      continue;
+      break;
     }
     case R_AARCH64_TLSGD_ADD_LO12_NC:
       *(ul32 *)loc |= bits(sym.get_tlsgd_addr(ctx) + A, 11, 0) << 10;
-      continue;
+      break;
     case R_AARCH64_TLSDESC_ADR_PAGE21: {
       if (ctx.relax_tlsdesc && !sym.is_imported) {
         // adrp x0, 0 -> movz x0, #tls_ofset_hi, lsl #16
-        i64 val = (S + A - ctx.tls_begin + E::tls_tp_offset);
-        overflow_check(val, -((i64)1 << 32), (i64)1 << 32);
-        *(ul32 *)loc = 0xd2a00000 | (bits(val, 32, 16) << 5);
+        i64 val = (S + A - ctx.tp_addr);
+        check(val, -(1LL << 32), 1LL << 32);
+        *(ul32 *)loc = 0xd2a0'0000 | (bits(val, 32, 16) << 5);
       } else {
         i64 val = page(sym.get_tlsdesc_addr(ctx) + A) - page(P);
-        overflow_check(val, -((i64)1 << 32), (i64)1 << 32);
+        check(val, -(1LL << 32), 1LL << 32);
         write_adrp(loc, val);
       }
-      continue;
+      break;
     }
     case R_AARCH64_TLSDESC_LD64_LO12:
       if (ctx.relax_tlsdesc && !sym.is_imported) {
         // ldr x2, [x0] -> movk x0, #tls_ofset_lo
-        u32 offset_lo = (S + A - ctx.tls_begin + E::tls_tp_offset) & 0xffff;
-        *(ul32 *)loc = 0xf2800000 | (offset_lo << 5);
+        u32 offset_lo = (S + A - ctx.tp_addr) & 0xffff;
+        *(ul32 *)loc = 0xf280'0000 | (offset_lo << 5);
       } else {
         *(ul32 *)loc |= bits(sym.get_tlsdesc_addr(ctx) + A, 11, 3) << 10;
       }
-      continue;
+      break;
     case R_AARCH64_TLSDESC_ADD_LO12:
       if (ctx.relax_tlsdesc && !sym.is_imported) {
         // add x0, x0, #0 -> nop
-        *(ul32 *)loc = 0xd503201f;
+        *(ul32 *)loc = 0xd503'201f;
       } else {
         *(ul32 *)loc |= bits(sym.get_tlsdesc_addr(ctx) + A, 11, 0) << 10;
       }
-      continue;
+      break;
     case R_AARCH64_TLSDESC_CALL:
       if (ctx.relax_tlsdesc && !sym.is_imported) {
         // blr x2 -> nop
-        *(ul32 *)loc = 0xd503201f;
+        *(ul32 *)loc = 0xd503'201f;
       }
-      continue;
+      break;
     default:
       unreachable();
     }
@@ -339,7 +370,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_AARCH64_NONE)
+    if (rel.r_type == R_NONE)
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
@@ -351,25 +382,22 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
     }
 
     SectionFragment<E> *frag;
-    i64 addend;
-    std::tie(frag, addend) = get_fragment(ctx, rel);
+    i64 frag_addend;
+    std::tie(frag, frag_addend) = get_fragment(ctx, rel);
 
 #define S (frag ? frag->get_addr(ctx) : sym.get_addr(ctx))
-#define A (frag ? (u64)addend : (u64)rel.r_addend)
+#define A (frag ? frag_addend : (i64)rel.r_addend)
 
     switch (rel.r_type) {
     case R_AARCH64_ABS64:
-      if (!frag) {
-        if (std::optional<u64> val = get_tombstone(sym)) {
-          *(ul64 *)loc = *val;
-          break;
-        }
-      }
-      *(ul64 *)loc = S + A;
-      continue;
+      if (std::optional<u64> val = get_tombstone(sym, frag))
+        *(ul64 *)loc = *val;
+      else
+        *(ul64 *)loc = S + A;
+      break;
     case R_AARCH64_ABS32:
       *(ul32 *)loc = S + A;
-      continue;
+      break;
     default:
       Fatal(ctx) << *this << ": invalid relocation for non-allocated sections: "
                  << rel;
@@ -391,7 +419,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
   // Scan relocations
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_AARCH64_NONE)
+    if (rel.r_type == R_NONE)
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
@@ -465,40 +493,14 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
   }
 }
 
-// For range extension thunks
-template <>
-bool is_reachable(Context<E> &ctx, Symbol<E> &sym,
-                  InputSection<E> &isec, const ElfRel<E> &rel) {
-  // We pessimistically assume that PLT entries are unreacahble.
-  if (sym.has_plt(ctx))
-    return false;
-
-  // We create thunks with a pessimistic assumption that all
-  // out-of-section relocations would be out-of-range.
-  InputSection<E> *isec2 = sym.get_input_section();
-  if (!isec2 || isec.output_section != isec2->output_section)
-    return false;
-
-  if (isec2->offset == -1)
-    return false;
-
-  // Compute a distance between the relocated place and the symbol
-  // and check if they are within reach.
-  i64 S = sym.get_addr(ctx);
-  i64 A = rel.r_addend;
-  i64 P = isec.get_addr() + rel.r_offset;
-  i64 val = S + A - P;
-  return -(1 << 27) <= val && val < (1 << 27);
-}
-
 template <>
 void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
   u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
 
-  static const u32 data[] = {
-    0x90000010, // adrp x16, 0   # R_AARCH64_ADR_PREL_PG_HI21
-    0x91000210, // add  x16, x16 # R_AARCH64_ADD_ABS_LO12_NC
-    0xd61f0200, // br   x16
+  static const ul32 data[] = {
+    0x9000'0010, // adrp x16, 0   # R_AARCH64_ADR_PREL_PG_HI21
+    0x9100'0210, // add  x16, x16 # R_AARCH64_ADD_ABS_LO12_NC
+    0xd61f'0200, // br   x16
   };
 
   static_assert(E::thunk_size == sizeof(data));

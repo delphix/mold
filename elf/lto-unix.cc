@@ -426,8 +426,10 @@ get_api_version(const char *plugin_identifier,
   if (LAPI_V1 < minimal_api_supported)
     Fatal(*gctx<E>) << "LTO plugin does not support V0 or V1 API";
 
+  std::string version = mold_version + "\0"s;
+
   *linker_identifier = "mold";
-  *linker_version = MOLD_VERSION;
+  *linker_version = version.data();
 
   if (LAPI_V1 <= maximal_api_supported) {
     is_gcc_linker_api_v1 = true;
@@ -500,7 +502,7 @@ static void load_plugin(Context<E> &ctx) {
   tv.emplace_back(LDPT_GET_API_VERSION, get_api_version<E>);
   tv.emplace_back(LDPT_NULL, 0);
 
-  PluginStatus status = onload(tv.data());
+  [[maybe_unused]] PluginStatus status = onload(tv.data());
   assert(status == LDPS_OK);
 }
 
@@ -644,7 +646,6 @@ ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   }
 
   obj->elf_syms = *esyms;
-  obj->sym_fragments.resize(esyms->size());
   obj->symvers.resize(esyms->size());
   plugin_symbols.clear();
   return obj;
@@ -693,12 +694,10 @@ void lto_cleanup(Context<E> &ctx) {
     cleanup_hook();
 }
 
-#define INSTANTIATE(E)                                                  \
-  template ObjectFile<E> *                                              \
-    read_lto_object(Context<E> &, MappedFile<Context<E>> *);            \
-  template std::vector<ObjectFile<E> *> do_lto(Context<E> &);           \
-  template void lto_cleanup(Context<E> &)
+using E = MOLD_TARGET;
 
-INSTANTIATE_ALL;
+template ObjectFile<E> *read_lto_object(Context<E> &, MappedFile<Context<E>> *);
+template std::vector<ObjectFile<E> *> do_lto(Context<E> &);
+template void lto_cleanup(Context<E> &);
 
 } // namespace mold::elf
