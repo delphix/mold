@@ -16,8 +16,9 @@ mkdir -p $t
 
 [ $MACHINE = riscv32 ] && { echo skipped; exit; }
 [ $MACHINE = riscv64 ] && { echo skipped; exit; }
+[ $MACHINE = sparc64 ] && { echo skipped; exit; }
 
-which gdb >& /dev/null || { echo skipped; exit; }
+command -v gdb >& /dev/null || { echo skipped; exit; }
 
 echo 'int main() {}' | $CC -o /dev/null -xc -gdwarf-5 -g - >& /dev/null ||
   { echo skipped; exit; }
@@ -78,7 +79,7 @@ $CC -c -o $t/c.o $t/c.c -fPIC -g -ggnu-pubnames -gdwarf-5
 $CC -c -o $t/d.o $t/d.c -fPIC -g -ggnu-pubnames -gdwarf-5 -ffunction-sections
 
 $CC -B. -shared -o $t/e.so $t/a.o $t/b.o $t/c.o $t/d.o -Wl,--gdb-index
-readelf -WS $t/e.so 2> /dev/null | fgrep -q .gdb_index
+readelf -WS $t/e.so 2> /dev/null | grep -Fq .gdb_index
 
 cat <<EOF | $CC -c -o $t/f.o -fPIC -g -ggnu-pubnames -gdwarf-5 -xc - -gz
 void fn1();
@@ -89,7 +90,7 @@ int main() {
 EOF
 
 $CC -B. -o $t/exe $t/e.so $t/f.o -Wl,--gdb-index
-readelf -WS $t/exe 2> /dev/null | fgrep -q .gdb_index
+readelf -WS $t/exe 2> /dev/null | grep -Fq .gdb_index
 
 $QEMU $t/exe | grep -q 'Hello world'
 

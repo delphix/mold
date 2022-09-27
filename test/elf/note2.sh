@@ -36,10 +36,9 @@ cat <<EOF | $CC -o $t/d.o -c -xc -
 int main() {}
 EOF
 
-./mold -static -o $t/exe $t/a.o $t/b.o $t/c.o $t/d.o
+./mold -o $t/exe $t/a.o $t/b.o $t/c.o $t/d.o
 
 readelf --segments $t/exe > $t/log
-fgrep -q '01     .note.b' $t/log
-fgrep -q '02     .note.a .note.c' $t/log
+grep -Fq '01     .note.a .note.c .note.b' $t/log
 
 echo OK

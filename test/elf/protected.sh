@@ -39,8 +39,9 @@ int foo() {
   return 3;
 }
 
+int x = 5;
 int bar();
-void *baz();
+void *baz() { return &x; }
 
 int main() {
   printf("%d %d %d\n", foo(), bar(), baz == baz());
@@ -48,6 +49,6 @@ int main() {
 EOF
 
 $CC -B. -no-pie -o $t/exe $t/c.o $t/b.so
-$QEMU $t/exe | grep -q '3 4 0'
+$QEMU $t/exe 2> /dev/null | grep -q '3 4 0'
 
 echo OK

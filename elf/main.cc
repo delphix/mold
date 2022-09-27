@@ -7,6 +7,7 @@
 #include <functional>
 #include <iomanip>
 #include <map>
+#include <regex>
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -27,8 +28,22 @@ namespace mold::elf {
 // (e.g. EM_X86_64 or EM_386).
 template <typename E>
 static MachineType get_machine_type(Context<E> &ctx, MappedFile<Context<E>> *mf) {
-  auto get_elf_type = [](u8 *buf) {
-    switch (ElfEhdr<E> &ehdr = *(ElfEhdr<E> *)buf; ehdr.e_machine) {
+  auto get_elf_type = [&](u8 *buf) {
+    bool is_le = (((EL32Ehdr *)buf)->e_ident[EI_DATA] == ELFDATA2LSB);
+    bool is_64;
+    u32 e_machine;
+
+    if (is_le) {
+      EL32Ehdr &ehdr = *(EL32Ehdr *)buf;
+      is_64 = (ehdr.e_ident[EI_CLASS] == ELFCLASS64);
+      e_machine = ehdr.e_machine;
+    } else {
+      EB32Ehdr &ehdr = *(EB32Ehdr *)buf;
+      is_64 = (ehdr.e_ident[EI_CLASS] == ELFCLASS64);
+      e_machine = ehdr.e_machine;
+    }
+
+    switch (e_machine) {
     case EM_386:
       return MachineType::I386;
     case EM_X86_64:
@@ -38,8 +53,13 @@ static MachineType get_machine_type(Context<E> &ctx, MappedFile<Context<E>> *mf)
     case EM_AARCH64:
       return MachineType::ARM64;
     case EM_RISCV:
-      return (ehdr.e_ident[EI_CLASS] == ELFCLASS64)
-        ? MachineType::RISCV64 : MachineType::RISCV32;
+      if (is_le)
+        return is_64 ? MachineType::RV64LE : MachineType::RV32LE;
+      return is_64 ? MachineType::RV64BE : MachineType::RV32BE;
+    case EM_PPC64:
+      return MachineType::PPC64V2;
+    case EM_SPARC64:
+      return MachineType::SPARC64;
     default:
       return MachineType::NONE;
     }
@@ -349,7 +369,7 @@ static void show_stats(Context<E> &ctx) {
 }
 
 template <typename E>
-static int elf_main(int argc, char **argv) {
+int elf_main(int argc, char **argv) {
   Context<E> ctx;
 
   // Process -run option first. process_run_subcommand() does not return.
@@ -370,7 +390,6 @@ static int elf_main(int argc, char **argv) {
 
   // Redo if -m is not x86-64.
   if (ctx.arg.emulation != E::machine_type) {
-#ifndef MOLD_DEBUG_X86_64_ONLY
     switch (ctx.arg.emulation) {
     case MachineType::I386:
       return elf_main<I386>(argc, argv);
@@ -378,14 +397,21 @@ static int elf_main(int argc, char **argv) {
       return elf_main<ARM64>(argc, argv);
     case MachineType::ARM32:
       return elf_main<ARM32>(argc, argv);
-    case MachineType::RISCV64:
-      return elf_main<RISCV64>(argc, argv);
-    case MachineType::RISCV32:
-      return elf_main<RISCV32>(argc, argv);
+    case MachineType::RV64LE:
+      return elf_main<RV64LE>(argc, argv);
+    case MachineType::RV64BE:
+      return elf_main<RV64BE>(argc, argv);
+    case MachineType::RV32LE:
+      return elf_main<RV32LE>(argc, argv);
+    case MachineType::RV32BE:
+      return elf_main<RV32BE>(argc, argv);
+    case MachineType::PPC64V2:
+      return elf_main<PPC64V2>(argc, argv);
+    case MachineType::SPARC64:
+      return elf_main<SPARC64>(argc, argv);
     default:
       unreachable();
     }
-#endif
     unreachable();
   }
 
@@ -573,9 +599,7 @@ static int elf_main(int argc, char **argv) {
 
   // Sort sections by section attributes so that we'll have to
   // create as few segments as possible.
-  sort(ctx.chunks, [&](Chunk<E> *a, Chunk<E> *b) {
-    return get_section_rank(ctx, a) < get_section_rank(ctx, b);
-  });
+  sort_output_sections(ctx);
 
   // If --packed_dyn_relocs=relr was given, base relocations are stored
   // to a .relr.dyn section in a compressed form. Construct a compressed
@@ -740,13 +764,30 @@ static int elf_main(int argc, char **argv) {
   return 0;
 }
 
+using E = MOLD_TARGET;
+
+template void read_file(Context<E> &, MappedFile<Context<E>> *);
+
+#ifdef MOLD_X86_64
+
+extern template int elf_main<I386>(int, char **);
+extern template int elf_main<ARM32>(int, char **);
+extern template int elf_main<ARM64>(int, char **);
+extern template int elf_main<RV32BE>(int, char **);
+extern template int elf_main<RV32LE>(int, char **);
+extern template int elf_main<RV64LE>(int, char **);
+extern template int elf_main<RV64BE>(int, char **);
+extern template int elf_main<PPC64V2>(int, char **);
+extern template int elf_main<SPARC64>(int, char **);
+
 int main(int argc, char **argv) {
   return elf_main<X86_64>(argc, argv);
 }
 
-#define INSTANTIATE(E)                                                  \
-  template void read_file(Context<E> &, MappedFile<Context<E>> *);
+#else
 
-INSTANTIATE_ALL;
+template int elf_main<E>(int, char **);
+
+#endif
 
 } // namespace mold::elf

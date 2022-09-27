@@ -118,7 +118,7 @@ static i64 parse_version(const std::string &arg) {
   static std::regex re(R"((\d+)(?:\.(\d+))?(?:\.(\d+))?)", flags);
 
   std::smatch m;
-  bool ok = std::regex_match(arg, m, re);
+  [[maybe_unused]] bool ok = std::regex_match(arg, m, re);
   assert(ok);
 
   i64 major = (m[1].length() == 0) ? 0 : stoi(m[1]);
@@ -281,14 +281,17 @@ static TextDylib parse(Context<E> &ctx, MappedFile<Context<E>> *mf,
   return squash(ctx, vec, arch);
 }
 
-template <>
-TextDylib parse_tbd(Context<ARM64> &ctx, MappedFile<Context<ARM64>> *mf) {
-  return parse(ctx, mf, "arm64");
+template <typename E>
+TextDylib parse_tbd(Context<E> &ctx, MappedFile<Context<E>> *mf) {
+  if constexpr (std::is_same_v<E, ARM64>)
+    return parse(ctx, mf, "arm64");
+  if constexpr (std::is_same_v<E, X86_64>)
+    return parse(ctx, mf, "x86_64");
+  unreachable();
 }
 
-template <>
-TextDylib parse_tbd(Context<X86_64> &ctx, MappedFile<Context<X86_64>> *mf) {
-  return parse(ctx, mf, "x86_64");
-}
+using E = MOLD_TARGET;
+
+template TextDylib parse_tbd(Context<E> &, MappedFile<Context<E>> *);
 
 } // namespace mold::macho

@@ -61,6 +61,8 @@ Options:
   --Tdata                     Set address to .data
   --Ttext                     Set address to .text
   --allow-multiple-definition Allow multiple definitions
+  --apply-dynamic-relocs      Apply link-time values for dynamic relocations (defualt)
+    --no-apply-dynamic-relocs
   --as-needed                 Only set DT_NEEDED if used
     --no-as-needed
   --build-id [none,md5,sha1,sha256,uuid,HEXSTRING]
@@ -70,7 +72,7 @@ Options:
   --color-diagnostics=[auto,always,never]
                               Use colors in diagnostics
   --color-diagnostics         Alias for --color-diagnostics=always
-  --compress-debug-sections [none,zlib,zlib-gabi,zlib-gnu]
+  --compress-debug-sections [none,zlib,zlib-gabi,zstd]
                               Compress .debug_* sections
   --dc                        Ignored
   --dependency-file=FILE      Write Makefile-style dependency rules to FILE
@@ -191,8 +193,8 @@ Options:
     -z notext
     -z textoff
 
-mold: supported targets: elf32-i386 elf64-x86-64 elf32-littlearm elf64-littleaarch64 elf32-littleriscv elf64-littleriscv
-mold: supported emulations: elf_i386 elf_x86_64 armelf_linux_eabi aarch64linux aarch64elf elf32lriscv elf64lriscv)";
+mold: supported targets: elf32-i386 elf64-x86-64 elf32-littlearm elf64-littleaarch64 elf32-littleriscv elf32-bigriscv elf64-littleriscv elf64-bigriscv elf64-sparc
+mold: supported emulations: elf_i386 elf_x86_64 armelf_linux_eabi aarch64linux aarch64elf elf32lriscv elf32briscv elf64lriscv elf64briscv elf64_sparc)";
 
 static std::vector<std::string> add_dashes(std::string name) {
   // Single-letter option
@@ -346,6 +348,12 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if constexpr (is_riscv<E>)
     ctx.arg.discard_locals = true;
 
+  // It looks like the SPARC's dynamic linker takes both RELA's r_addend
+  // and the value at the relocated place. So we don't want to write
+  // values to relocated places.
+  if (is_sparc<E>)
+    ctx.arg.apply_dynamic_relocs = false;
+
   auto read_arg = [&](std::string name) {
     for (std::string opt : add_dashes(name)) {
       if (args[0] == opt) {
@@ -438,7 +446,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       SyncOut(ctx) << mold_version
                    << "\n  Supported emulations:\n   elf_x86_64\n   elf_i386\n"
                    << "   aarch64linux\n   armelf_linux_eabi\n   elf64lriscv\n"
-                   << "   elf32lriscv";
+                   << "   elf64briscv\n   elf32lriscv\n   elf32briscv\n"
+                   << "   elf64lppc\n   elf64_sparc";
       version_shown = true;
     } else if (read_arg("m")) {
       if (arg == "elf_x86_64") {
@@ -450,9 +459,17 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       } else if (arg == "armelf_linux_eabi") {
         ctx.arg.emulation = MachineType::ARM32;
       } else if (arg == "elf64lriscv") {
-        ctx.arg.emulation = MachineType::RISCV64;
+        ctx.arg.emulation = MachineType::RV64LE;
+      } else if (arg == "elf64briscv") {
+        ctx.arg.emulation = MachineType::RV64BE;
       } else if (arg == "elf32lriscv") {
-        ctx.arg.emulation = MachineType::RISCV32;
+        ctx.arg.emulation = MachineType::RV32LE;
+      } else if (arg == "elf32briscv") {
+        ctx.arg.emulation = MachineType::RV32BE;
+      } else if (arg == "elf64lppc") {
+        ctx.arg.emulation = MachineType::PPC64V2;
+      } else if (arg == "elf64_sparc") {
+        ctx.arg.emulation = MachineType::SPARC64;
       } else {
         Fatal(ctx) << "unknown -m argument: " << arg;
       }
@@ -573,6 +590,10 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.soname = arg;
     } else if (read_flag("allow-multiple-definition")) {
       ctx.arg.allow_multiple_definition = true;
+    } else if (read_flag("apply-dynamic-relocs")) {
+      ctx.arg.apply_dynamic_relocs = true;
+    } else if (read_flag("no-apply-dynamic-relocs")) {
+      ctx.arg.apply_dynamic_relocs = false;
     } else if (read_flag("trace")) {
       ctx.arg.trace = true;
     } else if (read_flag("eh-frame-hdr")) {
@@ -633,9 +654,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.enable_new_dtags = false;
     } else if (read_arg("compress-debug-sections")) {
       if (arg == "zlib" || arg == "zlib-gabi")
-        ctx.arg.compress_debug_sections = COMPRESS_GABI;
-      else if (arg == "zlib-gnu")
-        ctx.arg.compress_debug_sections = COMPRESS_GNU;
+        ctx.arg.compress_debug_sections = COMPRESS_ZLIB;
+      else if (arg == "zstd")
+        ctx.arg.compress_debug_sections = COMPRESS_ZSTD;
       else if (arg == "none")
         ctx.arg.compress_debug_sections = COMPRESS_NONE;
       else
@@ -908,7 +929,6 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.auxiliary.push_back(arg);
     } else if (read_arg("filter") || read_arg("F")) {
       ctx.arg.filter.push_back(arg);
-    } else if (read_flag("apply-dynamic-relocs")) {
     } else if (read_arg("O")) {
     } else if (read_flag("O0")) {
     } else if (read_flag("O1")) {
@@ -1033,6 +1053,13 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       Fatal(ctx) << "-auxiliary may not be used without -shared";
   }
 
+  if (!ctx.arg.apply_dynamic_relocs && !is_rela<E>)
+    Fatal(ctx) << "--no-apply-dynamic-relocs may not be used on "
+               << E::machine_type;
+
+  if (is_sparc<E> && ctx.arg.apply_dynamic_relocs)
+    Fatal(ctx) << "--apply-dynamic-relocs may not be used on SPARC64";
+
   if (ctx.arg.thread_count == 0)
     ctx.arg.thread_count = get_default_thread_count();
 
@@ -1083,9 +1110,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   return remaining;
 }
 
-#define INSTANTIATE(E)                                                  \
-  template std::vector<std::string> parse_nonpositional_args(Context<E> &ctx);
+using E = MOLD_TARGET;
 
-INSTANTIATE_ALL;
+template std::vector<std::string> parse_nonpositional_args(Context<E> &ctx);
 
 } // namespace mold::elf

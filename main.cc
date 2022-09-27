@@ -10,6 +10,8 @@
 
 namespace mold {
 
+std::string mold_version_string = MOLD_VERSION;
+
 namespace elf {
 int main(int argc, char **argv);
 }
@@ -27,8 +29,6 @@ static std::string get_mold_version() {
 void cleanup() {
   if (output_tmpfile)
     unlink(output_tmpfile);
-  if (socket_tmpfile)
-    unlink(socket_tmpfile);
 }
 
 // mold mmap's an output file, and the mmap succeeds even if there's

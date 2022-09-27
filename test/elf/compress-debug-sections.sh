@@ -12,7 +12,7 @@ echo -n "Testing $testname ... "
 t=out/test/elf/$MACHINE/$testname
 mkdir -p $t
 
-which dwarfdump >& /dev/null || { echo skipped; exit; }
+command -v dwarfdump >& /dev/null || { echo skipped; exit; }
 
 cat <<EOF | $CC -c -g -o $t/a.o -xc -
 #include <stdio.h>
@@ -25,12 +25,7 @@ EOF
 
 $CC -B. -o $t/exe $t/a.o -Wl,--compress-debug-sections=zlib
 dwarfdump $t/exe > $t/log
-fgrep -q '.debug_info SHF_COMPRESSED' $t/log
-fgrep -q '.debug_str SHF_COMPRESSED' $t/log
-
-$CC -B. -o $t/exe $t/a.o -Wl,--compress-debug-sections=zlib-gnu
-dwarfdump $t/exe > $t/log
-fgrep -q .zdebug_info $t/log
-fgrep -q .zdebug_str $t/log
+grep -Fq '.debug_info SHF_COMPRESSED' $t/log
+grep -Fq '.debug_str SHF_COMPRESSED' $t/log
 
 echo OK

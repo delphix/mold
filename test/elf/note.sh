@@ -12,6 +12,9 @@ echo -n "Testing $testname ... "
 t=out/test/elf/$MACHINE/$testname
 mkdir -p $t
 
+echo 'int main() {}' | $CC -o /dev/null -xc - -static >& /dev/null || \
+  { echo skipped; exit; }
+
 [ $MACHINE = x86_64 ] || { echo skipped; exit; }
 
 cat <<EOF | $CC -o $t/a.o -c -x assembler -
@@ -45,8 +48,7 @@ grep -Eq '.note.baz\s+NOTE.+000008 00   A  0   0  8' $t/log
 grep -Eq '.note.nonalloc\s+NOTE.+000008 00      0   0  1' $t/log
 
 readelf --segments $t/exe > $t/log
-fgrep -q '01     .note.bar' $t/log
-fgrep -q '02     .note.baz .note.foo' $t/log
+grep -Fq '01     .note.baz .note.foo .note.bar' $t/log
 ! grep -q 'NOTE.*0x0000000000000000 0x0000000000000000' $t/log || false
 
 echo OK
