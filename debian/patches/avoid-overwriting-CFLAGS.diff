@@ -2,7 +2,7 @@ Index: mold/Makefile
 ===================================================================
 --- mold.orig/Makefile
 +++ mold/Makefile
-@@ -40,10 +40,10 @@ ifneq ($(findstring -android,$(shell $(C
+@@ -52,10 +52,10 @@ ifneq ($(findstring -android,$(shell $(C
    IS_ANDROID = 1
  endif
  
