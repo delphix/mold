@@ -1,20 +1,12 @@
 #!/bin/bash
 export LC_ALL=C
 set -e
-CC="${CC:-cc}"
-CXX="${CXX:-c++}"
-GCC="${GCC:-gcc}"
-GXX="${GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-mold="$(pwd)/ld64.mold"
-t=out/test/macho/$testname
+t=out/test/macho/$(uname -m)/$testname
 mkdir -p $t
 
-cat <<EOF | $CC -c -o $t/a.o -xc -
+cat <<EOF | cc -c -o $t/a.o -xc -
 #include <stdio.h>
 char world[] = "world";
 
@@ -23,9 +15,9 @@ char *hello() {
 }
 EOF
 
-clang -fuse-ld="$mold" -o $t/b.dylib -shared $t/a.o
+cc --ld-path=./ld64 -o $t/b.dylib -shared $t/a.o
 
-cat <<EOF | $CC -o $t/c.o -c -xc -
+cat <<EOF | cc -o $t/c.o -c -xc -
 #include <stdio.h>
 
 char *hello();
@@ -36,7 +28,7 @@ int main() {
 }
 EOF
 
-clang -fuse-ld="$mold" -o $t/exe $t/c.o $t/b.dylib
-$QEMU $t/exe | grep -q 'Hello world'
+cc --ld-path=./ld64 -o $t/exe $t/c.o $t/b.dylib
+$t/exe | grep -q 'Hello world'
 
 echo OK

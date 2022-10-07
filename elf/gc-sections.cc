@@ -26,31 +26,24 @@ static bool is_init_fini(const InputSection<E> &isec) {
 
 template <typename E>
 static bool mark_section(InputSection<E> *isec) {
-  return isec && isec->is_alive && !isec->extra().is_visited.exchange(true);
+  return isec && isec->is_alive && !isec->is_visited.exchange(true);
 }
 
 template <typename E>
 static void visit(Context<E> &ctx, InputSection<E> *isec,
                   tbb::feeder<InputSection<E> *> &feeder, i64 depth) {
-  assert(isec->extra().is_visited);
-
-  // A relocation can refer either a section fragment (i.e. a piece of
-  // string in a mergeable string section) or a symbol. Mark all
-  // section fragments as alive.
-  if (SectionFragmentRef<E> *refs = isec->rel_fragments.get())
-    for (i64 i = 0; refs[i].idx >= 0; i++)
-      refs[i].frag->is_alive.store(true, std::memory_order_relaxed);
+  assert(isec->is_visited);
 
   // If this is a text section, .eh_frame may contain records
   // describing how to handle exceptions for that function.
   // We want to keep associated .eh_frame records.
   for (FdeRecord<E> &fde : isec->get_fdes())
-    for (ElfRel<E> &rel : fde.get_rels(isec->file).subspan(1))
+    for (const ElfRel<E> &rel : fde.get_rels(isec->file).subspan(1))
       if (Symbol<E> *sym = isec->file.symbols[rel.r_sym])
         if (mark_section(sym->get_input_section()))
           feeder.add(sym->get_input_section());
 
-  for (ElfRel<E> &rel : isec->get_rels(ctx)) {
+  for (const ElfRel<E> &rel : isec->get_rels(ctx)) {
     Symbol<E> &sym = *isec->file.symbols[rel.r_sym];
 
     // Symbol can refer either a section fragment or an input section.
@@ -73,10 +66,9 @@ static void visit(Context<E> &ctx, InputSection<E> *isec,
 }
 
 template <typename E>
-static tbb::concurrent_vector<InputSection<E> *>
-collect_root_set(Context<E> &ctx) {
+static void collect_root_set(Context<E> &ctx,
+                             tbb::concurrent_vector<InputSection<E> *> &rootset) {
   Timer t(ctx, "collect_root_set");
-  tbb::concurrent_vector<InputSection<E> *> rootset;
 
   auto enqueue_section = [&](InputSection<E> *isec) {
     if (mark_section(isec))
@@ -102,11 +94,12 @@ collect_root_set(Context<E> &ctx) {
       // reduce the amount of non-memory-mapped segments, you should
       // use `strip` command, compile without debug info or use
       // -strip-all linker option.
-      if (!(isec->shdr().sh_flags & SHF_ALLOC))
-        isec->extra().is_visited = true;
+      u32 flags = isec->shdr().sh_flags;
+      if (!(flags & SHF_ALLOC))
+        isec->is_visited = true;
 
       if (is_init_fini(*isec) || is_c_identifier(isec->name()) ||
-          isec->shdr().sh_type == SHT_NOTE)
+          (flags & SHF_GNU_RETAIN) || isec->shdr().sh_type == SHT_NOTE)
         enqueue_section(isec.get());
     }
   });
@@ -132,11 +125,9 @@ collect_root_set(Context<E> &ctx) {
   // We just keep all CIEs and everything that are referenced by them.
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     for (CieRecord<E> &cie : file->cies)
-      for (ElfRel<E> &rel : cie.get_rels())
+      for (const ElfRel<E> &rel : cie.get_rels())
         enqueue_symbol(file->symbols[rel.r_sym]);
   });
-
-  return rootset;
 }
 
 // Mark all reachable sections
@@ -159,7 +150,7 @@ static void sweep(Context<E> &ctx) {
 
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     for (std::unique_ptr<InputSection<E>> &isec : file->sections) {
-      if (isec && isec->is_alive && !isec->extra().is_visited) {
+      if (isec && isec->is_alive && !isec->is_visited) {
         if (ctx.arg.print_gc_sections)
           SyncOut(ctx) << "removing unused section " << *isec;
         isec->kill();
@@ -188,19 +179,16 @@ template <typename E>
 void gc_sections(Context<E> &ctx) {
   Timer t(ctx, "gc");
 
-  for (ObjectFile<E> *file : ctx.objs)
-    file->extras.resize(file->sections.size());
-
   mark_nonalloc_fragments(ctx);
 
-  tbb::concurrent_vector<InputSection<E> *> rootset = collect_root_set(ctx);
+  tbb::concurrent_vector<InputSection<E> *> rootset;
+  collect_root_set(ctx, rootset);
   mark(ctx, rootset);
   sweep(ctx);
 }
 
-#define INSTANTIATE(E)                                  \
-  template void gc_sections(Context<E> &ctx);
+using E = MOLD_TARGET;
 
-INSTANTIATE_ALL;
+template void gc_sections(Context<E> &ctx);
 
 } // namespace mold::elf

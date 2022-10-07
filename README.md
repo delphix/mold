@@ -22,7 +22,8 @@ mold is so fast that it is only 2x _slower_ than `cp` on the same
 machine. Feel free to [file a bug](https://github.com/rui314/mold/issues)
 if you find mold is not faster than other linkers.
 
-mold currently supports x86-64, i386, ARM32, ARM64 and 64-bit RISC-V.
+mold officially supports x86-64, i386, ARM64, ARM32, 64-bit RISC-V and
+32-bit RISC-V. Little-endian PowerPC64 ELFv2 is partially supported.
 
 ## Why does the speed of linking matter?
 
@@ -39,7 +40,7 @@ most noticeable when you are in rapid debug-edit-rebuild cycles.
 
 ## Install
 
-Binary packages for the following distros are currently available.
+Binary packages for the following systems are currently available.
 
 [![Packaging status](https://repology.org/badge/vertical-allrepos/mold.svg)](https://repology.org/project/mold/versions)
 
@@ -60,33 +61,28 @@ necessary packages. You may want to run it as root.
 
 ```shell
 git clone https://github.com/rui314/mold.git
-cd mold
-git checkout v1.2.1
-make -j$(nproc) CXX=clang++
-sudo make install
+mkdir mold/build
+cd mold/build
+git checkout v1.5.1
+../install-build-deps.sh
+cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=c++ ..
+cmake --build . -j $(nproc)
+sudo cmake --install .
 ```
 
-You may need to pass a C++20 compiler command name to `make`.
-In the above case, `clang++` is passed. If it doesn't work for you,
+You may need to pass a C++20 compiler command name to `cmake`.
+In the above case, `c++` is passed. If it doesn't work for you,
 try a specific version of a compiler such as `g++-10` or `clang++-12`.
 
 By default, `mold` is installed to `/usr/local/bin`.
 
 If you don't use a recent enough Linux distribution, or if for any reason
-`make` in the above commands doesn't work for you, you can use Docker to
+`cmake` in the above commands doesn't work for you, you can use Docker to
 build it in a Docker environment. To do so, just run `./dist.sh` in this
-directory instead of running `make -j$(nproc)`. The shell script pulls a
-Docker image, builds mold and auxiliary files inside it, and packs
-them into a single tar file `mold-$version-$arch-linux.tar.gz`.
-You can extract the tar file anywhere and use `mold` executable in it.
-
-`make test` depends on a few more packages. To install, run the following commands:
-
-```shell
-sudo dpkg --add-architecture i386
-sudo apt update
-sudo apt-get install bsdmainutils dwarfdump libc6-dev:i386 lib32gcc-10-dev libstdc++-10-dev-arm64-cross gcc-10-aarch64-linux-gnu g++-10-aarch64-linux-gnu
-```
+directory instead of `cmake`. The shell script pulls a Docker image,
+builds mold and auxiliary files inside it, and packs them into a
+single tar file `mold-$version-$arch-linux.tar.gz`.  You can extract
+the tar file anywhere and use `mold` executable in it.
 
 ## How to use
 
@@ -103,7 +99,7 @@ following flags to use `mold` instead of `/usr/bin/ld`:
 
 - Clang: pass `-fuse-ld=mold`
 
-- GCC 12.1.0 (upcoming version) or later: pass `-fuse-ld=mold`
+- GCC 12.1.0 or later: pass `-fuse-ld=mold`
 
 - GCC before 12.1.0: `-fuse-ld` does not accept `mold` as a valid
   argument, so you need to use `-B` option instead. `-B` is an option
@@ -125,7 +121,7 @@ take an absolute path as an argument for `-fuse-ld` though.
 
 Create `.cargo/config.toml` in your project directory with the following:
 
-```
+```toml
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=/path/to/mold"]
@@ -136,6 +132,19 @@ Please make sure you have installed `clang`.
 
 If you want to use mold for all projects, put the above snippet to
 `~/.cargo/config.toml`.
+
+If you are using macOS, you can modify `config.toml` in a similar manner.
+Here is an example with `mold` installed via [Homebrew](https://brew.sh).
+
+```toml
+[target.x86_64-apple-darwin]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.aarch64-apple-darwin]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+```
 
 </details>
 
@@ -158,12 +167,28 @@ replace `argv[0]` with `mold` if it is `ld`, `ld.gold` or `ld.lld`.
 
 </details>
 
-<details><summary>GitHub Action</summary>
-If you want to use mold in your GitHub-hosted CI to speed up continuous
-build, you can use <a href=https://github.com/rui314/setup-mold>setup-mold</a>
-GitHub Action. GitHub runs a CI on a two-core machine, but mold is
-still significantly faster than the default GNU linker there
-especially when a program being linked is large.
+<details><summary>On macOS</summary>
+
+mold/macOS is available as an alpha version. It can be used to build not
+only macOS apps but also iOS apps because their binary formats are the same.
+
+The command name of mold/macOS is `ld64.mold`. If you build mold on macOS,
+it still produces `mold` and `ld.mold`, but these executables are useful
+only for cross compilation (i.e. building Linux apps on macOS.)
+
+If you find any issue with mold/macOS, please file it to
+<a href=https://github.com/rui314/mold/issues>our GitHub Issues</a>.
+
+</details>
+
+<details><summary>GitHub Actions</summary>
+
+You can use our <a href=https://github.com/rui314/setup-mold>setup-mold</a>
+GitHub Action to speed up GitHub-hosted continuous build. GitHub Actions
+runs on a two-core machine, but mold is still significantly faster than
+the default GNU linker there especially when a program being linked is
+large.
+
 </details>
 
 <details><summary>Verify that you are using mold</summary>
@@ -180,6 +205,15 @@ String dump of section '.comment':
 ```
 
 If `mold` is in `.comment`, the file is created by mold.
+
+</details>
+
+<details><summary>Online manual</summary>
+
+Since mold is a drop-in replacement, you should be able to use it
+without reading its manual. But just in case you need it, it's available
+online at <a href=https://rui314.github.io/mold.html>here</a>.
+You can also read the same manual by `man mold`.
 
 </details>
 
@@ -201,3 +235,35 @@ cores most of the time. In this demo, the maximum parallelism is
 artificially capped to 16 so that the bars fit in the GIF.
 
 For details, please read [design notes](docs/design.md).
+
+## License
+
+mold is available under AGPL. Note that that does not mean that you
+have to license your program under AGPL if you use mold to link your
+program. An output of the mold linker is a derived work of the object
+files and libraries you pass to the linker but not a derived work of
+the mold linker itself.
+
+Besides that, you can also buy a commercial, non-AGPL license with
+technical support from our company, Blue Whale Systems PTE LTD. If you
+are a big company, please consider obtaining it before making hundreds
+or thousands of developers of your company to depend on mold. mold is
+mostly a single-person open-source project, and just like other
+open-source projects, we are not legally obligated to keep maintaining
+it. A legally-binding commercial license contract addresses the
+concern. By purchasing a license, you are guaranteed that mold will be
+maintained for you. Please [contact us](mailto:contact@bluewhale.systems)
+for a commercial license inquiry.
+
+## Acknowledgement
+
+We accept donations via [GitHub Sponsors](https://github.com/sponsors/rui314)
+and [OpenCollective](https://opencollective.com/mold-linker).
+We thank you to everybody who sponsors our project. In particular,
+we'd like to acknowledge the following people and organizations who
+have sponsored $128/month or more:
+
+- [300baud](https://github.com/300baud)
+- [Mercury](https://github.com/MercuryTechnologies)
+- [Wei Wu](https://github.com/lazyparser)
+- [Signal Slot Inc.](https://github.com/signal-slot)

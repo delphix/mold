@@ -30,8 +30,9 @@ void print_map(Context<E> &ctx) {
     if (file.is_alive) {
       out << "[" << std::setw(3) << i << "] " << file << "\n";
       for (Symbol<E> *sym : file.syms)
-        if (sym->file == &file)
-          syms.push_back({sym->get_addr(ctx), 0, (u32)i, sym->name});
+        if (sym && sym->file == &file)
+          if (!sym->subsec || sym->subsec->is_alive)
+            syms.push_back({sym->get_addr(ctx), 0, (u32)i, sym->name});
     }
   }
 
@@ -71,10 +72,8 @@ void print_map(Context<E> &ctx) {
   }
 }
 
-#define INSTANTIATE(E)                          \
-  template void print_map(Context<E> &)
+using E = MOLD_TARGET;
 
-INSTANTIATE(ARM64);
-INSTANTIATE(X86_64);
+template void print_map(Context<E> &);
 
 } // namespace mold::macho

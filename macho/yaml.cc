@@ -1,12 +1,27 @@
+// On macOS, a .tbd file can be used instead of a .dylib to link
+// against a dynamic library. A .tbd file is a text file in the YAML
+// format, so the linker has to be able to parse a YAML file. This
+// file implements a YAML parser.
+//
+// We implemented a YAML parser ourselves instead of using an external
+// library. We didn't want to add an dependency to an external library
+// just to read .tdb files.
+//
+// YAML as a format is very complicated. For example, the official
+// YAML specification allows embedding a JSON string into YAML; so it
+// is strictly larger than JSON. It has surprisingly many features
+// that most users are not aware of. Fortunately, we have to support
+// only a small portion of the spec to read a .tbd file.
+
 #include "mold.h"
 
 #include <optional>
 
 namespace mold::macho {
 
-struct Token {
-  enum { STRING = 1, INDENT, DEDENT, END };
+enum { STRING = 1, INDENT, DEDENT, END };
 
+struct Token {
   u8 kind = 0;
   std::string_view str;
 };
@@ -35,17 +50,20 @@ private:
   std::vector<Token> tokens;
 };
 
+// A tokenizer for YAML. YAML represents blocks by indentation. This
+// tokenizer inserts INDENT and DEDENT special tokens before and after
+// each indented text block.
 std::optional<YamlError> YamlParser::tokenize() {
   std::vector<i64> indents = {0};
 
   auto indent = [&](std::string_view str, i64 depth) {
-    tokens.push_back({Token::INDENT, str});
+    tokens.push_back({INDENT, str});
     indents.push_back(depth);
   };
 
   auto dedent = [&](std::string_view str) {
     assert(indents.size() > 1);
-    tokens.push_back({Token::DEDENT, str});
+    tokens.push_back({DEDENT, str});
     indents.pop_back();
   };
 
@@ -63,7 +81,7 @@ std::optional<YamlError> YamlParser::tokenize() {
     if (str.starts_with("---")) {
       while (indents.size() > 1)
         dedent(str);
-      tokens.push_back({Token::END, str.substr(0, 3)});
+      tokens.push_back({END, str.substr(0, 3)});
       skip_line(str);
       return {};
     }
@@ -71,7 +89,7 @@ std::optional<YamlError> YamlParser::tokenize() {
     if (str.starts_with("...")) {
       while (indents.size() > 1)
         dedent(str);
-      tokens.push_back({Token::END, str.substr(0, 3)});
+      tokens.push_back({END, str.substr(0, 3)});
       str = str.substr(str.size());
       return {};
     }
@@ -217,7 +235,7 @@ YamlParser::tokenize_string(std::string_view &str, char end) {
   if (pos == str.npos)
     return YamlError{"unterminated string literal", start - input.data()};
 
-  tokens.push_back({Token::STRING, str.substr(1, pos - 1)});
+  tokens.push_back({STRING, str.substr(1, pos - 1)});
   str = str.substr(pos + 1);
   return {};
 }
@@ -228,7 +246,7 @@ YamlParser::tokenize_bare_string(std::string_view &str) {
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-/.");
   if (pos == str.npos)
     pos = str.size();
-  tokens.push_back({Token::STRING, str.substr(0, pos)});
+  tokens.push_back({STRING, str.substr(0, pos)});
   str = str.substr(pos);
 }
 
@@ -240,7 +258,7 @@ std::variant<std::vector<YamlNode>, YamlError> YamlParser::parse() {
   std::vector<YamlNode> vec;
 
   while (!tok.empty()) {
-    if (tok[0].kind == Token::END) {
+    if (tok[0].kind == END) {
       tok = tok.subspan(1);
       continue;
     }
@@ -250,7 +268,7 @@ std::variant<std::vector<YamlNode>, YamlError> YamlParser::parse() {
       return *err;
     vec.push_back(std::get<YamlNode>(elem));
 
-    if (tok[0].kind != Token::END)
+    if (tok[0].kind != END)
       return YamlError{"stray token", tok[0].str.data() - input.data()};
   }
   return vec;
@@ -258,11 +276,11 @@ std::variant<std::vector<YamlNode>, YamlError> YamlParser::parse() {
 
 std::variant<YamlNode, YamlError>
 YamlParser::parse_element(std::span<Token> &tok) {
-  if (tok[0].kind == Token::INDENT) {
+  if (tok[0].kind == INDENT) {
     tok = tok.subspan(1);
 
     std::variant<YamlNode, YamlError> elem = parse_element(tok);
-    assert(tok[0].kind == Token::DEDENT);
+    assert(tok[0].kind == DEDENT);
     tok = tok.subspan(1);
     return elem;
   }
@@ -270,7 +288,7 @@ YamlParser::parse_element(std::span<Token> &tok) {
   if (tok[0].kind == '-')
     return parse_list(tok);
 
-  if (tok.size() > 2 && tok[0].kind == Token::STRING && tok[1].kind == ':')
+  if (tok.size() > 2 && tok[0].kind == STRING && tok[1].kind == ':')
     return parse_map(tok);
 
   return parse_flow_element(tok);
@@ -280,7 +298,7 @@ std::variant<YamlNode, YamlError>
 YamlParser::parse_list(std::span<Token> &tok) {
   std::vector<YamlNode> vec;
 
-  while (tok[0].kind != Token::END && tok[0].kind != Token::DEDENT) {
+  while (tok[0].kind != END && tok[0].kind != DEDENT) {
     if (tok[0].kind != '-')
       return YamlError{"list element expected", tok[0].str.data() - input.data()};
     tok = tok.subspan(1);
@@ -297,8 +315,8 @@ std::variant<YamlNode, YamlError>
 YamlParser::parse_map(std::span<Token> &tok) {
   std::map<std::string_view, YamlNode> map;
 
-  while (tok[0].kind != Token::END && tok[0].kind != Token::DEDENT) {
-    if (tok.size() < 2 || tok[0].kind != Token::STRING || tok[1].kind != ':')
+  while (tok[0].kind != END && tok[0].kind != DEDENT) {
+    if (tok.size() < 2 || tok[0].kind != STRING || tok[1].kind != ':')
       return YamlError{"map key expected", tok[0].str.data() - input.data()};
 
     std::string_view key = tok[0].str;
@@ -319,7 +337,7 @@ YamlParser::parse_flow_element(std::span<Token> &tok) {
     return parse_flow_list(tok);
   }
 
-  if (tok[0].kind != Token::STRING)
+  if (tok[0].kind != STRING)
     return YamlError{"scalar expected", tok[0].str.data() - input.data()};
 
   std::string_view val = tok[0].str;
@@ -332,7 +350,7 @@ YamlParser::parse_flow_list(std::span<Token> &tok) {
   std::vector<YamlNode> vec;
   const char *start = tok[0].str.data();
 
-  while (tok[0].kind != ']' && tok[0].kind != Token::END) {
+  while (tok[0].kind != ']' && tok[0].kind != END) {
     std::variant<YamlNode, YamlError> elem = parse_flow_element(tok);
     if (YamlError *err = std::get_if<YamlError>(&elem))
       return *err;
@@ -345,7 +363,7 @@ YamlParser::parse_flow_list(std::span<Token> &tok) {
     tok = tok.subspan(1);
   }
 
-  if (tok[0].kind == Token::END)
+  if (tok[0].kind == END)
     return YamlError{"unterminated flow list", start - input.data()};
 
   tok = tok.subspan(1);

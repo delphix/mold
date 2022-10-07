@@ -1,17 +1,15 @@
 #!/bin/bash
 export LC_ALL=C
 set -e
-CC="${CC:-cc}"
-CXX="${CXX:-c++}"
-GCC="${GCC:-gcc}"
-GXX="${GXX:-g++}"
+CC="${TEST_CC:-cc}"
+CXX="${TEST_CXX:-c++}"
+GCC="${TEST_GCC:-gcc}"
+GXX="${TEST_GXX:-g++}"
 OBJDUMP="${OBJDUMP:-objdump}"
 MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-mold="$(pwd)/mold"
-t=out/test/elf/$testname
+t=out/test/elf/$MACHINE/$testname
 mkdir -p $t
 
 [ $MACHINE = x86_64 ] || { echo skipped; exit; }
@@ -39,7 +37,7 @@ int print64(long x) {
 }
 EOF
 
-$CC -shared -o $t/c.so $t/a.o $t/b.o
+$CC -shared -o $t/c.so $t/a.o $t/b.o -Wl,-z,noexecstack
 
 # Absolute symbol
 cat <<'EOF' > $t/d.s
@@ -226,7 +224,7 @@ $CC -c -o $t/f.o $t/f.s
 $CC -B. -o $t/exe $t/f.o
 readelf -x .foo -x .bar $t/exe > $t/log
 
-fgrep -q '0x00000010 00000000 00000000 10000000 00000000' $t/log
-fgrep -q '0x00000010 18000000 00000000' $t/log
+grep -Fq '0x00000010 00000000 00000000 10000000 00000000' $t/log
+grep -Fq '0x00000010 18000000 00000000' $t/log
 
 echo OK

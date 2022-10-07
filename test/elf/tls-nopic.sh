@@ -1,29 +1,27 @@
 #!/bin/bash
 export LC_ALL=C
 set -e
-CC="${CC:-cc}"
-CXX="${CXX:-c++}"
-GCC="${GCC:-gcc}"
-GXX="${GXX:-g++}"
+CC="${TEST_CC:-cc}"
+CXX="${TEST_CXX:-c++}"
+GCC="${TEST_GCC:-gcc}"
+GXX="${TEST_GXX:-g++}"
 OBJDUMP="${OBJDUMP:-objdump}"
 MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-mold="$(pwd)/mold"
-t=out/test/elf/$testname
+t=out/test/elf/$MACHINE/$testname
 mkdir -p $t
 
-if [ $MACHINE = x86_64 ]; then
-  dialect=gnu
+if [ $MACHINE = x86_64 -o $MACHINE = i386 -o $MACHINE = i686 ]; then
+  mtls=-mtls-dialect=gnu
 elif [ $MACHINE = aarch64 ]; then
-  dialect=trad
-else
+  mtls=-mtls-dialect=trad
+elif [[ $MACHINE != riscv* ]] && [[ $MACHINE != sparc64 ]]; then
   echo skipped
   exit
 fi
 
-cat <<EOF | $GCC -mtls-dialect=$dialect -c -o $t/a.o -xc -
+cat <<EOF | $GCC $mtls -c -o $t/a.o -xc -
 #include <stdio.h>
 
 extern _Thread_local int foo;

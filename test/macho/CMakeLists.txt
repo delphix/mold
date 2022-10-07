@@ -1,0 +1,10 @@
+file(GLOB TESTS
+  RELATIVE ${CMAKE_CURRENT_LIST_DIR}
+  CONFIGURE_DEPENDS
+  "*.sh")
+
+foreach(TEST IN LISTS TESTS)
+  add_test(NAME ${TEST}
+    COMMAND bash -x ${CMAKE_CURRENT_LIST_DIR}/${TEST}
+    WORKING_DIRECTORY ${mold_BINARY_DIR})
+endforeach()

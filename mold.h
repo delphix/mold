@@ -1,9 +1,11 @@
 #pragma once
 
-#include "big-endian.h"
+#include "inttypes.h"
 
+#include <array>
 #include <atomic>
 #include <bit>
+#include <bitset>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -11,50 +13,69 @@
 #include <filesystem>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <tbb/concurrent_vector.h>
 #include <tbb/enumerable_thread_specific.h>
-#include <unistd.h>
 #include <vector>
 
-#ifdef NDEBUG
-#  define unreachable() __builtin_unreachable()
+#ifdef _WIN32
+# include <io.h>
 #else
-#  define unreachable() assert(0 && "unreachable")
+# include <sys/mman.h>
+# include <unistd.h>
 #endif
+
+#define XXH_INLINE_ALL 1
+#include "third-party/xxhash/xxhash.h"
+
+#ifdef NDEBUG
+# define unreachable() __builtin_unreachable()
+#else
+# define unreachable() assert(0 && "unreachable")
+#endif
+
+inline uint64_t hash_string(std::string_view str) {
+  return XXH3_64bits(str.data(), str.size());
+}
+
+class HashCmp {
+public:
+  static size_t hash(const std::string_view &k) {
+    return hash_string(k);
+  }
+
+  static bool equal(const std::string_view &k1, const std::string_view &k2) {
+    return k1 == k2;
+  }
+};
 
 namespace mold {
 
 using namespace std::literals::string_literals;
 using namespace std::literals::string_view_literals;
 
-typedef uint8_t u8;
-typedef uint16_t u16;
-typedef uint32_t u32;
-typedef uint64_t u64;
-
-typedef int8_t i8;
-typedef int16_t i16;
-typedef int32_t i32;
-typedef int64_t i64;
-
 template <typename C> class OutputFile;
 
 inline char *output_tmpfile;
-inline char *socket_tmpfile;
 inline thread_local bool opt_demangle;
 
-extern const std::string mold_version;
+inline u8 *output_buffer_start = nullptr;
+inline u8 *output_buffer_end = nullptr;
+
+inline std::string mold_version;
+extern std::string mold_version_string;
+extern std::string mold_git_hash;
 
 std::string_view errno_string();
 void cleanup();
 void install_signal_handler();
+i64 get_default_thread_count();
 
 //
 // Error output
@@ -159,24 +180,42 @@ private:
 // Utility functions
 //
 
+// Some C++ libraries haven't implemented std::has_single_bit yet.
+inline bool has_single_bit(u64 val) {
+  return std::popcount(val) == 1;
+}
+
+// Some C++ libraries haven't implemented std::bit_ceil yet.
+inline u64 bit_ceil(u64 val) {
+  if (has_single_bit(val))
+    return val;
+  return 1LL << (64 - std::countl_zero(val));
+}
+
 inline u64 align_to(u64 val, u64 align) {
   if (align == 0)
     return val;
-  assert(std::popcount(align) == 1);
+  assert(has_single_bit(align));
   return (val + align - 1) & ~(align - 1);
 }
 
 inline u64 align_down(u64 val, u64 align) {
-  assert(std::popcount(align) == 1);
+  assert(has_single_bit(align));
   return val & ~(align - 1);
 }
 
-inline u64 next_power_of_two(u64 val) {
-  assert(val >> 63 == 0);
-  if (val == 0 || val == 1)
-    return 1;
-  return (u64)1 << (64 - std::countl_zero(val - 1));
+inline u64 bit(u64 val, i64 pos) {
+  return (val >> pos) & 1;
+};
+
+// Returns [hi:lo] bits of val.
+inline u64 bits(u64 val, u64 hi, u64 lo) {
+  return (val >> lo) & ((1LL << (hi - lo + 1)) - 1);
 }
+
+inline i64 sign_extend(u64 val, i64 size) {
+  return (i64)(val << (63 - size)) >> (63 - size);
+};
 
 template <typename T, typename Compare = std::less<T>>
 void update_minimum(std::atomic<T> &atomic, u64 new_val, Compare cmp = {}) {
@@ -215,14 +254,19 @@ inline void sort(T &vec, U less) {
   std::stable_sort(vec.begin(), vec.end(), less);
 }
 
-inline i64 write_string(u8 *buf, std::string_view str) {
+template <typename T>
+inline void remove_duplicates(std::vector<T> &vec) {
+  vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
+}
+
+inline i64 write_string(void *buf, std::string_view str) {
   memcpy(buf, str.data(), str.size());
-  buf[str.size()] = '\0';
+  *((u8 *)buf + str.size()) = '\0';
   return str.size() + 1;
 }
 
 template <typename T>
-inline i64 write_vector(u8 *buf, const std::vector<T> &vec) {
+inline i64 write_vector(void *buf, const std::vector<T> &vec) {
   i64 sz = vec.size() * sizeof(T);
   memcpy(buf, vec.data(), sz);
   return sz;
@@ -234,6 +278,20 @@ inline void encode_uleb(std::vector<u8> &vec, u64 val) {
     val >>= 7;
     vec.push_back(val ? (byte | 0x80) : byte);
   } while (val);
+}
+
+inline void encode_sleb(std::vector<u8> &vec, i64 val) {
+  for (;;) {
+    u8 byte = val & 0x7f;
+    val >>= 7;
+
+    bool neg = (byte & 0x40);
+    if ((val == 0 && !neg) || (val == -1 && neg)) {
+      vec.push_back(byte);
+      break;
+    }
+    vec.push_back(byte | 0x80);
+  }
 }
 
 inline i64 write_uleb(u8 *buf, u64 val) {
@@ -258,13 +316,26 @@ inline u64 read_uleb(u8 *&buf) {
   return val;
 }
 
+inline u64 read_uleb(u8 const*&buf) {
+  return read_uleb(const_cast<u8 *&>(buf));
+}
+
+inline u64 read_uleb(std::string_view &str) {
+  u8 *start = (u8 *)&str[0];
+  u8 *ptr = start;
+  u64 val = read_uleb(ptr);
+  str = str.substr(ptr - start);
+  return val;
+}
+
 inline i64 uleb_size(u64 val) {
-  i64 i = 0;
-  do {
-    i++;
-    val >>= 7;
-  } while (val);
-  return i;
+#if __GNUC__
+#pragma GCC unroll 8
+#endif
+  for (int i = 1; i < 9; i++)
+    if (val < (1LL << (7 * i)))
+      return i;
+  return 9;
 }
 
 template <typename C>
@@ -274,6 +345,14 @@ std::string_view save_string(C &ctx, const std::string &str) {
   buf[str.size()] = '\0';
   ctx.string_pool.push_back(std::unique_ptr<u8[]>(buf));
   return {(char *)buf, str.size()};
+}
+
+inline bool remove_prefix(std::string_view &s, std::string_view prefix) {
+  if (s.starts_with(prefix)) {
+    s = s.substr(prefix.size());
+    return true;
+  }
+  return false;
 }
 
 //
@@ -305,7 +384,7 @@ public:
   void resize(i64 nbuckets) {
     this->~ConcurrentMap();
 
-    nbuckets = std::max<i64>(MIN_NBUCKETS, next_power_of_two(nbuckets));
+    nbuckets = std::max<i64>(MIN_NBUCKETS, bit_ceil(nbuckets));
 
     this->nbuckets = nbuckets;
     keys = (std::atomic<const char *> *)calloc(nbuckets, sizeof(keys[0]));
@@ -317,7 +396,7 @@ public:
     if (!keys)
       return {nullptr, false};
 
-    assert(std::popcount<u64>(nbuckets) == 1);
+    assert(has_single_bit(nbuckets));
     i64 idx = hash & (nbuckets - 1);
     i64 retry = 0;
 
@@ -376,10 +455,28 @@ private:
 };
 
 //
-// threads.cc
+// output-file.h
 //
 
-void set_thread_count(i64 n);
+template <typename C>
+class OutputFile {
+public:
+  static std::unique_ptr<OutputFile<C>>
+  open(C &ctx, std::string path, i64 filesize, i64 perm);
+
+  virtual void close(C &ctx) = 0;
+  virtual ~OutputFile() = default;
+
+  u8 *buf = nullptr;
+  std::string path;
+  i64 filesize;
+  bool is_mmapped;
+  bool is_unmapped = false;
+
+protected:
+  OutputFile(std::string path, i64 filesize, bool is_mmapped)
+    : path(path), filesize(filesize), is_mmapped(is_mmapped) {}
+};
 
 //
 // hyperloglog.cc
@@ -408,6 +505,66 @@ private:
 };
 
 //
+// glob.cc
+//
+
+class Glob {
+  typedef enum { STRING, STAR, QUESTION, BRACKET } Kind;
+
+  struct Element {
+    Element(Kind k) : kind(k) {}
+    Kind kind;
+    std::string str;
+    std::bitset<256> bitset;
+  };
+
+public:
+  static std::optional<Glob> compile(std::string_view pat);
+  bool match(std::string_view str);
+
+private:
+  Glob(std::vector<Element> &&vec) : elements(vec) {}
+  static bool do_match(std::string_view str, std::span<Element> elements);
+
+  std::vector<Element> elements;
+};
+
+//
+// multi-glob.cc
+//
+
+class MultiGlob {
+public:
+  bool add(std::string_view pat, u32 val);
+  bool empty() const { return strings.empty(); }
+  std::optional<u32> find(std::string_view str);
+
+private:
+  struct TrieNode {
+    u32 value = -1;
+    TrieNode *suffix_link = nullptr;
+    std::unique_ptr<TrieNode> children[256];
+  };
+
+  void compile();
+  void fix_suffix_links(TrieNode &node);
+  void fix_values();
+
+  std::vector<std::string> strings;
+  std::unique_ptr<TrieNode> root;
+  std::vector<std::pair<Glob, u32>> globs;
+  std::vector<u32> values;
+  std::once_flag once;
+  bool is_compiled = false;
+};
+
+//
+// uuid.cc
+//
+
+std::array<u8, 16> get_uuid_v4();
+
+//
 // filepath.cc
 //
 
@@ -425,32 +582,36 @@ std::filesystem::path to_abs_path(std::filesystem::path path);
 //
 
 std::string_view demangle(std::string_view name);
+std::optional<std::string_view> cpp_demangle(std::string_view name);
 
 //
 // compress.cc
 //
 
-class ZlibCompressor {
+class Compressor {
+public:
+  virtual void write_to(u8 *buf) = 0;
+  virtual ~Compressor() {}
+  i64 compressed_size = 0;
+};
+
+class ZlibCompressor : public Compressor {
 public:
   ZlibCompressor(u8 *buf, i64 size);
-  void write_to(u8 *buf);
-  i64 size() const;
+  void write_to(u8 *buf) override;
 
 private:
   std::vector<std::vector<u8>> shards;
   u64 checksum = 0;
 };
 
-class GzipCompressor {
+class ZstdCompressor : public Compressor {
 public:
-  GzipCompressor(std::string_view input);
-  void write_to(u8 *buf);
-  i64 size() const;
+  ZstdCompressor(u8 *buf, i64 size);
+  void write_to(u8 *buf) override;
 
 private:
   std::vector<std::vector<u8>> shards;
-  u32 checksum = 0;
-  u32 uncompressed_size = 0;
 };
 
 //
@@ -590,6 +751,12 @@ public:
       // because archive members may have the same name.
       return parent->name + ":" + std::to_string(get_offset());
     }
+
+    if (thin_parent) {
+      // If this is a thin archive member, the filename part is
+      // guaranteed to be unique.
+      return thin_parent->name + ":" + name;
+    }
     return name;
   }
 
@@ -599,7 +766,11 @@ public:
   i64 mtime = 0;
   bool given_fullpath = true;
   MappedFile *parent = nullptr;
+  MappedFile *thin_parent = nullptr;
   int fd = -1;
+#ifdef _WIN32
+  HANDLE file_handle = INVALID_HANDLE_VALUE;
+#endif
 };
 
 template <typename C>
@@ -607,7 +778,14 @@ MappedFile<C> *MappedFile<C>::open(C &ctx, std::string path) {
   if (path.starts_with('/') && !ctx.arg.chroot.empty())
     path = ctx.arg.chroot + "/" + path_clean(path);
 
-  i64 fd = ::open(path.c_str(), O_RDONLY);
+
+  i64 fd;
+#ifdef _WIN32
+    fd = ::_open(path.c_str(), O_RDONLY);
+#else
+    fd = ::open(path.c_str(), O_RDONLY);
+#endif
+
   if (fd == -1)
     return nullptr;
 
@@ -621,17 +799,32 @@ MappedFile<C> *MappedFile<C>::open(C &ctx, std::string path) {
   mf->name = path;
   mf->size = st.st_size;
 
-#ifdef __APPLE__
-  mf->mtime = (u64)st.st_mtimespec.tv_sec * 1000000000 + st.st_mtimespec.tv_nsec;
+#ifdef _WIN32
+    mf->mtime = st.st_mtime;
+#elif defined(__APPLE__)
+    mf->mtime = (u64)st.st_mtimespec.tv_sec * 1000000000 + st.st_mtimespec.tv_nsec;
 #else
-  mf->mtime = (u64)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
+    mf->mtime = (u64)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
 #endif
 
   if (st.st_size > 0) {
-    mf->data = (u8 *)mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+#ifdef _WIN32
+    HANDLE handle = CreateFileMapping((HANDLE)_get_osfhandle(fd),
+                                      nullptr, PAGE_READWRITE, 0,
+                                      st.st_size, nullptr);
+    if (!handle)
+      Fatal(ctx) << path << ": CreateFileMapping failed: " << GetLastError();
+    mf->file_handle = handle;
+    mf->data = (u8 *)MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, st.st_size);
+    if (!mf->data)
+      Fatal(ctx) << path << ": MapViewOfFile failed: " << GetLastError();
+#else
+    mf->data = (u8 *)mmap(nullptr, st.st_size, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE, fd, 0);
     if (mf->data == MAP_FAILED)
       Fatal(ctx) << path << ": mmap failed: " << errno_string();
-  }
+#endif
+    }
 
   close(fd);
   return mf;
@@ -659,8 +852,16 @@ MappedFile<C>::slice(C &ctx, std::string name, u64 start, u64 size) {
 
 template <typename C>
 MappedFile<C>::~MappedFile() {
-  if (size && !parent)
-    munmap(data, size);
+  if (size == 0 || parent)
+    return;
+
+#ifdef _WIN32
+  UnmapViewOfFile(data);
+  if (file_handle != INVALID_HANDLE_VALUE)
+    CloseHandle(file_handle);
+#else
+  munmap(data, size);
+#endif
 }
 
 } // namespace mold

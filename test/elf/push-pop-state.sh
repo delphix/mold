@@ -1,17 +1,15 @@
 #!/bin/bash
 export LC_ALL=C
 set -e
-CC="${CC:-cc}"
-CXX="${CXX:-c++}"
-GCC="${GCC:-gcc}"
-GXX="${GXX:-g++}"
+CC="${TEST_CC:-cc}"
+CXX="${TEST_CXX:-c++}"
+GCC="${TEST_GCC:-gcc}"
+GXX="${TEST_GXX:-g++}"
 OBJDUMP="${OBJDUMP:-objdump}"
 MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-mold="$(pwd)/mold"
-t=out/test/elf/$testname
+t=out/test/elf/$MACHINE/$testname
 mkdir -p $t
 
 cat <<EOF | $CC -shared -o $t/a.so -xc -
@@ -30,7 +28,7 @@ $CC -B. -o $t/exe $t/c.o -Wl,-as-needed \
   -Wl,-push-state -Wl,-no-as-needed $t/a.so -Wl,-pop-state $t/b.so
 
 readelf --dynamic $t/exe > $t/log
-fgrep -q a.so $t/log
-! fgrep -q b.so $t/log || false
+grep -Fq a.so $t/log
+! grep -Fq b.so $t/log || false
 
 echo OK

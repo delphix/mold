@@ -1,17 +1,15 @@
 #!/bin/bash
 export LC_ALL=C
 set -e
-CC="${CC:-cc}"
-CXX="${CXX:-c++}"
-GCC="${GCC:-gcc}"
-GXX="${GXX:-g++}"
+CC="${TEST_CC:-cc}"
+CXX="${TEST_CXX:-c++}"
+GCC="${TEST_GCC:-gcc}"
+GXX="${TEST_GXX:-g++}"
 OBJDUMP="${OBJDUMP:-objdump}"
 MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-mold="$(pwd)/mold"
-t=out/test/elf/$testname
+t=out/test/elf/$MACHINE/$testname
 mkdir -p $t
 
 cat <<EOF | $CC -c -o $t/a.o -xc -
@@ -31,14 +29,14 @@ $CC -B. -o $t/exe $t/a.o
 $CC -B. -o $t/exe $t/a.o -Wl,-repro
 
 tar -C $t -xf $t/exe.repro.tar
-fgrep -q /a.o  $t/exe.repro/response.txt
-fgrep -q mold $t/exe.repro/version.txt
+grep -Fq /a.o  $t/exe.repro/response.txt
+grep -Fq mold $t/exe.repro/version.txt
 
 rm -rf $t/exe.repro $t/exe.repro.tar
 
 MOLD_REPRO=1 $CC -B. -o $t/exe $t/a.o
 tar -C $t -xf $t/exe.repro.tar
-fgrep -q /a.o  $t/exe.repro/response.txt
-fgrep -q mold $t/exe.repro/version.txt
+grep -Fq /a.o  $t/exe.repro/response.txt
+grep -Fq mold $t/exe.repro/version.txt
 
 echo OK
