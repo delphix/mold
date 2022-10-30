@@ -1,4 +1,4 @@
-VERSION = 1.5.1
+VERSION = 1.6.0
 
 PREFIX = /usr/local
 BINDIR = $(PREFIX)/bin
@@ -32,9 +32,9 @@ endif
 # `STRIP=true` to run /bin/true instead of the strip command.
 STRIP = strip
 
-SRCS = compress.cc demangle.cc elf/arch-arm32.cc elf/arch-arm64.cc elf/arch-i386.cc elf/arch-ppc64v2.cc elf/arch-riscv.cc elf/arch-sparc64.cc elf/arch-x86-64.cc filepath.cc glob.cc hyperloglog.cc macho/arch-arm64.cc macho/arch-x86-64.cc macho/yaml.cc main.cc multi-glob.cc perf.cc strerror.cc tar.cc uuid.cc
+SRCS = compress.cc demangle.cc elf/arch-arm32.cc elf/arch-arm64.cc elf/arch-i386.cc elf/arch-ppc64v1.cc elf/arch-ppc64v2.cc elf/arch-riscv.cc elf/arch-s390x.cc elf/arch-sparc64.cc elf/arch-x86-64.cc filepath.cc glob.cc hyperloglog.cc macho/arch-arm64.cc macho/arch-x86-64.cc macho/yaml.cc main.cc multi-glob.cc perf.cc tar.cc uuid.cc
 
-ELF_TARGETS = X86_64 I386 ARM64 ARM32 RV32LE RV32BE RV64LE RV64BE PPC64V2 SPARC64
+ELF_TARGETS = X86_64 I386 ARM64 ARM32 RV32LE RV32BE RV64LE RV64BE PPC64V1 PPC64V2 S390X SPARC64
 MACHO_TARGETS = X86_64 ARM64
 
 ELF_TEMPLATES = elf/cmdline.cc elf/dwarf.cc elf/gc-sections.cc elf/icf.cc elf/input-files.cc elf/input-sections.cc elf/linker-script.cc elf/lto.cc elf/main.cc elf/mapfile.cc elf/output-chunks.cc elf/passes.cc elf/relocatable.cc elf/subprocess.cc elf/thunks.cc
@@ -149,11 +149,14 @@ endif
 
 DEPFLAGS = -MT $@ -MMD -MP -MF out/d/$*.d
 
-all: prebuild mold mold-wrapper.so
+all: prebuild
+	$(MAKE) mold mold-wrapper.so
 
 -include $(SRCS:%.cc=d/%.d)
 
 prebuild:
+	@echo 'WARNING: Use of `make` is deprecated. Please use `cmake` to build mold.'
+	sleep 10
 	mkdir -p out/d out/d/elf out/d/macho out/srcs/elf out/srcs/macho out/objs/elf out/objs/macho out/objs2/elf out/objs2/macho out/objs2/src/elf out/objs2/src/macho
 
 out/srcs/git-hash.cc: FORCE
@@ -219,21 +222,14 @@ endif
 	fi
 
 test-arch:
-	TEST_CC=${TRIPLE}-gcc \
-	TEST_CXX=${TRIPLE}-g++ \
-	TEST_GCC=${TRIPLE}-gcc \
-	TEST_GXX=${TRIPLE}-g++ \
-	OBJDUMP=${TRIPLE}-objdump \
-	MACHINE=${MACHINE} \
-	QEMU="qemu-${MACHINE} -L /usr/${TRIPLE}" \
 	$(MAKE) test
 
 test-all: all
-	$(MAKE) test-arch TRIPLE=x86_64-linux-gnu MACHINE=x86_64
-	$(MAKE) test-arch TRIPLE=i686-linux-gnu MACHINE=i386
-	$(MAKE) test-arch TRIPLE=aarch64-linux-gnu MACHINE=aarch64
-	$(MAKE) test-arch TRIPLE=arm-linux-gnueabihf MACHINE=arm
-	$(MAKE) test-arch TRIPLE=riscv64-linux-gnu MACHINE=riscv64
+	$(MAKE) test-arch TRIPLE=x86_64-linux-gnu
+	$(MAKE) test-arch TRIPLE=i686-linux-gnu
+	$(MAKE) test-arch TRIPLE=aarch64-linux-gnu
+	$(MAKE) test-arch TRIPLE=arm-linux-gnueabihf
+	$(MAKE) test-arch TRIPLE=riscv64-linux-gnu
 
 # macOS's GNU make hasn't been updated since 3.8.1 perhaps due a concern
 # of GPLv3. The --output-sync flag was introduced in GNU Make 4.0, so we
