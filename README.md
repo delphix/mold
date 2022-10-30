@@ -22,8 +22,9 @@ mold is so fast that it is only 2x _slower_ than `cp` on the same
 machine. Feel free to [file a bug](https://github.com/rui314/mold/issues)
 if you find mold is not faster than other linkers.
 
-mold officially supports x86-64, i386, ARM64, ARM32, 64-bit RISC-V and
-32-bit RISC-V. Little-endian PowerPC64 ELFv2 is partially supported.
+mold supports x86-64, i386, ARM64, ARM32, 64-bit/32-bit little/big-endian
+RISC-V, 64-bit big-endian PowerPC ELFv1, 64-bit little-endian PowerPC ELFv2,
+s390x and SPARC64.
 
 ## Why does the speed of linking matter?
 
@@ -63,7 +64,7 @@ necessary packages. You may want to run it as root.
 git clone https://github.com/rui314/mold.git
 mkdir mold/build
 cd mold/build
-git checkout v1.5.1
+git checkout v1.6.0
 ../install-build-deps.sh
 cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=c++ ..
 cmake --build . -j $(nproc)
@@ -74,7 +75,9 @@ You may need to pass a C++20 compiler command name to `cmake`.
 In the above case, `c++` is passed. If it doesn't work for you,
 try a specific version of a compiler such as `g++-10` or `clang++-12`.
 
-By default, `mold` is installed to `/usr/local/bin`.
+By default, `mold` is installed to `/usr/local/bin`. You can change
+that by passing `-DCMAKE_INSTALL_PREFIX=<directory>`. For other cmake
+options, see the comments in `CMakeLists.txt`.
 
 If you don't use a recent enough Linux distribution, or if for any reason
 `cmake` in the above commands doesn't work for you, you can use Docker to
@@ -127,8 +130,15 @@ linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=/path/to/mold"]
 ```
 
-where `/path/to/mold` is an absolute path to `mold` exectuable.
-Please make sure you have installed `clang`.
+where `/path/to/mold` is an absolute path to `mold` exectuable. In the
+above example, we use `clang` as a linker driver as it can always take
+the `-fuse-ldd` option. If your GCC is recent enough to recognize the
+option, you may be able to remove the `linker = "clang"` line.
+
+```toml
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=/path/to/mold"]
+```
 
 If you want to use mold for all projects, put the above snippet to
 `~/.cargo/config.toml`.

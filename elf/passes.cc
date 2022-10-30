@@ -74,6 +74,8 @@ void create_synthetic_sections(Context<E> &ctx) {
     ctx.eh_frame_hdr = push(new EhFrameHdrSection<E>);
   if (ctx.arg.gdb_index)
     ctx.gdb_index = push(new GdbIndexSection<E>);
+  if (ctx.arg.z_relro && ctx.arg.z_separate_code != SEPARATE_LOADABLE_SEGMENTS)
+    ctx.relro_padding = push(new RelroPaddingSection<E>);
   if (ctx.arg.hash_style_sysv)
     ctx.hash = push(new HashSection<E>);
   if (ctx.arg.hash_style_gnu)
@@ -89,9 +91,16 @@ void create_synthetic_sections(Context<E> &ctx) {
   ctx.note_package = push(new NotePackageSection<E>);
   ctx.note_property = push(new NotePropertySection<E>);
 
-  if constexpr (is_sparc<E>)
-    if (ctx.arg.is_static)
+  if (ctx.arg.is_static) {
+    if constexpr (is_s390x<E>)
+      ctx.s390x_tls_get_offset = push(new S390XTlsGetOffsetSection);
+
+    if constexpr (is_sparc<E>)
       ctx.sparc_tls_get_addr = push(new SparcTlsGetAddrSection);
+  }
+
+  if constexpr (std::is_same_v<E, PPC64V1>)
+    ctx.ppc64_opd = push(new PPC64OpdSection);
 
   // If .dynamic exists, .dynsym and .dynstr must exist as well
   // since .dynamic refers them.
@@ -99,6 +108,9 @@ void create_synthetic_sections(Context<E> &ctx) {
     ctx.dynstr->keep();
     ctx.dynsym->keep();
   }
+
+  ctx.tls_get_addr = get_symbol(ctx, "__tls_get_addr");
+  ctx.tls_get_offset = get_symbol(ctx, "__tls_get_offset");
 }
 
 template <typename E>
@@ -645,8 +657,13 @@ void write_repro_file(Context<E> &ctx) {
   for (std::unique_ptr<MappedFile<Context<E>>> &mf : ctx.mf_pool) {
     if (!mf->parent) {
       std::string path = to_abs_path(mf->name).string();
-      if (seen.insert(path).second)
-        tar->append(path, mf->get_contents());
+      if (seen.insert(path).second) {
+        // We reopen a file because we may have modified the contents of mf
+        // in memory, which is mapped with PROT_WRITE and MAP_PRIVATE.
+        MappedFile<Context<E>> *mf2 = MappedFile<Context<E>>::must_open(ctx, path);
+        tar->append(path, mf2->get_contents());
+        mf2->unmap();
+      }
     }
   }
 }
@@ -748,7 +765,7 @@ static void shuffle(std::vector<T> &vec, u64 seed) {
 
   // Xorshift random number generator. We use this RNG because it is
   // measurably faster than MT19937.
-  auto rand = [&]() {
+  auto rand = [&] {
     seed ^= seed << 13;
     seed ^= seed >> 7;
     seed ^= seed << 17;
@@ -892,10 +909,17 @@ void compute_section_sizes(Context<E> &ctx) {
   // inserting thunks. This pass cannot be parallelized. That is,
   // create_range_extension_thunks is parallelized internally, but the
   // function itself is not thread-safe.
-  if constexpr (needs_thunk<E>)
-    for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections)
-      if (osec->shdr.sh_flags & SHF_EXECINSTR)
+  if constexpr (needs_thunk<E>) {
+    for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections) {
+      if (osec->shdr.sh_flags & SHF_EXECINSTR) {
         create_range_extension_thunks(ctx, *osec);
+
+        for (InputSection<E> *isec : osec->members)
+          osec->shdr.sh_addralign =
+            std::max<u32>(osec->shdr.sh_addralign, 1 << isec->p2align);
+      }
+    }
+  }
 }
 
 template <typename E>
@@ -907,8 +931,8 @@ void claim_unresolved_symbols(Context<E> &ctx) {
 }
 
 template <typename E>
-void scan_rels(Context<E> &ctx) {
-  Timer t(ctx, "scan_rels");
+void scan_relocations(Context<E> &ctx) {
+  Timer t(ctx, "scan_relocations");
 
   // Scan relocations to find dynamic symbols.
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
@@ -1007,6 +1031,10 @@ void scan_rels(Context<E> &ctx) {
       }
     }
 
+    if constexpr (std::is_same_v<E, PPC64V1>)
+      if (sym->flags & NEEDS_OPD)
+        ctx.ppc64_opd->add_symbol(ctx, sym);
+
     sym->flags = 0;
   }
 
@@ -1048,6 +1076,23 @@ void create_reloc_sections(Context<E> &ctx) {
 }
 
 template <typename E>
+void copy_chunks(Context<E> &ctx) {
+  Timer t(ctx, "copy_chunks");
+
+  tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
+    std::string name =
+      chunk->name.empty() ? "(header)" : std::string(chunk->name);
+    Timer t2(ctx, name, &t);
+    chunk->copy_buf(ctx);
+  });
+
+  report_undef_errors(ctx);
+
+  if constexpr (std::is_same_v<E, ARM32>)
+    sort_arm_exidx(ctx);
+}
+
+template <typename E>
 void construct_relr(Context<E> &ctx) {
   Timer t(ctx, "construct_relr");
 
@@ -1061,14 +1106,18 @@ void construct_relr(Context<E> &ctx) {
 
 template <typename E>
 void create_output_symtab(Context<E> &ctx) {
-  Timer t(ctx, "compute_symtab");
+  Timer t(ctx, "compute_symtab_size");
+
+  tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
+    chunk->compute_symtab_size(ctx);
+  });
 
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    file->compute_symtab(ctx);
+    file->compute_symtab_size(ctx);
   });
 
   tbb::parallel_for_each(ctx.dsos, [&](SharedFile<E> *file) {
-    file->compute_symtab(ctx);
+    file->compute_symtab_size(ctx);
   });
 }
 
@@ -1194,7 +1243,7 @@ void compute_import_export(Context<E> &ctx) {
     tbb::parallel_for_each(ctx.dsos, [&](SharedFile<E> *file) {
       for (Symbol<E> *sym : file->symbols) {
         if (sym->file && !sym->file->is_dso && sym->visibility != STV_HIDDEN) {
-          if (sym->ver_idx != VER_NDX_LOCAL || !ctx.version_specified) {
+          if (sym->ver_idx != VER_NDX_LOCAL || !ctx.default_version_from_version_script) {
             std::scoped_lock lock(sym->mu);
             sym->is_exported = true;
           }
@@ -1275,14 +1324,15 @@ void clear_padding(Context<E> &ctx) {
 //   .gnu.version_r
 //   .rela.dyn
 //   .rela.plt
-//   alloc readonly code
 //   alloc readonly data
+//   alloc readonly code
 //   alloc writable tdata
 //   alloc writable tbss
 //   alloc writable RELRO data
 //   .got
 //   .toc
 //   alloc writable RELRO bss
+//   .relro_padding
 //   alloc writable non-RELRO data
 //   alloc writable non-RELRO bss
 //   nonalloc
@@ -1318,10 +1368,10 @@ void sort_output_sections(Context<E> &ctx) {
     u64 type = chunk->shdr.sh_type;
     u64 flags = chunk->shdr.sh_flags;
 
-    if (!(flags & SHF_ALLOC))
-      return INT32_MAX - 1;
     if (chunk == ctx.shdr)
       return INT32_MAX;
+    if (!(flags & SHF_ALLOC))
+      return INT32_MAX - 1;
 
     if (chunk == ctx.ehdr)
       return 0;
@@ -1354,7 +1404,7 @@ void sort_output_sections(Context<E> &ctx) {
     bool relro = is_relro(ctx, chunk);
     bool is_bss = (type == SHT_NOBITS);
 
-    return (1 << 10) | (writable << 9) | (!exec << 8) | (!tls << 7) |
+    return (1 << 10) | (writable << 9) | (exec << 8) | (!tls << 7) |
            (!relro << 6) | (is_bss << 5);
   };
 
@@ -1362,6 +1412,8 @@ void sort_output_sections(Context<E> &ctx) {
     if (chunk->shdr.sh_type == SHT_NOTE)
       return -chunk->shdr.sh_addralign;
 
+    if (chunk == ctx.relro_padding)
+      return INT_MAX;
     if (chunk->name == ".toc")
       return 2;
     if (chunk == ctx.got)
@@ -1386,59 +1438,137 @@ static bool is_tbss(Chunk<E> *chunk) {
   return (chunk->shdr.sh_type == SHT_NOBITS) && (chunk->shdr.sh_flags & SHF_TLS);
 }
 
-// Assign virtual addresses to output sections.
+// This function assigns virtual addresses to output sections. Assigning
+// addresses is a bit tricky because we want to pack sections as tightly
+// as possible while not violating the constraints imposed by the hardware
+// and the OS kernel. Specifically, we need to satisfy the following
+// constraints:
+//
+// - Memory protection (readable, writable and executable) works at page
+//   granularity. Therefore, if we want to set different memory attributes
+//   to two sections, we need to place them into separate pages.
+//
+// - The ELF spec requires that a section's file offset is congruent to
+//   its virtual address modulo the page size. For example, a section at
+//   virtual address 0x401234 on x86-64 (4 KiB, or 0x1000 byte page
+//   system) can be at file offset 0x3234 or 0x50234 but not at 0x1000.
+//
+// We need to insert paddings between sections if we can't satisfy the
+// above constraints without them.
+//
+// We don't want to waste too much memory and disk space for paddings.
+// There are a few tricks we can use to minimize paddings as below:
+//
+// - We want to place sections with the same memory attributes
+//   contiguous as possible.
+//
+// - We can map the same file region to memory more than once. For
+//   example, we can write code (with R and X bits) and read-only data
+//   (with R bit) adjacent on file and map it twice as the last page of
+//   the executable segment and the first page of the read-only data
+//   segment. This doesn't save memory but saves disk space.
 template <typename E>
 static void set_virtual_addresses(Context<E> &ctx) {
-  std::vector<Chunk<E> *> &chunks = ctx.chunks;
+  constexpr i64 RELRO = 1LL << 32;
 
-  auto alignment = [](Chunk<E> *chunk) {
-    return std::max<i64>(chunk->extra_addralign, chunk->shdr.sh_addralign);
+  auto get_flags = [&](Chunk<E> *chunk) {
+    i64 flags = to_phdr_flags(ctx, chunk);
+    if (is_relro(ctx, chunk))
+      return flags | RELRO;
+    return flags;
   };
 
   // Assign virtual addresses
+  std::vector<Chunk<E> *> &chunks = ctx.chunks;
   u64 addr = ctx.arg.image_base;
-  for (Chunk<E> *chunk : chunks) {
-    if (!(chunk->shdr.sh_flags & SHF_ALLOC))
+
+  for (i64 i = 0; i < chunks.size(); i++) {
+    if (!(chunks[i]->shdr.sh_flags & SHF_ALLOC))
       continue;
 
-    if (auto it = ctx.arg.section_start.find(chunk->name);
+    // .relro_padding is a padding section to extend a PT_GNU_RELRO
+    // segment to cover an entire page.
+    if (chunks[i] == ctx.relro_padding) {
+      chunks[i]->shdr.sh_addr = addr;
+      chunks[i]->shdr.sh_size = align_to(addr, ctx.page_size) - addr;
+      addr += ctx.page_size;
+      continue;
+    }
+
+    // Handle --section-start first
+    if (auto it = ctx.arg.section_start.find(chunks[i]->name);
         it != ctx.arg.section_start.end()) {
       addr = it->second;
-      chunk->shdr.sh_addr = addr;
-      addr += chunk->shdr.sh_size;
+      chunks[i]->shdr.sh_addr = addr;
+      addr += chunks[i]->shdr.sh_size;
       continue;
     }
 
-    if (is_tbss(chunk)) {
-      chunk->shdr.sh_addr = addr;
-      continue;
-    }
+    // Memory protection works at page size granularity. We need to
+    // put sections with different memory attributes into different
+    // pages. We do it by inserting paddings here.
+    if (i > 0 && chunks[i - 1] != ctx.relro_padding) {
+      i64 flags1 = get_flags(chunks[i - 1]);
+      i64 flags2 = get_flags(chunks[i]);
 
-    addr = align_to(addr, alignment(chunk));
-    chunk->shdr.sh_addr = addr;
-    addr += chunk->shdr.sh_size;
-  }
-
-  // Fix tbss virtual addresses. tbss sections are laid out as if they
-  // were overlapping to suceeding non-tbss sections. This is fine
-  // because no one will actually access the TBSS part of a TLS
-  // template image at runtime.
-  //
-  // We can lay out tbss sections in the same way as regular bss
-  // sections, but that would need one more extra PT_LOAD segment.
-  // Having fewer PT_LOAD segments is generally desirable, so we do this.
-  for (i64 i = 0; i < chunks.size();) {
-    if (is_tbss(chunks[i])) {
-      u64 addr = chunks[i]->shdr.sh_addr;
-      for (; i < chunks.size() && is_tbss(chunks[i]); i++) {
-        addr = align_to(addr, alignment(chunks[i]));
-        chunks[i]->shdr.sh_addr = addr;
-        addr += chunks[i]->shdr.sh_size;
+      if (flags1 != flags2) {
+        switch (ctx.arg.z_separate_code) {
+        case SEPARATE_LOADABLE_SEGMENTS:
+          addr = align_to(addr, ctx.page_size);
+          break;
+        case SEPARATE_CODE:
+          if ((flags1 & PF_X) != (flags2 & PF_X)) {
+            addr = align_to(addr, ctx.page_size);
+            break;
+          }
+          [[fallthrough]];
+        case NOSEPARATE_CODE:
+          if (addr % ctx.page_size != 0)
+            addr += ctx.page_size;
+          break;
+        default:
+          unreachable();
+        }
       }
-    } else {
-      i++;
     }
+
+    // TLS BSS sections are laid out so that they overlap with the
+    // subsequent non-tbss sections. Overlapping is fine because a STT_TLS
+    // segment contains an initialization image for newly-created threads,
+    // and no one except the runtime reads its contents. Even the runtime
+    // doesn't need a BSS part of a TLS initialization image; it just
+    // leaves zero-initialized bytes as-is instead of copying zeros.
+    // So no one really read tbss at runtime.
+    //
+    // We can instead allocate a dedicated virtual address space to tbss,
+    // but that would be just a waste of the address and disk space.
+    if (is_tbss(chunks[i])) {
+      u64 addr2 = addr;
+      for (;;) {
+        addr2 = align_to(addr2, chunks[i]->shdr.sh_addralign);
+        chunks[i]->shdr.sh_addr = addr2;
+        addr2 += chunks[i]->shdr.sh_size;
+        if (i + 2 == chunks.size() || !is_tbss(chunks[i + 1]))
+          break;
+        i++;
+      }
+      continue;
+    }
+
+    addr = align_to(addr, chunks[i]->shdr.sh_addralign);
+    chunks[i]->shdr.sh_addr = addr;
+    addr += chunks[i]->shdr.sh_size;
   }
+}
+
+// Returns the smallest integer N that satisfies N >= val and
+// N mod align == skew mod align.
+//
+// Section's file offset must be congruent to its virtual address modulo
+// the page size. We use this function to satisfy that requirement.
+static u64 align_with_skew(u64 val, u64 align, u64 skew) {
+  u64 x = align_down(val, align) + skew % align;
+  return (val <= x) ? x : x + align;
 }
 
 // Assign file offsets to output sections.
@@ -1448,14 +1578,17 @@ static i64 set_file_offsets(Context<E> &ctx) {
   u64 fileoff = 0;
   i64 i = 0;
 
-  auto alignment = [](Chunk<E> *chunk) {
-    return std::max<i64>(chunk->extra_addralign, chunk->shdr.sh_addralign);
-  };
-
   while (i < chunks.size() && (chunks[i]->shdr.sh_flags & SHF_ALLOC)) {
     Chunk<E> &first = *chunks[i];
-    assert(first.shdr.sh_type != SHT_NOBITS);
-    fileoff = align_to(fileoff, alignment(&first));
+    if (first.shdr.sh_type == SHT_NOBITS) {
+      i++;
+      continue;
+    }
+
+    if (first.shdr.sh_addralign > ctx.page_size)
+      fileoff = align_to(fileoff, first.shdr.sh_addralign);
+    else
+      fileoff = align_with_skew(fileoff, ctx.page_size, first.shdr.sh_addr);
 
     // Assign ALLOC sections contiguous file offsets as long as they
     // are contiguous in memory.
@@ -1526,7 +1659,7 @@ template <typename E>
 static i64 get_num_irelative_relocs(Context<E> &ctx) {
   return std::count_if(
     ctx.got->got_syms.begin(), ctx.got->got_syms.end(),
-    [](Symbol<E> *sym) { return sym->get_type() == STT_GNU_IFUNC; });
+    [](Symbol<E> *sym) { return sym->is_ifunc(); });
 }
 
 template <typename E>
@@ -1798,8 +1931,9 @@ template std::vector<Chunk<E> *> collect_output_sections(Context<E> &);
 template void compute_section_sizes(Context<E> &);
 template void sort_output_sections(Context<E> &);
 template void claim_unresolved_symbols(Context<E> &);
-template void scan_rels(Context<E> &);
+template void scan_relocations(Context<E> &);
 template void create_reloc_sections(Context<E> &);
+template void copy_chunks(Context<E> &);
 template void construct_relr(Context<E> &);
 template void create_output_symtab(Context<E> &);
 template void apply_version_script(Context<E> &);

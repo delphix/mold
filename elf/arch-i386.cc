@@ -39,89 +39,75 @@ namespace mold::elf {
 
 using E = I386;
 
-static void write_plt_header(Context<E> &ctx, u8 *buf) {
+template <>
+void write_plt_header(Context<E> &ctx, u8 *buf) {
   if (ctx.arg.pic) {
-    static const u8 plt0[] = {
-      0xff, 0xb3, 0, 0, 0, 0, // pushl GOTPLT+4(%ebx)
-      0xff, 0xa3, 0, 0, 0, 0, // jmp *GOTPLT+8(%ebx)
-      0x90, 0x90, 0x90, 0x90, // nop
+    static const u8 insn[] = {
+      0xf3, 0x0f, 0x1e, 0xfb, // endbr32
+      0x51,                   // push   %ecx
+      0x8d, 0x8b, 0, 0, 0, 0, // lea    GOTPLT+4(%ebx), %ecx
+      0xff, 0x31,             // push   (%ecx)
+      0xff, 0x61, 0x04,       // jmp    *0x4(%ecx)
     };
-    memcpy(buf, plt0, sizeof(plt0));
-    *(ul32 *)(buf + 2) = ctx.gotplt->shdr.sh_addr - ctx.got->shdr.sh_addr + 4;
-    *(ul32 *)(buf + 8) = ctx.gotplt->shdr.sh_addr - ctx.got->shdr.sh_addr + 8;
+    memcpy(buf, insn, sizeof(insn));
+    *(ul32 *)(buf + 7) = ctx.gotplt->shdr.sh_addr - ctx.got->shdr.sh_addr + 4;
   } else {
-    static const u8 plt0[] = {
-      0xff, 0x35, 0, 0, 0, 0, // pushl GOTPLT+4
-      0xff, 0x25, 0, 0, 0, 0, // jmp *GOTPLT+8
-      0x90, 0x90, 0x90, 0x90, // nop
+    static const u8 insn[] = {
+      0xf3, 0x0f, 0x1e, 0xfb, // endbr32
+      0x51,                   // push   %ecx
+      0xb9, 0, 0, 0, 0,       // mov    GOTPLT+4, %ecx
+      0xff, 0x31,             // push   (%ecx)
+      0xff, 0x61, 0x04,       // jmp    *0x4(%ecx)
+      0x90,                   // nop
     };
-    memcpy(buf, plt0, sizeof(plt0));
-    *(ul32 *)(buf + 2) = ctx.gotplt->shdr.sh_addr + 4;
-    *(ul32 *)(buf + 8) = ctx.gotplt->shdr.sh_addr + 8;
+    memcpy(buf, insn, sizeof(insn));
+    *(ul32 *)(buf + 6) = ctx.gotplt->shdr.sh_addr + 4;
   }
 }
 
-static void write_plt_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym,
-                            i64 idx) {
-  u8 *ent = buf + E::plt_hdr_size + sym.get_plt_idx(ctx) * E::plt_size;
-
+template <>
+void write_plt_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
   if (ctx.arg.pic) {
-    static const u8 data[] = {
+    static const u8 insn[] = {
+      0xf3, 0x0f, 0x1e, 0xfb, // endbr32
+      0xb9, 0, 0, 0, 0,       // mov $reloc_offset, %ecx
       0xff, 0xa3, 0, 0, 0, 0, // jmp *foo@GOT(%ebx)
-      0x68, 0,    0, 0, 0,    // pushl $reloc_offset
-      0xe9, 0,    0, 0, 0,    // jmp .PLT0@PC
+      0x90,                   // nop
     };
-    memcpy(ent, data, sizeof(data));
-    *(ul32 *)(ent + 2) = sym.get_gotplt_addr(ctx) - ctx.got->shdr.sh_addr;
+    memcpy(buf, insn, sizeof(insn));
+    *(ul32 *)(buf + 11) = sym.get_gotplt_addr(ctx) - ctx.got->shdr.sh_addr;
   } else {
-    static const u8 data[] = {
+    static const u8 insn[] = {
+      0xf3, 0x0f, 0x1e, 0xfb, // endbr32
+      0xb9, 0, 0, 0, 0,       // mov $reloc_offset, %ecx
       0xff, 0x25, 0, 0, 0, 0, // jmp *foo@GOT
-      0x68, 0,    0, 0, 0,    // pushl $reloc_offset
-      0xe9, 0,    0, 0, 0,    // jmp .PLT0@PC
+      0x90,                   // nop
     };
-    memcpy(ent, data, sizeof(data));
-    *(ul32 *)(ent + 2) = sym.get_gotplt_addr(ctx);
+    memcpy(buf, insn, sizeof(insn));
+    *(ul32 *)(buf + 11) = sym.get_gotplt_addr(ctx);
   }
 
-  *(ul32 *)(ent + 7) = idx * sizeof(ElfRel<E>);
-  *(ul32 *)(ent + 12) = ctx.plt->shdr.sh_addr - sym.get_plt_addr(ctx) - 16;
+  *(ul32 *)(buf + 5) = sym.get_plt_idx(ctx) * sizeof(ElfRel<E>);
 }
 
 template <>
-void PltSection<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + this->shdr.sh_offset;
-  write_plt_header(ctx, buf);
-
-  for (i64 i = 0; i < symbols.size(); i++)
-    write_plt_entry(ctx, buf, *symbols[i], i);
-}
-
-template <>
-void PltGotSection<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + this->shdr.sh_offset;
-
+void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
   if (ctx.arg.pic) {
-    static const u8 data[] = {
-      0xff, 0xa3, 0, 0, 0, 0, // jmp   *foo@GOT(%ebx)
-      0x66, 0x90,             // nop
+    static const u8 insn[] = {
+      0xf3, 0x0f, 0x1e, 0xfb,             // endbr32
+      0xff, 0xa3, 0, 0, 0, 0,             // jmp *foo@GOT(%ebx)
+      0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00, // nop
     };
-
-    for (i64 i = 0; i < symbols.size(); i++) {
-      u8 *ent = buf + i * sizeof(data);
-      memcpy(ent, data, sizeof(data));
-      *(ul32 *)(ent + 2) = symbols[i]->get_got_addr(ctx) - ctx.got->shdr.sh_addr;
-    }
+    memcpy(buf, insn, sizeof(insn));
+    *(ul32 *)(buf + 6) = sym.get_got_addr(ctx) - ctx.got->shdr.sh_addr;
   } else {
-    static const u8 data[] = {
-      0xff, 0x25, 0, 0, 0, 0, // jmp   *foo@GOT
-      0x66, 0x90,             // nop
+    static const u8 insn[] = {
+      0xf3, 0x0f, 0x1e, 0xfb,             // endbr32
+      0xff, 0x25, 0, 0, 0, 0,             // jmp *foo@GOT
+      0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00, // nop
     };
-
-    for (i64 i = 0; i < symbols.size(); i++) {
-      u8 *ent = buf + i * sizeof(data);
-      memcpy(ent, data, sizeof(data));
-      *(ul32 *)(ent + 2) = symbols[i]->get_got_addr(ctx);
-    }
+    memcpy(buf, insn, sizeof(insn));
+    *(ul32 *)(buf + 6) = sym.get_got_addr(ctx);
   }
 }
 
@@ -142,6 +128,13 @@ void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
   default:
     Fatal(ctx) << "unsupported relocation in .eh_frame: " << rel;
   }
+}
+
+static u32 relax_got32x(u8 *loc) {
+  // mov imm(%reg1), %reg2 -> lea imm(%reg1), %reg2
+  if (loc[0] == 0x8b)
+    return 0x8d00 | loc[1];
+  return 0;
 }
 
 template <>
@@ -188,14 +181,14 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       break;
     }
     case R_386_32:
-      apply_abs_dyn_rel(ctx, sym, rel, loc, S, A, P, dynrel);
+      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, dynrel);
       break;
     case R_386_PC8: {
       i64 val = S + A - P;
       check(val, -(1 << 7), 1 << 7);
       *loc = val;
       break;
-    };
+    }
     case R_386_PC16: {
       i64 val = S + A - P;
       check(val, -(1 << 15), 1 << 15);
@@ -207,8 +200,18 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul32 *)loc = S + A - P;
       break;
     case R_386_GOT32:
-    case R_386_GOT32X:
       *(ul32 *)loc = G + A;
+      break;
+    case R_386_GOT32X:
+      if (sym.has_got(ctx)) {
+        *(ul32 *)loc = G + A;
+      } else {
+        u32 insn = relax_got32x(loc - 2);
+        assert(insn);
+        loc[-2] = insn >> 8;
+        loc[-1] = insn;
+        *(ul32 *)loc = S + A - GOT;
+      }
       break;
     case R_386_GOTOFF:
       *(ul32 *)loc = S + A - GOT;
@@ -226,7 +229,9 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul32 *)loc = sym.get_gottp_addr(ctx) + A;
       break;
     case R_386_TLS_GD:
-      if (sym.get_tlsgd_idx(ctx) == -1) {
+      if (sym.has_tlsgd(ctx)) {
+        *(ul32 *)loc = sym.get_tlsgd_addr(ctx) + A - GOT;
+      } else {
         // Relax GD to LE
         switch (rels[i + 1].r_type) {
         case R_386_PLT32: {
@@ -253,12 +258,12 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         }
 
         i++;
-      } else {
-        *(ul32 *)loc = sym.get_tlsgd_addr(ctx) + A - GOT;
       }
       break;
     case R_386_TLS_LDM:
-      if (ctx.got->tlsld_idx == -1) {
+      if (ctx.got->has_tlsld(ctx)) {
+        *(ul32 *)loc = ctx.got->get_tlsld_addr(ctx) + A - GOT;
+      } else {
         // Relax LD to LE
         switch (rels[i + 1].r_type) {
         case R_386_PLT32: {
@@ -287,8 +292,6 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 
         *(ul32 *)(loc + 5) = ctx.tp_addr - ctx.tls_begin;
         i++;
-      } else {
-        *(ul32 *)loc = ctx.got->get_tlsld_addr(ctx) + A - GOT;
       }
       break;
     case R_386_TLS_LDO_32:
@@ -298,18 +301,18 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul32 *)loc = sym.esym().st_size + A;
       break;
     case R_386_TLS_GOTDESC:
-      if (sym.get_tlsdesc_idx(ctx) == -1) {
+      if (sym.has_tlsdesc(ctx)) {
+        *(ul32 *)loc = sym.get_tlsdesc_addr(ctx) + A - GOT;
+      } else {
         static const u8 insn[] = {
           0x8d, 0x05, 0, 0, 0, 0, // lea 0, %eax
         };
         memcpy(loc - 2, insn, sizeof(insn));
         *(ul32 *)loc = S + A - ctx.tp_addr;
-      } else {
-        *(ul32 *)loc = sym.get_tlsdesc_addr(ctx) + A - GOT;
       }
       break;
     case R_386_TLS_DESC_CALL:
-      if (ctx.arg.relax && !ctx.arg.shared) {
+      if (!sym.has_tlsdesc(ctx)) {
         // call *(%eax) -> nop
         loc[0] = 0x66;
         loc[1] = 0x90;
@@ -390,7 +393,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       check(val, -(1 << 15), 1 << 15);
       *(ul16 *)loc = val;
       break;
-    };
+    }
     case R_386_PC32:
       *(ul32 *)loc = S + A;
       break;
@@ -434,33 +437,40 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
+    u8 *loc = (u8 *)(contents.data() + rel.r_offset);
 
     if (!sym.file) {
       record_undef_error(ctx, rel);
       continue;
     }
 
-    if (sym.get_type() == STT_GNU_IFUNC)
+    if (sym.is_ifunc())
       sym.flags |= (NEEDS_GOT | NEEDS_PLT);
 
     switch (rel.r_type) {
     case R_386_8:
     case R_386_16:
-      scan_abs_rel(ctx, sym, rel);
+      scan_rel(ctx, sym, rel, absrel_table);
       break;
     case R_386_32:
-      scan_abs_dyn_rel(ctx, sym, rel);
+      scan_rel(ctx, sym, rel, dyn_absrel_table);
       break;
     case R_386_PC8:
     case R_386_PC16:
     case R_386_PC32:
-      scan_pcrel_rel(ctx, sym, rel);
+      scan_rel(ctx, sym, rel, pcrel_table);
       break;
     case R_386_GOT32:
-    case R_386_GOT32X:
     case R_386_GOTPC:
       sym.flags |= NEEDS_GOT;
       break;
+    case R_386_GOT32X: {
+      bool do_relax = ctx.arg.relax && !sym.is_imported &&
+                      sym.is_relative() && relax_got32x(loc - 2);
+      if (!do_relax)
+        sym.flags |= NEEDS_GOT;
+      break;
+    }
     case R_386_PLT32:
       if (sym.is_imported)
         sym.flags |= NEEDS_PLT;
@@ -478,7 +488,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
           ty != R_386_PLT32 && ty != R_386_GOT32 && ty != R_386_GOT32X)
         Fatal(ctx) << *this << ": TLS_GD reloc must be followed by PLT or GOT32";
 
-      if (ctx.arg.relax && !ctx.arg.shared && !sym.is_imported)
+      if (relax_tlsgd(ctx, sym))
         i++;
       else
         sym.flags |= NEEDS_TLSGD;
@@ -491,13 +501,13 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
           ty != R_386_PLT32 && ty != R_386_GOT32 && ty != R_386_GOT32X)
         Fatal(ctx) << *this << ": TLS_LDM reloc must be followed by PLT or GOT32";
 
-      if (ctx.arg.relax && !ctx.arg.shared)
+      if (relax_tlsld(ctx))
         i++;
       else
         ctx.needs_tlsld = true;
       break;
     case R_386_TLS_GOTDESC:
-      if (!ctx.arg.relax || ctx.arg.shared)
+      if (!relax_tlsdesc(ctx, sym))
         sym.flags |= NEEDS_TLSDESC;
       break;
     case R_386_GOTOFF:

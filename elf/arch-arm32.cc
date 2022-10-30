@@ -73,10 +73,8 @@ static void write_thm_mov_imm(u8 *loc, u32 val) {
 }
 
 template <>
-void PltSection<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + this->shdr.sh_offset;
-
-  static const ul32 plt0[] = {
+void write_plt_header(Context<E> &ctx, u8 *buf) {
+  static const ul32 insn[] = {
     0xe52d'e004, // push {lr}
     0xe59f'e004, // ldr lr, 2f
     0xe08f'e00e, // 1: add lr, pc, lr
@@ -87,39 +85,27 @@ void PltSection<E>::copy_buf(Context<E> &ctx) {
     0xe320'f000, // nop
   };
 
-  memcpy(buf, plt0, sizeof(plt0));
-  *(ul32 *)(buf + 16) = ctx.gotplt->shdr.sh_addr - this->shdr.sh_addr - 16;
+  memcpy(buf, insn, sizeof(insn));
+  *(ul32 *)(buf + 16) = ctx.gotplt->shdr.sh_addr - ctx.plt->shdr.sh_addr - 16;
+}
 
-  for (Symbol<E> *sym : symbols) {
-    static const ul32 plt[] = {
-      0xe59f'c004, // 1: ldr ip, 2f
-      0xe08c'c00f, // add ip, ip, pc
-      0xe59c'f000, // ldr pc, [ip]
-      0x0000'0000, // 2: .word sym@PLTGOT - 1b
-    };
+static const ul32 plt_entry[] = {
+  0xe59f'c004, // 1: ldr ip, 2f
+  0xe08c'c00f, // add ip, ip, pc
+  0xe59c'f000, // ldr pc, [ip]
+  0x0000'0000, // 2: .word sym@GOT - 1b
+};
 
-    u8 *ent = buf + sizeof(plt0) + sym->get_plt_idx(ctx) * sizeof(plt);
-    memcpy(ent, plt, sizeof(plt));
-    *(ul32 *)(ent + 12) = sym->get_gotplt_addr(ctx) - sym->get_plt_addr(ctx) - 12;
-  }
+template <>
+void write_plt_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
+  memcpy(buf, plt_entry, sizeof(plt_entry));
+  *(ul32 *)(buf + 12) = sym.get_gotplt_addr(ctx) - sym.get_plt_addr(ctx) - 12;
 }
 
 template <>
-void PltGotSection<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + this->shdr.sh_offset;
-
-  for (Symbol<E> *sym : symbols) {
-    static const ul32 plt[] = {
-      0xe59f'c004, // 1: ldr ip, 2f
-      0xe08c'c00f, // add ip, ip, pc
-      0xe59c'f000, // ldr pc, [ip]
-      0x0000'0000, // 2: .word sym@GOT - 1b
-    };
-
-    u8 *ent = buf + sym->get_pltgot_idx(ctx) * sizeof(plt);
-    memcpy(ent, plt, sizeof(plt));
-    *(ul32 *)(ent + 12) = sym->get_got_addr(ctx) - sym->get_plt_addr(ctx) - 12;
-  }
+void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
+  memcpy(buf, plt_entry, sizeof(plt_entry));
+  *(ul32 *)(buf + 12) = sym.get_got_addr(ctx) - sym.get_plt_addr(ctx) - 12;
 }
 
 // ARM does not use .eh_frame for exception handling. Instead, it uses
@@ -162,6 +148,13 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     Symbol<E> &sym = *file.symbols[rel.r_sym];
     u8 *loc = base + rel.r_offset;
 
+    auto check = [&](i64 val, i64 lo, i64 hi) {
+      if (val < lo || hi <= val)
+        Error(ctx) << *this << ": relocation " << rel << " against "
+                   << sym << " out of range: " << val << " is not in ["
+                   << lo << ", " << hi << ")";
+    };
+
 #define S   sym.get_addr(ctx)
 #define A   this->get_addend(rel)
 #define P   (get_addr() + rel.r_offset)
@@ -184,7 +177,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     switch (rel.r_type) {
     case R_ARM_ABS32:
     case R_ARM_TARGET1:
-      apply_abs_dyn_rel(ctx, sym, rel, loc, S, A, P, dynrel);
+      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, dynrel);
       break;
     case R_ARM_REL32:
       *(ul32 *)loc = S + A - P;
@@ -265,10 +258,31 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         *(ul32 *)loc = (*(ul32 *)loc & 0xff00'0000) | bits(val, 25, 2);
       }
       break;
-    case R_ARM_THM_JUMP11:
+    case R_ARM_THM_JUMP11: {
       assert(T);
-      *(ul16 *)loc = (*(ul16 *)loc & 0xf800) | bits(S + A - P, 11, 1);
+      i64 val = S + A - P;
+      check(val, -(1 << 11), 1 << 11);
+      *(ul16 *)loc = (*(ul16 *)loc & 0xf800) | bits(val, 11, 1);
       break;
+    }
+    case R_ARM_THM_JUMP19: {
+      i64 val = S + A - P;
+      check(val, -(1 << 19), 1 << 19);
+
+      // sign:J2:J1:imm6:imm11:'0'
+      u32 sign = bit(val, 20);
+      u32 J2 = bit(val, 19);
+      u32 J1 = bit(val, 18);
+      u32 imm6 = bits(val, 17, 12);
+      u32 imm11 = bits(val, 11, 1);
+
+      *(ul16 *)loc &= 0b1111'1011'1100'0000;
+      *(ul16 *)loc |= (sign << 10) | imm6;
+
+      *(ul16 *)(loc + 2) &= 0b1101'0000'0000'0000;
+      *(ul16 *)(loc + 2) |= (J2 << 13) | (J1 << 11) | imm11;
+      break;
+    }
     case R_ARM_THM_JUMP24:
       if (sym.is_remaining_undef_weak()) {
         *(ul32 *)loc = 0x8000'f3af; // NOP.W
@@ -290,9 +304,12 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_ARM_THM_MOVW_PREL_NC:
       write_thm_mov_imm(loc, ((S + A) | T) - P);
       break;
-    case R_ARM_PREL31:
-      *(ul32 *)loc = (*(ul32 *)loc & 0x8000'0000) | ((S + A - P) & 0x7fff'ffff);
+    case R_ARM_PREL31: {
+      i64 val = S + A - P;
+      check(val, -(1LL << 30), 1LL << 30);
+      *(ul32 *)loc = (*(ul32 *)loc & 0x8000'0000) | ((val) & 0x7fff'ffff);
       break;
+    }
     case R_ARM_THM_MOVW_ABS_NC:
       write_thm_mov_imm(loc, (S + A) | T);
       break;
@@ -324,32 +341,33 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul32 *)loc = S + A - ctx.tp_addr;
       break;
     case R_ARM_TLS_GOTDESC:
-      if (sym.get_tlsdesc_idx(ctx) == -1) {
-        *(ul32 *)loc = S - ctx.tp_addr;
-      } else if (A & 1) {
+      if (sym.has_tlsdesc(ctx)) {
         // A is odd if the corresponding TLS_CALL is Thumb.
-        *(ul32 *)loc = sym.get_tlsdesc_addr(ctx) - P + A - 6;
+        if (A & 1)
+          *(ul32 *)loc = sym.get_tlsdesc_addr(ctx) - P + A - 6;
+        else
+          *(ul32 *)loc = sym.get_tlsdesc_addr(ctx) - P + A - 4;
       } else {
-        *(ul32 *)loc = sym.get_tlsdesc_addr(ctx) - P + A - 4;
+        *(ul32 *)loc = S - ctx.tp_addr;
       }
       break;
     case R_ARM_TLS_CALL:
-      if (sym.get_tlsdesc_idx(ctx) == -1) {
-        // BL -> NOP
-        *(ul32 *)loc = 0xe320'f000;
-      } else {
+      if (sym.has_tlsdesc(ctx)) {
         // BL <tls_trampoline>
         *(ul32 *)loc = 0xeb00'0000 | bits(get_trampoline_addr(P + 8), 25, 2);
+      } else {
+        // BL -> NOP
+        *(ul32 *)loc = 0xe320'f000;
       }
       break;
     case R_ARM_THM_TLS_CALL:
-      if (sym.get_tlsdesc_idx(ctx) == -1) {
-        // BL -> NOP.W
-        *(ul32 *)loc = 0x8000'f3af;
-      } else {
+      if (sym.has_tlsdesc(ctx)) {
         u64 val = align_to(get_trampoline_addr(P + 4), 4);
         write_thm_b_imm(loc, val);
         *(ul16 *)(loc + 2) &= ~0x1000; // rewrite BL with BLX
+      } else {
+        // BL -> NOP.W
+        *(ul32 *)loc = 0x8000'f3af;
       }
       break;
     default:
@@ -433,7 +451,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       continue;
     }
 
-    if (sym.get_type() == STT_GNU_IFUNC)
+    if (sym.is_ifunc())
       sym.flags |= (NEEDS_GOT | NEEDS_PLT);
 
     switch (rel.r_type) {
@@ -441,7 +459,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_ARM_MOVT_ABS:
     case R_ARM_THM_MOVT_ABS:
     case R_ARM_TARGET1:
-      scan_abs_dyn_rel(ctx, sym, rel);
+      scan_rel(ctx, sym, rel, dyn_absrel_table);
       break;
     case R_ARM_THM_CALL:
     case R_ARM_CALL:
@@ -458,7 +476,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_ARM_MOVT_PREL:
     case R_ARM_THM_MOVT_PREL:
     case R_ARM_PREL31:
-      scan_pcrel_rel(ctx, sym, rel);
+      scan_rel(ctx, sym, rel, pcrel_table);
       break;
     case R_ARM_TLS_GD32:
       sym.flags |= NEEDS_TLSGD;
@@ -470,12 +488,13 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       sym.flags |= NEEDS_GOTTP;
       break;
     case R_ARM_TLS_GOTDESC:
-      if (!ctx.relax_tlsdesc || sym.is_imported)
+      if (!relax_tlsdesc(ctx, sym))
         sym.flags |= NEEDS_TLSDESC;
       break;
     case R_ARM_REL32:
     case R_ARM_BASE_PREL:
     case R_ARM_THM_JUMP11:
+    case R_ARM_THM_JUMP19:
     case R_ARM_MOVW_PREL_NC:
     case R_ARM_MOVW_ABS_NC:
     case R_ARM_THM_MOVW_PREL_NC:
@@ -500,9 +519,9 @@ void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
   // common piece of code is factored out from object files to reduce
   // output size. Since no one provide, the linker has to synthesize it.
   static ul32 hdr[] = {
-    0xe08e0000, // add r0, lr, r0
-    0xe5901004, // ldr r1, [r0, #4]
-    0xe12fff11, // bx  r1
+    0xe08e'0000, // add r0, lr, r0
+    0xe590'1004, // ldr r1, [r0, #4]
+    0xe12f'ff11, // bx  r1
   };
 
   // This is a range extension and mode switch thunk.
@@ -593,7 +612,7 @@ void sort_arm_exidx(Context<E> &ctx) {
     i64 offset = sizeof(Entry) * i;
     ent[i].addr = sign_extend(ent[i].addr, 30) + offset;
     if (is_relative(ent[i].val))
-      ent[i].val = 0x7fff'ffff & (sign_extend(ent[i].val, 30) + offset);
+      ent[i].val = 0x7fff'ffff & (ent[i].val + offset);
   });
 
   tbb::parallel_sort(ent, ent + num_entries, [](const Entry &a, const Entry &b) {

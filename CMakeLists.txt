@@ -1,10 +1,55 @@
+# You can customize a build by specifying CMake options. An option may be
+# given in the -Dvariable=value form. For a boolean variable, `ON` or `1`
+# means true while `OFF` or `0` means false.
+#
+# Here are a couple of common cmake options:
+#
+#  -DCMAKE_C_COMPILER=<command-name>
+#
+#   Specifies a C compiler name to use. The default value is `cc`.
+#
+#  -DCMAKE_CXX_COMPILER=<command-name>
+#
+#   Specifies a C++ compiler name to use. The default value is `c++`.
+#
+#  -DCMAKE_INSTALL_PREFIX=<directory>
+#
+#   Specifies an install target directory. The default value is `/usr/local`.
+#
+#  -DCMAKE_BUILD_TYPE=[Debug | Release | RelWithDebInfo | MinSizeRel]
+#
+#   Specifies a build type. The default is `Release` which is the right
+#   option unless you are debugging mold.
+#
+# An example of a cmake command line is shown below:
+#
+#   $ cmake -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_CXX_COMPILER=g++-12 ..
+#
+# where `..` refers this directory.
+#
+# With cmake, you may run `cmake --install .` instead of `make install` to
+# install build artifacts to system directories. If you want to install
+# artifacts to a temporary target directory, run `cmake --install . --prefix
+# <dir>`.
+#
+# You can see the current cmake variables and their values by running
+# `cmake -N -L .` in a build directory.
+#
+# Note that in this file, we provide various dials and knobs to configure
+# how to build mold. However, as a policy, we do not provide a way to
+# enable/disable any individual mold's feature. In other words, we do not
+# provide options like `--enable-foo` or `--disable-foo`. The motivation
+# behind it is build reproducibility. We want to guarantees that all builds
+# of the mold linker of the same version will have the exactly same set of
+# features and behave exactly the same.
+
 cmake_minimum_required(VERSION 3.13)
-project(mold VERSION 1.5.1)
+project(mold VERSION 1.6.0)
 
 include(CMakeDependentOption)
 include(GNUInstallDirs)
 
-# Add -fuse-ld=mold if accepted by the compiler.
+# Build mold itself using mold if -DMOLD_USE_MOLD=ON.
 option(MOLD_USE_MOLD "Use mold to build mold" OFF)
 if(MOLD_USE_MOLD)
   add_link_options(-fuse-ld=mold)
@@ -13,7 +58,7 @@ endif()
 add_executable(mold)
 target_compile_features(mold PRIVATE cxx_std_20)
 target_compile_definitions(mold PRIVATE
-  "LIBDIR=\"${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}\"")
+  "LIBDIR=\"${CMAKE_INSTALL_FULL_LIBDIR}\"")
 target_link_libraries(mold PRIVATE ${CMAKE_DL_LIBS})
 
 if(NOT "${CMAKE_CXX_COMPILER_FRONTEND_VARIANT}" STREQUAL "MSVC")
@@ -25,33 +70,39 @@ if(NOT "${CMAKE_CXX_COMPILER_FRONTEND_VARIANT}" STREQUAL "MSVC")
     -Wno-unused-function)
 endif()
 
-# Build mold with -flto if MOLD_LTO=On
+# Build mold with -flto if -DMOLD_LTO=ON
 option(MOLD_LTO "Build mold with link-time optimization enabled")
 if(MOLD_LTO)
   set_property(TARGET mold PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
 endif()
 
-# Handle MOLD_USE_ASAN and MOLD_USE_TSAN
+# Enable AddressSanitizer if -DMOLD_USE_ASAN=ON
 option(MOLD_USE_ASAN "Build mold with AddressSanitizer" OFF)
 if(MOLD_USE_ASAN)
   target_compile_options(mold PRIVATE -fsanitize=address -fsanitize=undefined)
   target_link_options(mold PRIVATE -fsanitize=address -fsanitize=undefined)
 endif()
 
+# Enabled ThreadSanitizer if -DMOLD_USE_TSAN=ON
 option(MOLD_USE_TSAN "Build mold with ThreadSanitizer" OFF)
 if(MOLD_USE_TSAN)
   target_compile_options(mold PRIVATE -fsanitize=thread)
   target_link_options(mold PRIVATE -fsanitize=thread)
 endif()
 
-# Static link libstdc++ and libcrypto if MOLD_MOSTLY_STATIC=On
+# Statically-link libstdc++ and libcrypto if -DMOLD_MOSTLY_STATIC=ON.
+#
+# This option is intended to be used by `./dist.sh` script to create a
+# mold binary that works on various Linux distros. You probably don't
+# need nor want to set this to ON.
 option(MOLD_MOSTLY_STATIC "Statically link libstdc++ and libcrypto" OFF)
 if(MOLD_MOSTLY_STATIC)
   target_link_options(mold PRIVATE -static-libstdc++)
   target_link_libraries(mold PRIVATE libcrypto.a)
 endif()
 
-# Setup zlib
+# Find zlib. If libz.so is not found, we compile a bundled one and
+# statically-link it to mold.
 find_package(ZLIB QUIET)
 if(ZLIB_FOUND)
   target_link_libraries(mold PRIVATE ZLIB::ZLIB)
@@ -62,7 +113,8 @@ else()
   target_link_libraries(mold PRIVATE zlibstatic)
 endif()
 
-# Setup zstd
+# Find zstd compression library. Just like zlib, if libzstd.so is not
+# found, we compile a bundled one and statically-link it to mold.
 include(CheckIncludeFile)
 check_include_file(zstd.h HAVE_ZSTD_H)
 
@@ -80,7 +132,10 @@ else()
   target_link_libraries(mold PRIVATE libzstd_static)
 endif()
 
-# Setup mimalloc
+# Find mimalloc. mimalloc is an alternative malloc implementation
+# optimized for multi-threaded applications.
+#
+# If you want to use the usual libc's malloc, pass -DMOLD_USE_MIMALLOC=OFF.
 include(CheckCSourceCompiles)
 check_c_source_compiles("#ifdef __i386__\nint main() {}\n#endif" I386)
 
@@ -90,6 +145,9 @@ cmake_dependent_option(
   MOLD_USE_SYSTEM_MIMALLOC "Use system or vendored mimalloc" OFF
   MOLD_USE_MIMALLOC OFF)
 
+# By default, we build a bundled mimalloc and statically-link it to
+# mold. If you want to dynamically link to the system's
+# libmimalloc.so, pass -DMOLD_USE_SYSTEM_MIMALLOC=ON.
 if(MOLD_USE_MIMALLOC)
   if(MOLD_USE_SYSTEM_MIMALLOC)
     find_package(mimalloc REQUIRED)
@@ -108,7 +166,12 @@ if(MOLD_USE_MIMALLOC)
   endif()
 endif()
 
-# Setup TBB
+# Find TBB. TBB (OneTBB or Intel TBB) is a high-level threading library.
+# Use of this library is mandatory.
+#
+# By default, we build a bundled one and statically-link the library
+# to mold. If you want to link to the system's libtbb2.so, pass
+# -DMOLD_USE_SYSTEM_TBB=ON.
 option(MOLD_USE_SYSTEM_TBB "Use system or vendored TBB" OFF)
 if(MOLD_USE_SYSTEM_TBB)
   find_package(TBB REQUIRED)
@@ -156,7 +219,7 @@ if(NOT APPLE AND NOT WIN32 AND NOT MOLD_MOSTLY_STATIC)
   target_link_libraries(mold PRIVATE OpenSSL::Crypto)
 endif()
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(riscv64|armv)")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(riscv64|armv6)")
   target_link_libraries(mold PRIVATE atomic)
 endif()
 
@@ -183,7 +246,8 @@ add_dependencies(mold git_hash)
 # As a workaround, we create a .cc file for each target and spawn many
 # compiler instances. This is hacky but greatly reduces compile time.
 list(APPEND MOLD_ELF_TARGETS
-  X86_64 I386 ARM64 ARM32 RV32LE RV32BE RV64LE RV64BE PPC64V2 SPARC64)
+  X86_64 I386 ARM64 ARM32 RV32LE RV32BE RV64LE RV64BE
+  PPC64V1 PPC64V2 SPARC64 S390X)
 
 list(APPEND MOLD_ELF_TEMPLATE_FILES
   elf/cmdline.cc
@@ -245,8 +309,10 @@ target_sources(mold PRIVATE
   elf/arch-arm32.cc
   elf/arch-arm64.cc
   elf/arch-i386.cc
+  elf/arch-ppc64v1.cc
   elf/arch-ppc64v2.cc
   elf/arch-riscv.cc
+  elf/arch-s390x.cc
   elf/arch-sparc64.cc
   elf/arch-x86-64.cc
   filepath.cc
@@ -259,11 +325,17 @@ target_sources(mold PRIVATE
   main.cc
   multi-glob.cc
   perf.cc
-  strerror.cc
   tar.cc
   third-party/rust-demangle/rust-demangle.c
   uuid.cc
   )
+
+# Add frequently included header files for pre-compiling.
+if(${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.16.0") # for target_precompile_headers
+target_precompile_headers(mold PRIVATE
+  "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_SOURCE_DIR}/elf/mold.h>"
+  "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_SOURCE_DIR}/macho/mold.h>")
+endif()
 
 include(CTest)
 
@@ -287,21 +359,20 @@ if(BUILD_TESTING)
 endif()
 
 if(NOT CMAKE_SKIP_INSTALL_RULES)
-  install(TARGETS mold RUNTIME DESTINATION bin)
+  install(TARGETS mold RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
   install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
   install(FILES docs/mold.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1/)
   install(CODE "
-    set(DEST \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}\")
     file(RELATIVE_PATH RELPATH
-       /${CMAKE_INSTALL_LIBEXECDIR}/mold /${CMAKE_INSTALL_BINDIR}/mold)
+       /${CMAKE_INSTALL_FULL_LIBEXECDIR}/mold /${CMAKE_INSTALL_FULL_BINDIR}/mold)
     execute_process(COMMAND ${CMAKE_COMMAND} -E make_directory
-      \${DEST}/${CMAKE_INSTALL_LIBEXECDIR}/mold)
+      \$ENV{DESTDIR}/${CMAKE_INSTALL_FULL_LIBEXECDIR}/mold)
     execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink \${RELPATH}
-      \${DEST}/${CMAKE_INSTALL_LIBEXECDIR}/mold/ld)
+      \$ENV{DESTDIR}/${CMAKE_INSTALL_FULL_LIBEXECDIR}/mold/ld)
     execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink mold
-      \${DEST}/${CMAKE_INSTALL_BINDIR}/ld.mold)
+      \$ENV{DESTDIR}/${CMAKE_INSTALL_FULL_BINDIR}/ld.mold)
     execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink mold
-      \${DEST}/${CMAKE_INSTALL_BINDIR}/ld64.mold)
+      \$ENV{DESTDIR}/${CMAKE_INSTALL_FULL_BINDIR}/ld64.mold)
     execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink mold.1
-      \${DEST}/${CMAKE_INSTALL_MANDIR}/man1/ld.mold.1)")
+      \$ENV{DESTDIR}/${CMAKE_INSTALL_FULL_MANDIR}/man1/ld.mold.1)")
 endif()

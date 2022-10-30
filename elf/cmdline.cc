@@ -115,12 +115,12 @@ Options:
   --perf                      Print performance statistics
   --pie, --pic-executable     Create a position independent executable
     --no-pie, --no-pic-executable
-  --pop-state                 Pop state of flags governing input file handling
+  --pop-state                 Restore state of flags governing input file handling
   --print-gc-sections         Print removed unreferenced sections
     --no-print-gc-sections
   --print-icf-sections        Print folded identical sections
     --no-print-icf-sections
-  --push-state                Pop state of flags governing input file handling
+  --push-state                Save state of flags governing input file handling
   --quick-exit                Use quick_exit to exit (default)
     --no-quick-exit
   --relax                     Optimize instructions (default)
@@ -193,8 +193,8 @@ Options:
     -z notext
     -z textoff
 
-mold: supported targets: elf32-i386 elf64-x86-64 elf32-littlearm elf64-littleaarch64 elf32-littleriscv elf32-bigriscv elf64-littleriscv elf64-bigriscv elf64-sparc
-mold: supported emulations: elf_i386 elf_x86_64 armelf_linux_eabi aarch64linux aarch64elf elf32lriscv elf32briscv elf64lriscv elf64briscv elf64_sparc)";
+mold: supported targets: elf32-i386 elf64-x86-64 elf32-littlearm elf64-littleaarch64 elf32-littleriscv elf32-bigriscv elf64-littleriscv elf64-bigriscv elf64-powerpc elf64-powerpc elf64-powerpcle elf64-s390 elf64-sparc
+mold: supported emulations: elf_i386 elf_x86_64 armelf_linux_eabi aarch64linux aarch64elf elf32lriscv elf32briscv elf64lriscv elf64briscv elf64_s390 elf64_sparc)";
 
 static std::vector<std::string> add_dashes(std::string name) {
   // Single-letter option
@@ -447,7 +447,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
                    << "\n  Supported emulations:\n   elf_x86_64\n   elf_i386\n"
                    << "   aarch64linux\n   armelf_linux_eabi\n   elf64lriscv\n"
                    << "   elf64briscv\n   elf32lriscv\n   elf32briscv\n"
-                   << "   elf64lppc\n   elf64_sparc";
+                   << "   elf64ppc\n   elf64lppc\n   elf64_s390\n   elf64_sparc";
       version_shown = true;
     } else if (read_arg("m")) {
       if (arg == "elf_x86_64") {
@@ -466,8 +466,12 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
         ctx.arg.emulation = MachineType::RV32LE;
       } else if (arg == "elf32briscv") {
         ctx.arg.emulation = MachineType::RV32BE;
+      } else if (arg == "elf64ppc") {
+        ctx.arg.emulation = MachineType::PPC64V1;
       } else if (arg == "elf64lppc") {
         ctx.arg.emulation = MachineType::PPC64V2;
+      } else if (arg == "elf64_s390") {
+        ctx.arg.emulation = MachineType::S390X;
       } else if (arg == "elf64_sparc") {
         ctx.arg.emulation = MachineType::SPARC64;
       } else {
@@ -1085,12 +1089,6 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     ctx.arg.warn_textrel = true;
 
   ctx.arg.undefined.push_back(ctx.arg.entry);
-
-  // TLSDESC relocs must be always relaxed for statically-linked
-  // executables even if -no-relax is given. It is because a
-  // statically-linked executable doesn't contain a tranpoline
-  // function needed for TLSDESC.
-  ctx.relax_tlsdesc = ctx.arg.is_static || (ctx.arg.relax && !ctx.arg.shared);
 
   // By default, mold tries to ovewrite to an output file if exists
   // because at least on Linux, writing to an existing file is much

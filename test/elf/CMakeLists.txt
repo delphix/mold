@@ -1,49 +1,59 @@
 option(MOLD_ENABLE_QEMU_TESTS "Enable tests on non-native targets" OFF)
 option(MOLD_ENABLE_QEMU_TESTS_RV32 "Enable tests for RV32" OFF)
-option(MOLD_ENABLE_QEMU_TESTS_SPARC64 "Enable tests for SPARC64" OFF)
 
-file(GLOB TESTS
-  RELATIVE ${CMAKE_CURRENT_LIST_DIR}
-  CONFIGURE_DEPENDS
-  "*.sh")
+function(add_target TRIPLE)
+  set(HOST ${CMAKE_HOST_SYSTEM_PROCESSOR})
+  if(${HOST} MATCHES "arm.*")
+    set(HOST arm)
+  endif()
 
-function(add_qemu_test TEST TRIPLE MACHINE)
-  if(NOT ${CMAKE_HOST_SYSTEM_PROCESSOR} STREQUAL ${MACHINE})
-    add_test(NAME "${MACHINE}-${TEST}"
-      COMMAND bash -x ${CMAKE_CURRENT_LIST_DIR}/${TEST}
-      WORKING_DIRECTORY ${mold_BINARY_DIR})
+  if(${TRIPLE} MATCHES "${HOST}-.*")
+    set(IS_NATIVE 1)
+  endif()
 
-    set(ENV
-      TEST_CC=${TRIPLE}-gcc
-      TEST_CXX=${TRIPLE}-g++
-      TEST_GCC=${TRIPLE}-gcc
-      TEST_GXX=${TRIPLE}-g++
-      OBJDUMP=${TRIPLE}-objdump
-      MACHINE=${MACHINE}
-      "QEMU=qemu-${MACHINE} -L /usr/${TRIPLE}")
-    set_tests_properties("${MACHINE}-${TEST}" PROPERTIES ENVIRONMENT "${ENV}")
+  if(${TRIPLE} MATCHES "([^-]+)-.")
+    set(MACHINE ${CMAKE_MATCH_1})
+  endif()
+
+  if(IS_NATIVE OR MOLD_ENABLE_QEMU_TESTS)
+    file(GLOB ALL_TESTS RELATIVE ${CMAKE_CURRENT_LIST_DIR} CONFIGURE_DEPENDS
+      "*.sh")
+
+    list(FILTER ALL_TESTS EXCLUDE REGEX "_")
+
+    file(GLOB TESTS RELATIVE ${CMAKE_CURRENT_LIST_DIR} CONFIGURE_DEPENDS
+      "${MACHINE}_*.sh")
+
+    list(APPEND TESTS ${ALL_TESTS})
+
+    foreach(TEST IN LISTS TESTS)
+      string(REGEX REPLACE "\\.sh$" "" TESTNAME "${MACHINE}-${TEST}")
+
+      add_test(NAME ${TESTNAME}
+        COMMAND bash -x ${CMAKE_CURRENT_LIST_DIR}/${TEST}
+        WORKING_DIRECTORY ${mold_BINARY_DIR})
+
+      if(IS_NATIVE)
+        set_tests_properties(${TESTNAME} PROPERTIES
+          SKIP_REGULAR_EXPRESSION "skipped")
+      else()
+        set_tests_properties(${TESTNAME} PROPERTIES
+          ENVIRONMENT "TRIPLE=${TRIPLE}")
+      endif()
+    endforeach()
   endif()
 endfunction()
 
-foreach(TEST IN LISTS TESTS)
-  add_test(NAME "${CMAKE_HOST_SYSTEM_PROCESSOR}-${TEST}"
-    COMMAND bash -x ${CMAKE_CURRENT_LIST_DIR}/${TEST}
-    WORKING_DIRECTORY ${mold_BINARY_DIR})
+add_target(x86_64-linux-gnu)
+add_target(i686-linux-gnu)
+add_target(aarch64-linux-gnu)
+add_target(arm-linux-gnueabihf)
+add_target(riscv64-linux-gnu)
+add_target(powerpc64-linux-gnu)
+add_target(powerpc64le-linux-gnu)
+add_target(sparc64-linux-gnu)
+add_target(s390x-linux-gnu)
 
-  if(MOLD_ENABLE_QEMU_TESTS)
-    add_qemu_test(${TEST} x86_64-linux-gnu x86_64)
-    add_qemu_test(${TEST} i686-linux-gnu i386)
-    add_qemu_test(${TEST} aarch64-linux-gnu aarch64)
-    add_qemu_test(${TEST} arm-linux-gnueabihf arm)
-    add_qemu_test(${TEST} riscv64-linux-gnu riscv64)
-    add_qemu_test(${TEST} powerpc64le-linux-gnu ppc64le)
-  endif()
-
-  if (MOLD_ENABLE_QEMU_TESTS_RV32)
-    add_qemu_test(${TEST} riscv32-linux-gnu riscv32)
-  endif()
-
-  if (MOLD_ENABLE_QEMU_TESTS_SPARC64)
-    add_qemu_test(${TEST} sparc64-linux-gnu sparc64)
-  endif()
-endforeach()
+if(MOLD_ENABLE_QEMU_TESTS_RV32)
+  add_target(riscv32-linux-gnu)
+endif()

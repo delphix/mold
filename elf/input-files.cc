@@ -1,5 +1,6 @@
 #include "mold.h"
 
+#include <bit>
 #include <cstring>
 
 #ifndef _WIN32
@@ -186,13 +187,16 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
         continue;
       }
 
-      if (name.starts_with(".gnu.warning."))
-        continue;
-
       if (name == ".note.gnu.property") {
         this->features = read_note_gnu_property(ctx, shdr);
         continue;
       }
+
+      // Ignore a build-id section in an input file. This doesn't normally
+      // happen, but you can create such object file with
+      // `ld.bfd -r --build-id`.
+      if (name == ".note.gnu.build-id")
+        continue;
 
       // Ignore these sections for compatibility with old glibc i386 CRT files.
       if (name == ".gnu.linkonce.t.__x86.get_pc_thunk.bx" ||
@@ -433,10 +437,11 @@ void ObjectFile<E>::initialize_symbols(Context<E> &ctx) {
     if (esym.is_common())
       Fatal(ctx) << *this << ": common local symbol?";
 
-    std::string_view name = this->symbol_strtab.data() + esym.st_name;
-    if (name.empty() && esym.st_type == STT_SECTION)
-      if (InputSection<E> *sec = get_section(esym))
-        name = sec->name();
+    std::string_view name;
+    if (esym.st_type == STT_SECTION)
+      name = this->shstrtab.data() + this->elf_sections[esym.st_shndx].sh_name;
+    else
+      name = this->symbol_strtab.data() + esym.st_name;
 
     Symbol<E> &sym = this->local_syms[i];
     sym.set_name(name);
@@ -590,12 +595,12 @@ split_section(Context<E> &ctx, InputSection<E> &sec) {
   return rec;
 }
 
-// Usually a section is an atomic unit of inclusion and exclusion.
-// The linker doesn't care its contents. However, if a section is a
-// mergeable section (a section with SHF_MERGE bit set), the linker
-// is expected to split it into smaller pieces and merge each piece
-// with other pieces from different object files. In mold, we call
-// the atomic unit of mergeable section "section pieces".
+// Usually a section is an atomic unit of inclusion or exclusion.
+// Linker doesn't care about its contents. However, if a section is a
+// mergeable section (a section with SHF_MERGE bit set), the linker is
+// expected to split it into smaller pieces and merge each piece with
+// other pieces from different object files. In mold, we call the
+// atomic unit of mergeable section "section pieces".
 //
 // This feature is typically used for string literals. String literals
 // are usually put into a mergeable section by a compiler. If the same
@@ -603,10 +608,8 @@ split_section(Context<E> &ctx, InputSection<E> &sec) {
 // a linker merges them into a single instance of a string, so that
 // a linker's output doesn't contain duplicate string literals.
 //
-// Handling relocations referring mergeable sections is a bit tricky.
-// Assume that we have a mergeable section with the following contents
-// and symbols:
-//
+// Handling symbols in mergeable sections is a bit tricky. Assume that
+// we have a mergeable section with the following contents and symbols:
 //
 //   Hello world\0foo bar\0
 //   ^            ^
@@ -1086,8 +1089,8 @@ void ObjectFile<E>::scan_relocations(Context<E> &ctx) {
       if (sym.is_imported) {
         if (sym.get_type() != STT_FUNC)
           Fatal(ctx) << *this << ": " << sym
-                  << ": .eh_frame CIE record with an external data reference"
-                  << " is not supported";
+                     << ": .eh_frame CIE record with an external data reference"
+                     << " is not supported";
         sym.flags |= NEEDS_PLT;
       }
     }
@@ -1192,7 +1195,7 @@ static bool should_write_to_local_symtab(Context<E> &ctx, Symbol<E> &sym) {
 }
 
 template <typename E>
-void ObjectFile<E>::compute_symtab(Context<E> &ctx) {
+void ObjectFile<E>::compute_symtab_size(Context<E> &ctx) {
   if (ctx.arg.strip_all)
     return;
 
@@ -1455,7 +1458,7 @@ SharedFile<E>::mark_live_objects(Context<E> &ctx,
     if (sym.traced)
       print_trace_symbol(ctx, *this, esym, sym);
 
-    if (esym.is_undef() && sym.file && sym.file != this &&
+    if (esym.is_undef() && sym.file && !sym.file->is_dso &&
         !sym.file->is_alive.exchange(true)) {
       feeder(sym.file);
 
@@ -1477,6 +1480,23 @@ std::vector<Symbol<E> *> SharedFile<E>::find_aliases(Symbol<E> *sym) {
   return vec;
 }
 
+// Infer an alignment of a DSO symbol. An alignment of a symbol in other
+// .so is not something we usually care about, but when we create a copy
+// relocation for a symbol, we need to preserve its alignment requirement.
+//
+// Symbol alignment is not explicitly represented in an ELF file. In this
+// function, we conservatively infer it from a symbol address and a
+// section alignment requirement.
+template <typename E>
+i64 SharedFile<E>::get_alignment(Symbol<E> *sym) {
+  ElfShdr<E> &shdr = this->elf_sections[sym->esym().st_shndx];
+  i64 p2align = std::min(std::countr_zero<u64>(sym->value),
+                         std::countr_zero<u64>(shdr.sh_addralign));
+
+  // We do not want a ridiculously large alignment. Cap it arbitrary at 64.
+  return std::min(64, 1 << p2align);
+}
+
 template <typename E>
 bool SharedFile<E>::is_readonly(Context<E> &ctx, Symbol<E> *sym) {
   ElfPhdr<E> *phdr = this->get_phdr();
@@ -1490,7 +1510,7 @@ bool SharedFile<E>::is_readonly(Context<E> &ctx, Symbol<E> *sym) {
 }
 
 template <typename E>
-void SharedFile<E>::compute_symtab(Context<E> &ctx) {
+void SharedFile<E>::compute_symtab_size(Context<E> &ctx) {
   if (ctx.arg.strip_all)
     return;
 

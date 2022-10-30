@@ -63,7 +63,7 @@ static bool needs_thunk_rel(const ElfRel<E> &r) {
     return ty == R_ARM_JUMP24 || ty == R_ARM_THM_JUMP24 ||
            ty == R_ARM_CALL   || ty == R_ARM_THM_CALL;
   } else {
-    static_assert(std::is_same_v<E, PPC64V2>);
+    static_assert(is_ppc<E>);
     return ty == R_PPC64_REL24;
   }
 }
@@ -100,7 +100,7 @@ static bool is_reachable(Context<E> &ctx, InputSection<E> &isec,
 
   // Compute a distance between the relocated place and the symbol
   // and check if they are within reach.
-  i64 S = sym.get_addr(ctx);
+  i64 S = sym.get_addr(ctx, NO_OPD);
   i64 A = isec.get_addend(rel);
   i64 P = isec.get_addr() + rel.r_offset;
   u64 val = S + A - P;
@@ -254,13 +254,10 @@ void create_range_extension_thunks(Context<E> &ctx, OutputSection<E> &osec) {
     reset_thunk(*osec.thunks[a++]);
 
   osec.shdr.sh_size = offset;
-
-  for (InputSection<E> *isec : members)
-    osec.shdr.sh_addralign =
-      std::max<u32>(osec.shdr.sh_addralign, 1 << isec->p2align);
 }
 
-#if defined(MOLD_ARM64) || defined(MOLD_ARM32) || defined(MOLD_PPC64V2)
+#if defined(MOLD_ARM64) || defined(MOLD_ARM32) || \
+    defined(MOLD_PPC64V1) || defined(MOLD_PPC64V2)
 using E = MOLD_TARGET;
 template void create_range_extension_thunks(Context<E> &, OutputSection<E> &);
 #endif
