@@ -22,7 +22,9 @@ mold is so fast that it is only 2x _slower_ than `cp` on the same
 machine. Feel free to [file a bug](https://github.com/rui314/mold/issues)
 if you find mold is not faster than other linkers.
 
-mold currently supports x86-64, i386, ARM32, ARM64 and 64-bit RISC-V.
+mold supports x86-64, i386, ARM64, ARM32, 64-bit/32-bit little/big-endian
+RISC-V, 64-bit big-endian PowerPC ELFv1, 64-bit little-endian PowerPC ELFv2,
+s390x, SPARC64 and m68k.
 
 ## Why does the speed of linking matter?
 
@@ -60,25 +62,30 @@ necessary packages. You may want to run it as root.
 
 ```shell
 git clone https://github.com/rui314/mold.git
-cd mold
-git checkout v1.4.2
-make -j$(nproc) CXX=clang++
-sudo make install
+mkdir mold/build
+cd mold/build
+git checkout v1.7.0
+../install-build-deps.sh
+cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=c++ ..
+cmake --build . -j $(nproc)
+sudo cmake --install .
 ```
 
-You may need to pass a C++20 compiler command name to `make`.
-In the above case, `clang++` is passed. If it doesn't work for you,
+You may need to pass a C++20 compiler command name to `cmake`.
+In the above case, `c++` is passed. If it doesn't work for you,
 try a specific version of a compiler such as `g++-10` or `clang++-12`.
 
-By default, `mold` is installed to `/usr/local/bin`.
+By default, `mold` is installed to `/usr/local/bin`. You can change
+that by passing `-DCMAKE_INSTALL_PREFIX=<directory>`. For other cmake
+options, see the comments in `CMakeLists.txt`.
 
 If you don't use a recent enough Linux distribution, or if for any reason
-`make` in the above commands doesn't work for you, you can use Docker to
+`cmake` in the above commands doesn't work for you, you can use Docker to
 build it in a Docker environment. To do so, just run `./dist.sh` in this
-directory instead of running `make -j$(nproc)`. The shell script pulls a
-Docker image, builds mold and auxiliary files inside it, and packs
-them into a single tar file `mold-$version-$arch-linux.tar.gz`.
-You can extract the tar file anywhere and use `mold` executable in it.
+directory instead of `cmake`. The shell script pulls a Docker image,
+builds mold and auxiliary files inside it, and packs them into a
+single tar file `mold-$version-$arch-linux.tar.gz`.  You can extract
+the tar file anywhere and use `mold` executable in it.
 
 ## How to use
 
@@ -123,8 +130,15 @@ linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=/path/to/mold"]
 ```
 
-where `/path/to/mold` is an absolute path to `mold` exectuable.
-Please make sure you have installed `clang`.
+where `/path/to/mold` is an absolute path to `mold` exectuable. In the
+above example, we use `clang` as a linker driver as it can always take
+the `-fuse-ldd` option. If your GCC is recent enough to recognize the
+option, you may be able to remove the `linker = "clang"` line.
+
+```toml
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=/path/to/mold"]
+```
 
 If you want to use mold for all projects, put the above snippet to
 `~/.cargo/config.toml`.

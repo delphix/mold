@@ -17,14 +17,6 @@
 #include <unordered_set>
 #include <variant>
 
-#if MOLD_DEBUG_X86_64_ONLY
-# define INSTANTIATE_ALL INSTANTIATE(X86_64)
-#else
-# define INSTANTIATE_ALL                        \
-  INSTANTIATE(X86_64);                          \
-  INSTANTIATE(ARM64);
-#endif
-
 namespace mold::macho {
 
 static constexpr i64 COMMON_PAGE_SIZE = 0x4000;
@@ -241,7 +233,7 @@ public:
   u32 nrels = 0;
   u32 unwind_offset = 0;
   u32 nunwind = 0;
-  Subsection<E> *replacer; // Used if is_coalesced is true
+  Subsection<E> *replacer = nullptr; // Used if is_coalesced is true
 
   std::atomic_uint8_t p2align = 0;
   std::atomic_bool is_alive = true;
@@ -987,6 +979,9 @@ struct Context {
   OutputSection<E> *bss = nullptr;
   OutputSection<E> *common = nullptr;
 };
+
+template <typename E>
+int macho_main(int argc, char **argv);
 
 int main(int argc, char **argv);
 

@@ -785,6 +785,13 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
     read_file(ctx, mf);
   };
 
+  auto read_bundle = [&](std::string name) {
+    MappedFile<Context<E>> *mf = MappedFile<Context<E>>::open(ctx, name);
+    if (!mf)
+      Fatal(ctx) << "library not found: -l" << name;
+    read_file(ctx, mf);
+  };
+
   auto find_framework = [&](std::string name) -> MappedFile<Context<E>> * {
     std::string suffix;
     std::tie(name, suffix) = split_string(name, ',');
@@ -886,7 +893,7 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
 
   // With -bundle_loader, we can import symbols from a main executable.
   if (!ctx.arg.bundle_loader.empty())
-    read_library(ctx.arg.bundle_loader);
+    read_bundle(ctx.arg.bundle_loader);
 
   // An object file can contain linker directives to load other object
   // files or libraries, so process them if any.
@@ -983,7 +990,7 @@ static void print_stats(Context<E> &ctx) {
 }
 
 template <typename E>
-static int do_main(int argc, char **argv) {
+int macho_main(int argc, char **argv) {
   Context<E> ctx;
 
   for (i64 i = 0; i < argc; i++)
@@ -992,14 +999,12 @@ static int do_main(int argc, char **argv) {
   std::vector<std::string> file_args = parse_nonpositional_args(ctx);
 
   if (ctx.arg.arch != E::cputype) {
-#ifndef MOLD_DEBUG_X86_64_ONLY
     switch (ctx.arg.arch) {
     case CPU_TYPE_X86_64:
-      return do_main<X86_64>(argc, argv);
+      return macho_main<X86_64>(argc, argv);
     case CPU_TYPE_ARM64:
-      return do_main<X86_64>(argc, argv);
+      return macho_main<X86_64>(argc, argv);
     }
-#endif
     Fatal(ctx) << "unknown cputype: " << ctx.arg.arch;
   }
 
@@ -1114,12 +1119,19 @@ static int do_main(int argc, char **argv) {
   return 0;
 }
 
+using E = MOLD_TARGET;
+
+#ifdef MOLD_ARM64
+
+extern template int macho_main<X86_64>(int, char **);
+
 int main(int argc, char **argv) {
-#ifdef MOLD_DEBUG_X86_64_ONLY
-  return do_main<X86_64>(argc, argv);
-#else
-  return do_main<ARM64>(argc, argv);
-#endif
+  return macho_main<ARM64>(argc, argv);
 }
 
+#else
+
+template int macho_main<E>(int, char **);
+
+#endif
 }

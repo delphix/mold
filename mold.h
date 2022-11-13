@@ -60,29 +60,20 @@ namespace mold {
 using namespace std::literals::string_literals;
 using namespace std::literals::string_view_literals;
 
-typedef uint8_t u8;
-typedef uint16_t u16;
-typedef uint32_t u32;
-typedef uint64_t u64;
-
-typedef int8_t i8;
-typedef int16_t i16;
-typedef int32_t i32;
-typedef int64_t i64;
-
 template <typename C> class OutputFile;
 
 inline char *output_tmpfile;
-inline char *socket_tmpfile;
 inline thread_local bool opt_demangle;
 
 inline u8 *output_buffer_start = nullptr;
 inline u8 *output_buffer_end = nullptr;
 
 inline std::string mold_version;
+extern std::string mold_version_string;
 extern std::string mold_git_hash;
 
-std::string_view errno_string();
+std::string errno_string();
+std::string get_self_path();
 void cleanup();
 void install_signal_handler();
 i64 get_default_thread_count();
@@ -199,7 +190,7 @@ inline bool has_single_bit(u64 val) {
 inline u64 bit_ceil(u64 val) {
   if (has_single_bit(val))
     return val;
-  return (u64)1 << (64 - std::countl_zero(val));
+  return 1LL << (64 - std::countl_zero(val));
 }
 
 inline u64 align_to(u64 val, u64 align) {
@@ -220,7 +211,7 @@ inline u64 bit(u64 val, i64 pos) {
 
 // Returns [hi:lo] bits of val.
 inline u64 bits(u64 val, u64 hi, u64 lo) {
-  return (val >> lo) & (((u64)1 << (hi - lo + 1)) - 1);
+  return (val >> lo) & ((1LL << (hi - lo + 1)) - 1);
 }
 
 inline i64 sign_extend(u64 val, i64 size) {
@@ -229,16 +220,29 @@ inline i64 sign_extend(u64 val, i64 size) {
 
 template <typename T, typename Compare = std::less<T>>
 void update_minimum(std::atomic<T> &atomic, u64 new_val, Compare cmp = {}) {
-  T old_val = atomic;
+  T old_val = atomic.load(std::memory_order_relaxed);
   while (cmp(new_val, old_val) &&
-         !atomic.compare_exchange_weak(old_val, new_val));
+         !atomic.compare_exchange_weak(old_val, new_val,
+                                       std::memory_order_relaxed));
 }
 
 template <typename T, typename Compare = std::less<T>>
 void update_maximum(std::atomic<T> &atomic, u64 new_val, Compare cmp = {}) {
-  T old_val = atomic;
+  T old_val = atomic.load(std::memory_order_relaxed);
   while (cmp(old_val, new_val) &&
-         !atomic.compare_exchange_weak(old_val, new_val));
+         !atomic.compare_exchange_weak(old_val, new_val,
+                                       std::memory_order_relaxed));
+}
+
+// An optimized "mark" operation for parallel mark-and-sweep algorithms.
+// Returns true if `visited` was false and updated to true.
+inline bool fast_mark(std::atomic<bool> &visited) {
+  // A relaxed load + branch (assuming miss) takes only around 20 cycles,
+  // while an atomic RMW can easily take hundreds on x86. We note that it's
+  // common that another thread beat us in marking, so doing an optimistic
+  // early test tends to improve performance in the ~20% ballpark.
+  return !visited.load(std::memory_order_relaxed) &&
+         !visited.exchange(true, std::memory_order_relaxed);
 }
 
 template <typename T, typename U>
@@ -343,7 +347,7 @@ inline i64 uleb_size(u64 val) {
 #pragma GCC unroll 8
 #endif
   for (int i = 1; i < 9; i++)
-    if (val < ((u64)1 << (7 * i)))
+    if (val < (1LL << (7 * i)))
       return i;
   return 9;
 }
@@ -563,7 +567,6 @@ private:
   std::vector<std::string> strings;
   std::unique_ptr<TrieNode> root;
   std::vector<std::pair<Glob, u32>> globs;
-  std::vector<u32> values;
   std::once_flag once;
   bool is_compiled = false;
 };
@@ -598,27 +601,30 @@ std::optional<std::string_view> cpp_demangle(std::string_view name);
 // compress.cc
 //
 
-class ZlibCompressor {
+class Compressor {
+public:
+  virtual void write_to(u8 *buf) = 0;
+  virtual ~Compressor() {}
+  i64 compressed_size = 0;
+};
+
+class ZlibCompressor : public Compressor {
 public:
   ZlibCompressor(u8 *buf, i64 size);
-  void write_to(u8 *buf);
-  i64 size() const;
+  void write_to(u8 *buf) override;
 
 private:
   std::vector<std::vector<u8>> shards;
   u64 checksum = 0;
 };
 
-class GzipCompressor {
+class ZstdCompressor : public Compressor {
 public:
-  GzipCompressor(std::string_view input);
-  void write_to(u8 *buf);
-  i64 size() const;
+  ZstdCompressor(u8 *buf, i64 size);
+  void write_to(u8 *buf) override;
 
 private:
   std::vector<std::vector<u8>> shards;
-  u32 checksum = 0;
-  u32 uncompressed_size = 0;
 };
 
 //
@@ -738,7 +744,8 @@ public:
   static MappedFile *open(C &ctx, std::string path);
   static MappedFile *must_open(C &ctx, std::string path);
 
-  ~MappedFile();
+  ~MappedFile() { unmap(); }
+  void unmap();
 
   MappedFile *slice(C &ctx, std::string name, u64 start, u64 size);
 
@@ -784,7 +791,6 @@ template <typename C>
 MappedFile<C> *MappedFile<C>::open(C &ctx, std::string path) {
   if (path.starts_with('/') && !ctx.arg.chroot.empty())
     path = ctx.arg.chroot + "/" + path_clean(path);
-
 
   i64 fd;
 #ifdef _WIN32
@@ -858,8 +864,8 @@ MappedFile<C>::slice(C &ctx, std::string name, u64 start, u64 size) {
 }
 
 template <typename C>
-MappedFile<C>::~MappedFile() {
-  if (size == 0 || parent)
+void MappedFile<C>::unmap() {
+  if (size == 0 || parent || !data)
     return;
 
 #ifdef _WIN32
@@ -869,6 +875,8 @@ MappedFile<C>::~MappedFile() {
 #else
   munmap(data, size);
 #endif
+
+  data = nullptr;
 }
 
 } // namespace mold

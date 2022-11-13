@@ -248,14 +248,14 @@ get_input_section_name(const PluginSection section,
 static PluginStatus
 get_input_section_contents(const PluginSection section,
                            const char **section_contents,
-		           size_t *len) {
+                           size_t *len) {
   LOG << "get_input_section_contents\n";
   return LDPS_OK;
 }
 
 static PluginStatus
 update_section_order(const PluginSection *section_list,
-		     int num_sections) {
+                     int num_sections) {
   LOG << "update_section_order\n";
   return LDPS_OK;
 }
@@ -351,10 +351,10 @@ static void restart_process(Context<E> &ctx) {
   args.push_back("--:lto-pass2");
   args.push_back(nullptr);
 
-  std::string self = std::filesystem::read_symlink("/proc/self/exe");
-
   std::cout << std::flush;
   std::cerr << std::flush;
+
+  std::string self = get_self_path();
   execv(self.c_str(), (char * const *)args.data());
   std::cerr << "execv failed: " << errno_string() << "\n";
   _exit(1);
@@ -381,10 +381,10 @@ static PluginStatus allow_unique_segment_for_sections() {
 
 static PluginStatus
 unique_segment_for_sections(const char *segment_name,
-			    uint64_t flags,
-			    uint64_t align,
-			    const PluginSection *section_list,
-			    int num_sections) {
+                            uint64_t flags,
+                            uint64_t align,
+                            const PluginSection *section_list,
+                            int num_sections) {
   LOG << "unique_segment_for_sections\n";
   return LDPS_OK;
 }
@@ -426,8 +426,10 @@ get_api_version(const char *plugin_identifier,
   if (LAPI_V1 < minimal_api_supported)
     Fatal(*gctx<E>) << "LTO plugin does not support V0 or V1 API";
 
+  std::string version = mold_version + "\0"s;
+
   *linker_identifier = "mold";
-  *linker_version = MOLD_VERSION;
+  *linker_version = version.data();
 
   if (LAPI_V1 <= maximal_api_supported) {
     is_gcc_linker_api_v1 = true;
@@ -500,13 +502,14 @@ static void load_plugin(Context<E> &ctx) {
   tv.emplace_back(LDPT_GET_API_VERSION, get_api_version<E>);
   tv.emplace_back(LDPT_NULL, 0);
 
-  PluginStatus status = onload(tv.data());
+  [[maybe_unused]] PluginStatus status = onload(tv.data());
   assert(status == LDPS_OK);
 }
 
 template <typename E>
 static ElfSym<E> to_elf_sym(PluginSymbol &psym) {
-  ElfSym<E> esym = {};
+  ElfSym<E> esym;
+  memset(&esym, 0, sizeof(esym));
 
   switch (psym.def) {
   case LDPK_DEF:
@@ -644,7 +647,6 @@ ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   }
 
   obj->elf_syms = *esyms;
-  obj->sym_fragments.resize(esyms->size());
   obj->symvers.resize(esyms->size());
   plugin_symbols.clear();
   return obj;
@@ -693,12 +695,10 @@ void lto_cleanup(Context<E> &ctx) {
     cleanup_hook();
 }
 
-#define INSTANTIATE(E)                                                  \
-  template ObjectFile<E> *                                              \
-    read_lto_object(Context<E> &, MappedFile<Context<E>> *);            \
-  template std::vector<ObjectFile<E> *> do_lto(Context<E> &);           \
-  template void lto_cleanup(Context<E> &)
+using E = MOLD_TARGET;
 
-INSTANTIATE_ALL;
+template ObjectFile<E> *read_lto_object(Context<E> &, MappedFile<Context<E>> *);
+template std::vector<ObjectFile<E> *> do_lto(Context<E> &);
+template void lto_cleanup(Context<E> &);
 
 } // namespace mold::elf

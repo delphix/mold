@@ -1,4 +1,7 @@
+#if !defined(_WIN32) && !defined(__APPLE__)
+
 #include "mold.h"
+#include "config.h"
 
 #include <filesystem>
 #include <signal.h>
@@ -10,6 +13,7 @@
 
 namespace mold::elf {
 
+#ifdef MOLD_X86_64
 // Exiting from a program with large memory usage is slow --
 // it may take a few hundred milliseconds. To hide the latency,
 // we fork a child and let it do the actual linking work.
@@ -49,10 +53,11 @@ std::function<void()> fork_child() {
 
   return [=] {
     char buf[] = {1};
-    int n = write(pipefd[1], buf, 1);
+    [[maybe_unused]] int n = write(pipefd[1], buf, 1);
     assert(n == 1);
   };
 }
+#endif
 
 template <typename E>
 static std::string find_dso(Context<E> &ctx, std::filesystem::path self) {
@@ -62,13 +67,11 @@ static std::string find_dso(Context<E> &ctx, std::filesystem::path self) {
   if (std::filesystem::is_regular_file(path, ec) && !ec)
     return path;
 
-#ifdef LIBDIR
-  // If not found, search $(LIBDIR)/mold, which is /usr/local/lib/mold
+  // If not found, search $(MOLD_LIBDIR)/mold, which is /usr/local/lib/mold
   // by default.
-  path = LIBDIR "/mold/mold-wrapper.so";
+  path = MOLD_LIBDIR "/mold/mold-wrapper.so";
   if (std::filesystem::is_regular_file(path, ec) && !ec)
     return path;
-#endif
 
   // Look for ../lib/mold/mold-wrapper.so
   path = self.parent_path() / "../lib/mold/mold-wrapper.so";
@@ -81,13 +84,13 @@ static std::string find_dso(Context<E> &ctx, std::filesystem::path self) {
 template <typename E>
 [[noreturn]]
 void process_run_subcommand(Context<E> &ctx, int argc, char **argv) {
-  std::string_view arg1 = argv[1];
-  assert(arg1 == "-run" || arg1 == "--run");
+  assert(argv[1] == "-run"s || argv[1] == "--run"s);
+
   if (!argv[2])
     Fatal(ctx) << "-run: argument missing";
 
   // Get the mold-wrapper.so path
-  std::string self = std::filesystem::read_symlink("/proc/self/exe");
+  std::string self = get_self_path();
   std::string dso_path = find_dso(ctx, self);
 
   // Set environment variables
@@ -110,9 +113,10 @@ void process_run_subcommand(Context<E> &ctx, int argc, char **argv) {
   Fatal(ctx) << "mold -run failed: " << argv[2] << ": " << errno_string();
 }
 
-#define INSTANTIATE(E)                                                  \
-  template void process_run_subcommand(Context<E> &, int, char **)
+using E = MOLD_TARGET;
 
-INSTANTIATE_ALL;
+template void process_run_subcommand(Context<E> &, int, char **);
 
 } // namespace mold::elf
+
+#endif

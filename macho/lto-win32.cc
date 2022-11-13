@@ -1,11 +1,7 @@
-#ifdef _WIN32
-
 #include "lto.h"
 #include "mold.h"
 
 namespace mold::macho {
-
-LTOPlugin::~LTOPlugin() {}
 
 template <typename E>
 void load_lto_plugin(Context<E> &ctx) {
@@ -15,12 +11,13 @@ void load_lto_plugin(Context<E> &ctx) {
 template <typename E>
 void do_lto(Context<E> &ctx) {}
 
-#define INSTANTIATE(E)                         \
-  template void load_lto_plugin(Context<E> &); \
-  template void do_lto(Context<E> &);
+#ifdef MOLD_ARM64
+LTOPlugin::~LTOPlugin() {}
+#endif
 
-INSTANTIATE_ALL;
+using E = MOLD_TARGET;
+
+template void load_lto_plugin(Context<E> &);
+template void do_lto(Context<E> &);
 
 } // namespace mold::macho
-
-#endif
