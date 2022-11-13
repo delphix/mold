@@ -62,6 +62,8 @@ static MachineType get_machine_type(Context<E> &ctx, MappedFile<Context<E>> *mf)
       return MachineType::S390X;
     case EM_SPARC64:
       return MachineType::SPARC64;
+    case EM_68K:
+      return MachineType::M68K;
     default:
       return MachineType::NONE;
     }
@@ -357,10 +359,10 @@ static void show_stats(Context<E> &ctx) {
   static Counter num_dsos("num_dsos", ctx.dsos.size());
 
   if constexpr (needs_thunk<E>) {
-    static Counter num_thunks("num_thunks");
+    static Counter thunk_bytes("thunk_bytes");
     for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections)
       for (std::unique_ptr<RangeExtensionThunk<E>> &thunk : osec->thunks)
-        num_thunks += thunk->symbols.size();
+        thunk_bytes += thunk->size();
   }
 
   Counter::print();
@@ -397,6 +399,8 @@ static int redo_main(int argc, char **argv, MachineType ty) {
     return elf_main<S390X>(argc, argv);
   case MachineType::SPARC64:
     return elf_main<SPARC64>(argc, argv);
+  case MachineType::M68K:
+    return elf_main<M68K>(argc, argv);
   default:
     unreachable();
   }
@@ -409,7 +413,7 @@ int elf_main(int argc, char **argv) {
   // Process -run option first. process_run_subcommand() does not return.
   if (argc >= 2 && (argv[1] == "-run"sv || argv[1] == "--run"sv)) {
 #if defined(_WIN32) || defined(__APPLE__)
-    Fatal(ctx) << ": -run is supported only on Unix";
+    Fatal(ctx) << "-run is supported only on Unix";
 #endif
     process_run_subcommand(ctx, argc, argv);
   }
@@ -484,15 +488,20 @@ int elf_main(int argc, char **argv) {
   // Create a dummy file containing linker-synthesized symbols.
   create_internal_file(ctx);
 
-  // Resolve symbols and fix the set of object files that are
-  // included to the final output.
+  // resolve_symbols is 4 things in 1 phase:
+  //
+  // - Determine the set of object files to extract from archives.
+  // - Remove redundant COMDAT sections (e.g. duplicate inline functions).
+  // - Finally, the actual symbol resolution.
+  // - LTO, which requires preliminary symbol resolution before running
+  //   and a follow-up re-resolution after the LTO objects are emitted.
+  //
+  // These passes have complex interactions, and unfortunately has to be
+  // put together in a single phase.
   resolve_symbols(ctx);
 
   // Resolve mergeable section pieces to merge them.
   register_section_pieces(ctx);
-
-  // Remove redundant comdat sections (e.g. duplicate inline functions).
-  eliminate_comdats(ctx);
 
   // Create .bss sections for common symbols.
   convert_common_symbols(ctx);
@@ -789,6 +798,7 @@ extern template int elf_main<PPC64V1>(int, char **);
 extern template int elf_main<PPC64V2>(int, char **);
 extern template int elf_main<S390X>(int, char **);
 extern template int elf_main<SPARC64>(int, char **);
+extern template int elf_main<M68K>(int, char **);
 
 int main(int argc, char **argv) {
   return elf_main<X86_64>(argc, argv);

@@ -3,6 +3,7 @@
 
 #include <cctype>
 #include <shared_mutex>
+#include <span>
 #include <tbb/parallel_for_each.h>
 #include <tbb/parallel_scan.h>
 #include <tbb/parallel_sort.h>
@@ -116,17 +117,26 @@ void OutputShdr<E>::copy_buf(Context<E> &ctx) {
 
 template <typename E>
 i64 to_phdr_flags(Context<E> &ctx, Chunk<E> *chunk) {
+  // All sections are put into a single RWX segment if --omagic
   if (ctx.arg.omagic)
     return PF_R | PF_W | PF_X;
 
-  i64 ret = PF_R;
   bool write = (chunk->shdr.sh_flags & SHF_WRITE);
-  if (write)
-    ret |= PF_W;
-  if ((!ctx.arg.rosegment && !write) ||
-      (chunk->shdr.sh_flags & SHF_EXECINSTR))
-    ret |= PF_X;
-  return ret;
+  bool exec = (chunk->shdr.sh_flags & SHF_EXECINSTR);
+
+  // .text is not readable if --execute-only
+  if (exec && ctx.arg.execute_only) {
+    if (write)
+      Error(ctx) << "--execute-only is not compatible with writable section: "
+                 << chunk->name;
+    return PF_X;
+  }
+
+  // .rodata is merged with .text if --no-rosegment
+  if (!write && !ctx.arg.rosegment)
+    exec = true;
+
+  return PF_R | (write ? PF_W : 0) | (exec ? PF_X : 0);
 }
 
 // PT_GNU_RELRO segment is a security mechanism to make more pages
@@ -177,12 +187,12 @@ static void init_thread_pointers(Context<E> &ctx, ElfPhdr<E> phdr) {
   // template image when copying TLVs to per-thread area, so we need
   // to offset it.
   //
-  // On PPC64, TP is 0x7000 (28 KiB) past the beginning of the TLV block
-  // to maximize the addressable range for load/store instructions with
-  // 16-bits signed immediates. It's not exactly 0x8000 (32 KiB) off
-  // because there's a small implementation-defined piece of data before
-  // the TLV block, and the runtime wants to access them efficiently
-  // too.
+  // On PPC64 and m68k, TP is 0x7000 (28 KiB) past the beginning of the
+  // TLV block to maximize the addressable range for load/store
+  // instructions with 16-bits signed immediates. It's not exactly 0x8000
+  // (32 KiB) off because there's a small implementation-defined piece of
+  // data before the TLV block, and the runtime wants to access them
+  // efficiently too.
   //
   // RISC-V just uses the beginning of the TLV block as TP. RISC-V
   // load/store instructions usually take 12-bits signed immediates,
@@ -192,7 +202,7 @@ static void init_thread_pointers(Context<E> &ctx, ElfPhdr<E> phdr) {
     ctx.tp_addr = align_to(phdr.p_vaddr + phdr.p_memsz, phdr.p_align);
   } else if constexpr (is_arm<E>) {
     ctx.tp_addr = align_down(phdr.p_vaddr - sizeof(Word<E>) * 2, phdr.p_align);
-  } else if constexpr (is_ppc<E>) {
+  } else if constexpr (is_ppc<E> || is_m68k<E>) {
     ctx.tp_addr = phdr.p_vaddr + 0x7000;
   } else {
     static_assert(is_riscv<E>);
@@ -242,7 +252,7 @@ static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
   };
 
   // Create a PT_PHDR for the program header itself.
-  if (ctx.phdr)
+  if (ctx.phdr && (ctx.phdr->shdr.sh_flags & SHF_ALLOC))
     define(PT_PHDR, PF_R, sizeof(Word<E>), ctx.phdr);
 
   // Create a PT_INTERP.
@@ -273,7 +283,7 @@ static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
     for (i64 i = 0, end = chunks.size(); i < end;) {
       Chunk<E> *first = chunks[i++];
       if (!(first->shdr.sh_flags & SHF_ALLOC))
-        break;
+        continue;
 
       i64 flags = to_phdr_flags(ctx, first);
       define(PT_LOAD, flags, ctx.page_size, first);
@@ -350,6 +360,52 @@ static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
         define(PT_ARM_EXIDX, PF_R, 4, chunk);
         break;
       }
+    }
+  }
+
+  // Set p_paddr if --physical-image-base was given. --physical-image-base
+  // is typically used in embedded programming to specify the base address
+  // of a memory-mapped ROM area. In that environment, paddr refers to a
+  // segment's initial location in ROM and vaddr refers the its run-time
+  // address.
+  //
+  // When a device is turned on, it start executing code at a fixed
+  // location in the ROM area. At that location is a startup routine that
+  // copies data or code from ROM to RAM before using them.
+  //
+  // .data must have different paddr and vaddr because ROM is not writable.
+  // paddr of .rodata and .text may or may be equal to vaddr. They can be
+  // directly read or executed from ROM, but oftentimes they are copied
+  // from ROM to RAM because Flash or EEPROM are usually much slower than
+  // DRAM.
+  //
+  // We want to keep vaddr == pvaddr for as many segments as possible so
+  // that they can be directly read/executed from ROM. If a gap between
+  // two segments is two page size or larger, we give up and pack segments
+  // tightly so that we don't waste too much ROM area.
+  if (ctx.arg.physical_image_base) {
+    for (i64 i = 0; i < vec.size(); i++) {
+      if (vec[i].p_type != PT_LOAD)
+        continue;
+
+      u64 addr = *ctx.arg.physical_image_base;
+      bool in_sync = (vec[i].p_vaddr == addr);
+
+      vec[i].p_paddr = addr;
+      addr += vec[i].p_memsz;
+
+      for (i++; i < vec.size() && vec[i].p_type == PT_LOAD; i++) {
+        ElfPhdr<E> &p = vec[i];
+        if (in_sync && addr <= p.p_vaddr && p.p_vaddr < addr + ctx.page_size * 2) {
+          p.p_paddr = p.p_vaddr;
+          addr = p.p_vaddr + p.p_memsz;
+        } else {
+          in_sync = false;
+          p.p_paddr = addr;
+          addr += p.p_memsz;
+        }
+      }
+      break;
     }
   }
 
@@ -504,7 +560,7 @@ void StrtabSection<E>::update_shdr(Context<E> &ctx) {
     offset += file->strtab_size;
   }
 
-  this->shdr.sh_size = offset;
+  this->shdr.sh_size = (offset == 1) ? 0 : offset;
 }
 
 template <typename E>
@@ -513,7 +569,7 @@ void ShstrtabSection<E>::update_shdr(Context<E> &ctx) {
   i64 offset = 1;
 
   for (Chunk<E> *chunk : ctx.chunks) {
-    if (!chunk->name.empty()) {
+    if (chunk->kind() != ChunkKind::HEADER && !chunk->name.empty()) {
       auto [it, inserted] = map.insert({chunk->name, offset});
       chunk->shdr.sh_name = it->second;
       if (inserted)
@@ -530,7 +586,7 @@ void ShstrtabSection<E>::copy_buf(Context<E> &ctx) {
   base[0] = '\0';
 
   for (Chunk<E> *chunk : ctx.chunks)
-    if (!chunk->name.empty())
+    if (chunk->kind() != ChunkKind::HEADER && !chunk->name.empty())
       write_string(base + chunk->shdr.sh_name, chunk->name);
 }
 
@@ -568,11 +624,8 @@ void DynstrSection<E>::copy_buf(Context<E> &ctx) {
 
   if (!ctx.dynsym->symbols.empty()) {
     i64 offset = dynsym_offset;
-
-    for (i64 i = 1; i < ctx.dynsym->symbols.size(); i++) {
-      Symbol<E> &sym = *ctx.dynsym->symbols[i];
-      offset += write_string(base + offset, sym.name());
-    }
+    for (Symbol<E> *sym : std::span<Symbol<E> *>(ctx.dynsym->symbols).subspan(1))
+      offset += write_string(base + offset, sym->name());
   }
 }
 
@@ -844,9 +897,9 @@ get_output_name(Context<E> &ctx, std::string_view name, u64 flags) {
 
   if ((name == ".rodata" || name.starts_with(".rodata.")) && (flags & SHF_MERGE))
     return (flags & SHF_STRINGS) ? ".rodata.str" : ".rodata.cst";
-  if (name == ".ARM.exidx" || name.starts_with(".ARM.exidx."))
+  if (name.starts_with(".ARM.exidx"))
     return ".ARM.exidx";
-  if (name == ".ARM.extab" || name.starts_with(".ARM.extab."))
+  if (name.starts_with(".ARM.extab"))
     return ".ARM.extab";
 
   if (ctx.arg.z_keep_text_section_prefix) {
@@ -1094,7 +1147,6 @@ void OutputSection<E>::populate_symtab(Context<E> &ctx) {
   if constexpr (needs_thunk<E>) {
     ElfSym<E> *esym =
       (ElfSym<E> *)(ctx.buf + ctx.symtab->shdr.sh_offset) + this->local_symtab_idx;
-    memset(esym, 0, this->num_local_symtab * sizeof(ElfSym<E>));
 
     u8 *strtab_base = ctx.buf + ctx.strtab->shdr.sh_offset;
     u8 *strtab = strtab_base + this->strtab_offset;
@@ -1112,6 +1164,7 @@ void OutputSection<E>::populate_symtab(Context<E> &ctx) {
         Symbol<E> &sym = *thunk->symbols[i];
 
         auto write_esym = [&](i64 st_name, i64 off) {
+          memset(esym, 0, sizeof(*esym));
           esym->st_name = st_name;
           esym->st_type = STT_FUNC;
           esym->st_shndx = this->shndx;
@@ -1378,12 +1431,12 @@ void GotSection<E>::populate_symtab(Context<E> &ctx) {
 
   ElfSym<E> *esym =
     (ElfSym<E> *)(ctx.buf + ctx.symtab->shdr.sh_offset) + this->local_symtab_idx;
-  memset(esym, 0, this->num_local_symtab * sizeof(ElfSym<E>));
 
   u8 *strtab_base = ctx.buf + ctx.strtab->shdr.sh_offset;
   u8 *strtab = strtab_base + this->strtab_offset;
 
   auto write = [&](std::string_view name, std::string_view suffix, i64 value) {
+    memset(esym, 0, sizeof(*esym));
     esym->st_name = strtab - strtab_base;
     esym->st_type = STT_OBJECT;
     esym->st_shndx = this->shndx;
@@ -1481,12 +1534,12 @@ void PltSection<E>::populate_symtab(Context<E> &ctx) {
 
   ElfSym<E> *esym =
     (ElfSym<E> *)(ctx.buf + ctx.symtab->shdr.sh_offset) + this->local_symtab_idx;
-  memset(esym, 0, symbols.size() * sizeof(ElfSym<E>));
 
   u8 *strtab_base = ctx.buf + ctx.strtab->shdr.sh_offset;
   u8 *strtab = strtab_base + this->strtab_offset;
 
   for (Symbol<E> *sym : symbols) {
+    memset(esym, 0, sizeof(*esym));
     esym->st_name = strtab - strtab_base;
     esym->st_type = STT_FUNC;
     esym->st_shndx = this->shndx;
@@ -1534,12 +1587,12 @@ void PltGotSection<E>::populate_symtab(Context<E> &ctx) {
 
   ElfSym<E> *esym =
     (ElfSym<E> *)(ctx.buf + ctx.symtab->shdr.sh_offset) + this->local_symtab_idx;
-  memset(esym, 0, symbols.size() * sizeof(ElfSym<E>));
 
   u8 *strtab_base = ctx.buf + ctx.strtab->shdr.sh_offset;
   u8 *strtab = strtab_base + this->strtab_offset;
 
   for (Symbol<E> *sym : symbols) {
+    memset(esym, 0, sizeof(*esym));
     esym->st_name = strtab - strtab_base;
     esym->st_type = STT_FUNC;
     esym->st_shndx = this->shndx;
@@ -1579,10 +1632,13 @@ void RelPltSection<E>::copy_buf(Context<E> &ctx) {
 }
 
 template<typename E>
-ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym) {
+ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym, u32 st_name) {
   ElfSym<E> esym;
   memset(&esym, 0, sizeof(esym));
+
+  esym.st_name = st_name;
   esym.st_type = sym.esym().st_type;
+  esym.st_size = sym.esym().st_size;
 
   if (sym.is_local())
     esym.st_bind = STB_LOCAL;
@@ -1616,35 +1672,29 @@ ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym) {
     esym.st_shndx =
       sym.copyrel_readonly ? ctx.copyrel_relro->shndx : ctx.copyrel->shndx;
     esym.st_value = sym.get_addr(ctx);
-    esym.st_size = sym.esym().st_size;
   } else if (sym.file->is_dso || sym.esym().is_undef()) {
     esym.st_shndx = SHN_UNDEF;
-    esym.st_value = sym.is_canonical ? sym.get_plt_addr(ctx) : 0;
-    esym.st_size = 0;
+    if (sym.is_canonical)
+      esym.st_value = sym.get_plt_addr(ctx);
   } else if (Chunk<E> *osec = sym.get_output_section()) {
     // Linker-synthesized symbols
     esym.st_shndx = osec->shndx;
     esym.st_value = sym.get_addr(ctx);
-    esym.st_size = sym.esym().st_size;
   } else if (SectionFragment<E> *frag = sym.get_frag()) {
     // Section fragment
     esym.st_shndx = frag->output_section.shndx;
     esym.st_value = sym.get_addr(ctx);
-    esym.st_size = 0;
   } else if (!sym.get_input_section()) {
     // Absolute symbol
     esym.st_shndx = SHN_ABS;
     esym.st_value = sym.get_addr(ctx);
-    esym.st_size = sym.esym().st_size;
   } else if (sym.get_type() == STT_TLS) {
     esym.st_shndx = get_st_shndx(sym);
     esym.st_value = sym.get_addr(ctx) - ctx.tls_begin;
-    esym.st_size = sym.esym().st_size;
   } else {
     esym.st_visibility = sym.visibility;
     esym.st_shndx = get_st_shndx(sym);
     esym.st_value = sym.get_addr(ctx, NO_PLT);
-    esym.st_size = sym.esym().st_size;
   }
   return esym;
 }
@@ -1737,8 +1787,7 @@ void DynsymSection<E>::copy_buf(Context<E> &ctx) {
     ElfSym<E> &esym =
       *(ElfSym<E> *)(base + sym.get_dynsym_idx(ctx) * sizeof(ElfSym<E>));
 
-    esym = to_output_esym(ctx, sym);
-    esym.st_name = name_offset;
+    esym = to_output_esym(ctx, sym, name_offset);
     name_offset += sym.name().size() + 1;
     assert(esym.st_bind != STB_LOCAL || i < this->shdr.sh_info);
   }
@@ -2395,8 +2444,24 @@ void BuildIdSection<E>::copy_buf(Context<E> &ctx) {
 
 template <typename E>
 static void compute_sha256(Context<E> &ctx, i64 offset) {
-  u8 *buf = ctx.buf;
+  // We compute sha256 only for the part of the file that is memory-mapped
+  // at runtime. In other words, we ignore symbol table, section table,
+  // debug info, etc. when computing build-id.
+  //
+  // We ignore them because build-id is not unique anyway due to the strip
+  // command. If you run strip on an executable, its symbol table and
+  // debug info sections are removed, but its .note.gnu.build-id is
+  // unchanged. So, there are commonly two versions of a file of the same
+  // build-id; unstripped and stripped.
+  i64 memsize = 0;
+  for (Chunk<E> *chunk : ctx.chunks) {
+    ElfShdr<E> &shdr = chunk->shdr;
+    if ((shdr.sh_flags & SHF_ALLOC) && shdr.sh_type != SHT_NOBITS)
+      memsize = std::max<i64>(memsize, shdr.sh_offset + shdr.sh_size);
+  }
+
   i64 filesize = ctx.output_file->filesize;
+  u8 *buf = ctx.buf;
 
   i64 shard_size = 4096 * 1024;
   i64 num_shards = align_to(filesize, shard_size) / shard_size;
@@ -2405,7 +2470,8 @@ static void compute_sha256(Context<E> &ctx, i64 offset) {
   tbb::parallel_for((i64)0, num_shards, [&](i64 i) {
     u8 *begin = buf + shard_size * i;
     u8 *end = (i == num_shards - 1) ? buf + filesize : begin + shard_size;
-    sha256_hash(begin, end - begin, shards.data() + i * SHA256_SIZE);
+    if (end <= buf + memsize)
+      sha256_hash(begin, end - begin, shards.data() + i * SHA256_SIZE);
 
 #ifndef _WIN32
     // We call munmap early for each chunk so that the last munmap
@@ -2878,7 +2944,7 @@ static i64 get_output_sym_idx(Symbol<E> &sym) {
   i64 idx2 = sym.file->output_sym_indices[sym.sym_idx];
   assert(idx2 != -1);
 
-  if (sym.sym_idx < sym.file->first_global)
+  if (sym.is_local())
     return sym.file->local_symtab_idx + idx2;
   return sym.file->global_symtab_idx + idx2;
 }
@@ -2903,9 +2969,9 @@ void RelocSection<E>::copy_buf(Context<E> &ctx) {
 
       buf[j].r_offset =
         isec.output_section->shdr.sh_addr + isec.offset + r.r_offset;
+      buf[j].r_type = r.r_type;
 
       if (sym.esym().st_type == STT_SECTION) {
-        buf[j].r_type = STT_SECTION;
         buf[j].r_addend = isec.get_addend(r) + isec.offset;
 
         if (SectionFragment<E> *frag = sym.get_frag())
@@ -2913,7 +2979,6 @@ void RelocSection<E>::copy_buf(Context<E> &ctx) {
         else
           buf[j].r_sym = sym.get_input_section()->output_section->shndx;
       } else {
-        buf[j].r_type = r.r_type;
         buf[j].r_sym = get_output_sym_idx(sym);
         buf[j].r_addend = isec.get_addend(r);
       }
@@ -2959,6 +3024,6 @@ template class CompressedSection<E>;
 template class RelocSection<E>;
 template i64 to_phdr_flags(Context<E> &ctx, Chunk<E> *chunk);
 template bool is_relro(Context<E> &, Chunk<E> *);
-template ElfSym<E> to_output_esym(Context<E> &, Symbol<E> &);
+template ElfSym<E> to_output_esym(Context<E> &, Symbol<E> &, u32);
 
 } // namespace mold::elf

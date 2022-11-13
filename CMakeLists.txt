@@ -44,12 +44,12 @@
 # features and behave exactly the same.
 
 cmake_minimum_required(VERSION 3.13)
-project(mold VERSION 1.6.0)
+project(mold VERSION 1.7.0)
 
 include(CMakeDependentOption)
 include(GNUInstallDirs)
 
-# Build mold itself using mold if -DMOLD_USE_MOLD=ON.
+# Build mold itself using mold if -DMOLD_USE_MOLD=ON
 option(MOLD_USE_MOLD "Use mold to build mold" OFF)
 if(MOLD_USE_MOLD)
   add_link_options(-fuse-ld=mold)
@@ -57,8 +57,6 @@ endif()
 
 add_executable(mold)
 target_compile_features(mold PRIVATE cxx_std_20)
-target_compile_definitions(mold PRIVATE
-  "LIBDIR=\"${CMAKE_INSTALL_FULL_LIBDIR}\"")
 target_link_libraries(mold PRIVATE ${CMAKE_DL_LIBS})
 
 if(NOT "${CMAKE_CXX_COMPILER_FRONTEND_VARIANT}" STREQUAL "MSVC")
@@ -136,11 +134,15 @@ endif()
 # optimized for multi-threaded applications.
 #
 # If you want to use the usual libc's malloc, pass -DMOLD_USE_MIMALLOC=OFF.
-include(CheckCSourceCompiles)
-check_c_source_compiles("#ifdef __i386__\nint main() {}\n#endif" I386)
+#
+# We enable mimalloc by default for 64-bit targets. It doesn't seem to
+# be stable on 32-bit targets.
+include(CheckCXXSourceCompiles)
+check_cxx_source_compiles(
+  "static_assert(sizeof(void *) == 4); int main() {}" P32)
 
 cmake_dependent_option(MOLD_USE_MIMALLOC "Use mimalloc" ON
-  "NOT APPLE; NOT ANDROID; NOT I386" OFF)
+  "NOT APPLE; NOT ANDROID; NOT P32" OFF)
 cmake_dependent_option(
   MOLD_USE_SYSTEM_MIMALLOC "Use system or vendored mimalloc" OFF
   MOLD_USE_MIMALLOC OFF)
@@ -189,6 +191,7 @@ else()
   mold_add_tbb()
 endif()
 
+# We always use Clang to build mold on Windows. MSVC can't compile mold.
 if(WIN32)
   if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     message(FATAL_ERROR
@@ -204,6 +207,7 @@ else()
   endif()
 endif()
 
+# Build mold-wrapper.so
 if(NOT APPLE AND NOT WIN32)
   add_library(mold-wrapper SHARED)
   install(TARGETS mold-wrapper DESTINATION ${CMAKE_INSTALL_LIBDIR}/mold)
@@ -219,12 +223,19 @@ if(NOT APPLE AND NOT WIN32 AND NOT MOLD_MOSTLY_STATIC)
   target_link_libraries(mold PRIVATE OpenSSL::Crypto)
 endif()
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(riscv64|armv6)")
+# If atomics doesn't work by default, add -latomic.
+# We need the flag on riscv, armv6 and m68k.
+include(CheckCXXSourceCompiles)
+check_cxx_source_compiles("#include <cstdint>
+int main() {
+  uint64_t x = 1;
+  __atomic_add_fetch(&x, 0, __ATOMIC_RELAXED);
+  return x;
+}" HAVE_ATOMIC_ADD_FETCH)
+
+if(NOT HAVE_ATOMIC_ADD_FETCH)
   target_link_libraries(mold PRIVATE atomic)
 endif()
-
-set_property(SOURCE main.cc APPEND PROPERTY
-  COMPILE_DEFINITIONS "MOLD_VERSION=\"${CMAKE_PROJECT_VERSION}\"")
 
 # Create a .cc file containing the current git hash for `mold --version`.
 add_custom_target(git_hash
@@ -238,16 +249,21 @@ add_custom_target(git_hash
 
 add_dependencies(mold git_hash)
 
+# Create config.h file
+configure_file(config.h.in config.h)
+include_directories(${CMAKE_CURRENT_BINARY_DIR})
+
 # Almost all functions are template in mold which take a target type
 # (e.g. X86_64) as its type parameter. Since we suport more than 10
 # targets, compiling a single source file for all the targets is very
 # slow.
 #
 # As a workaround, we create a .cc file for each target and spawn many
-# compiler instances. This is hacky but greatly reduces compile time.
+# compiler instances. This is hacky but greatly reduces compile time
+# on a multicore machine.
 list(APPEND MOLD_ELF_TARGETS
   X86_64 I386 ARM64 ARM32 RV32LE RV32BE RV64LE RV64BE
-  PPC64V1 PPC64V2 SPARC64 S390X)
+  PPC64V1 PPC64V2 S390X SPARC64 M68K)
 
 list(APPEND MOLD_ELF_TEMPLATE_FILES
   elf/cmdline.cc
@@ -309,6 +325,7 @@ target_sources(mold PRIVATE
   elf/arch-arm32.cc
   elf/arch-arm64.cc
   elf/arch-i386.cc
+  elf/arch-m68k.cc
   elf/arch-ppc64v1.cc
   elf/arch-ppc64v2.cc
   elf/arch-riscv.cc
@@ -331,10 +348,15 @@ target_sources(mold PRIVATE
   )
 
 # Add frequently included header files for pre-compiling.
-if(${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.16.0") # for target_precompile_headers
-target_precompile_headers(mold PRIVATE
-  "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_SOURCE_DIR}/elf/mold.h>"
-  "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_SOURCE_DIR}/macho/mold.h>")
+# target_precompile_headers is supported by CMake 3.16.0 or newer.
+if(${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.16.0")
+  target_precompile_headers(mold PRIVATE
+    "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_SOURCE_DIR}/elf/mold.h>"
+    "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_SOURCE_DIR}/macho/mold.h>")
+
+  # ccache needs this flag along with `sloppiness = pch_defines,time_macros`
+  # to enable caching
+  target_compile_options(mold PRIVATE -fpch-preprocess)
 endif()
 
 include(CTest)
@@ -362,17 +384,24 @@ if(NOT CMAKE_SKIP_INSTALL_RULES)
   install(TARGETS mold RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
   install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
   install(FILES docs/mold.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1/)
-  install(CODE "
-    file(RELATIVE_PATH RELPATH
-       /${CMAKE_INSTALL_FULL_LIBEXECDIR}/mold /${CMAKE_INSTALL_FULL_BINDIR}/mold)
-    execute_process(COMMAND ${CMAKE_COMMAND} -E make_directory
-      \$ENV{DESTDIR}/${CMAKE_INSTALL_FULL_LIBEXECDIR}/mold)
-    execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink \${RELPATH}
-      \$ENV{DESTDIR}/${CMAKE_INSTALL_FULL_LIBEXECDIR}/mold/ld)
-    execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink mold
-      \$ENV{DESTDIR}/${CMAKE_INSTALL_FULL_BINDIR}/ld.mold)
-    execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink mold
-      \$ENV{DESTDIR}/${CMAKE_INSTALL_FULL_BINDIR}/ld64.mold)
-    execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink mold.1
-      \$ENV{DESTDIR}/${CMAKE_INSTALL_FULL_MANDIR}/man1/ld.mold.1)")
+
+  function(mold_install_relative_symlink OLD NEW)
+    install(CODE "
+      get_filename_component(PREFIX_ABS \${CMAKE_INSTALL_PREFIX} ABSOLUTE)
+      get_filename_component(OLD_ABS ${OLD} ABSOLUTE BASE_DIR \${PREFIX_ABS})
+      get_filename_component(NEW_ABS ${NEW} ABSOLUTE BASE_DIR \${PREFIX_ABS})
+      get_filename_component(NEW_DIR \${NEW_ABS} DIRECTORY)
+      file(RELATIVE_PATH OLD_REL \${NEW_DIR} \${OLD_ABS})
+      message(STATUS \"Installing symlink: \$ENV{DESTDIR}/\${NEW_ABS} -> \${OLD_REL}\")
+      file(MAKE_DIRECTORY \$ENV{DESTDIR}/\${NEW_DIR})
+      file(CREATE_LINK \${OLD_REL} \$ENV{DESTDIR}/\${NEW_ABS} SYMBOLIC)")
+  endfunction()
+  mold_install_relative_symlink(${CMAKE_INSTALL_BINDIR}/mold
+    ${CMAKE_INSTALL_LIBEXECDIR}/mold/ld)
+  mold_install_relative_symlink(${CMAKE_INSTALL_BINDIR}/mold
+    ${CMAKE_INSTALL_BINDIR}/ld.mold)
+  mold_install_relative_symlink(${CMAKE_INSTALL_BINDIR}/mold
+    ${CMAKE_INSTALL_BINDIR}/ld64.mold)
+  mold_install_relative_symlink(${CMAKE_INSTALL_MANDIR}/man1/mold.1
+    ${CMAKE_INSTALL_MANDIR}/man1/ld.mold.1)
 endif()

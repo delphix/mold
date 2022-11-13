@@ -412,6 +412,9 @@ public:
   i64 strtab_size = 0;
   i64 strtab_offset = 0;
 
+  // For --section-order
+  i64 sect_order = 0;
+
 protected:
   Chunk() { shdr.sh_addralign = 1; }
 };
@@ -420,8 +423,9 @@ protected:
 template <typename E>
 class OutputEhdr : public Chunk<E> {
 public:
-  OutputEhdr() {
-    this->shdr.sh_flags = SHF_ALLOC;
+  OutputEhdr(u32 sh_flags) {
+    this->name = "EHDR";
+    this->shdr.sh_flags = sh_flags;
     this->shdr.sh_size = sizeof(ElfEhdr<E>);
     this->shdr.sh_addralign = sizeof(Word<E>);
   }
@@ -435,6 +439,7 @@ template <typename E>
 class OutputShdr : public Chunk<E> {
 public:
   OutputShdr() {
+    this->name = "SHDR";
     this->shdr.sh_addralign = sizeof(Word<E>);
   }
 
@@ -447,8 +452,9 @@ public:
 template <typename E>
 class OutputPhdr : public Chunk<E> {
 public:
-  OutputPhdr() {
-    this->shdr.sh_flags = SHF_ALLOC;
+  OutputPhdr(u32 sh_flags) {
+    this->name = "PHDR";
+    this->shdr.sh_flags = sh_flags;
     this->shdr.sh_addralign = sizeof(Word<E>);
   }
 
@@ -456,7 +462,6 @@ public:
   void update_shdr(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
 
-private:
   std::vector<ElfPhdr<E>> phdrs;
 };
 
@@ -678,7 +683,6 @@ public:
   StrtabSection() {
     this->name = ".strtab";
     this->shdr.sh_type = SHT_STRTAB;
-    this->shdr.sh_size = 1;
   }
 
   void update_shdr(Context<E> &ctx) override;
@@ -732,7 +736,7 @@ public:
 };
 
 template<typename E>
-ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym);
+ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym, u32 st_name);
 
 template <typename E>
 class SymtabSection : public Chunk<E> {
@@ -1196,6 +1200,7 @@ public:
                                std::string archive_name, bool is_in_lib);
 
   void parse(Context<E> &ctx);
+  void initialize_mergeable_sections(Context<E> &ctx);
   void register_section_pieces(Context<E> &ctx);
   void resolve_symbols(Context<E> &ctx) override;
   void mark_live_objects(Context<E> &ctx,
@@ -1236,7 +1241,6 @@ public:
 
   // For ICF
   std::unique_ptr<InputSection<E>> llvm_addrsig;
-
   // For .gdb_index
   InputSection<E> *debug_info = nullptr;
   InputSection<E> *debug_ranges = nullptr;
@@ -1260,7 +1264,6 @@ private:
   void initialize_sections(Context<E> &ctx);
   void initialize_symbols(Context<E> &ctx);
   void sort_relocations(Context<E> &ctx);
-  void initialize_mergeable_sections(Context<E> &ctx);
   void initialize_ehframe_sections(Context<E> &ctx);
   u32 read_note_gnu_property(Context<E> &ctx, const ElfShdr<E> &shdr);
   void read_ehframe(Context<E> &ctx, InputSection<E> &isec);
@@ -1430,7 +1433,7 @@ template <typename E> void write_dependency_file(Context<E> &);
 // arch-arm32.cc
 //
 
-void sort_arm_exidx(Context<ARM32> &ctx);
+void fixup_arm_exidx_section(Context<ARM32> &ctx);
 
 //
 // arch-riscv64.cc
@@ -1541,6 +1544,12 @@ struct VersionPattern {
   bool is_cpp = false;
 };
 
+struct SectionOrder {
+  enum { NONE, SECTION, GROUP, ADDR, ALIGN, SYMBOL } type = NONE;
+  std::string name;
+  u64 value = 0;
+};
+
 // Context represents a context object for each invocation of the linker.
 // It contains command line flags, pointers to singleton objects
 // (such as linker-synthesized output sections), unique_ptrs for
@@ -1572,11 +1581,12 @@ struct Context {
     bool default_symver = false;
     bool demangle = true;
     bool discard_all = false;
+    bool apply_dynamic_relocs = true;
     bool discard_locals = false;
     bool eh_frame_hdr = true;
     bool emit_relocs = false;
-    bool apply_dynamic_relocs = true;
     bool enable_new_dtags = true;
+    bool execute_only = false;
     bool export_dynamic = false;
     bool fatal_warnings = false;
     bool fork = true;
@@ -1605,6 +1615,7 @@ struct Context {
     bool repro = false;
     bool rosegment = true;
     bool shared = false;
+    bool start_stop = false;
     bool stats = false;
     bool strip_all = false;
     bool strip_debug = false;
@@ -1635,6 +1646,7 @@ struct Context {
     i64 spare_dynamic_tags = 5;
     i64 thread_count = 0;
     std::optional<Glob> unique;
+    std::optional<u64> physical_image_base;
     std::optional<u64> shuffle_sections_seed;
     std::string Map;
     std::string chroot;
@@ -1651,9 +1663,11 @@ struct Context {
     std::string soname;
     std::string sysroot;
     std::unique_ptr<std::unordered_set<std::string_view>> retain_symbols_file;
+    std::unordered_map<std::string_view, u64> section_align;
     std::unordered_map<std::string_view, u64> section_start;
     std::unordered_set<std::string_view> ignore_ir_file;
     std::unordered_set<std::string_view> wrap;
+    std::vector<SectionOrder> section_order;
     std::vector<std::pair<Symbol<E> *, std::variant<Symbol<E> *, u64>>> defsyms;
     std::vector<std::string> library_paths;
     std::vector<std::string> plugin_opt;

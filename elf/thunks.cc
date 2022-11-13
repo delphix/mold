@@ -1,15 +1,24 @@
-// RISC instructions are usually up to 4 bytes long, so the immediates
-// of their branch instructions are naturally smaller than 32 bits.
-// This is contrary to x86-64 on which branch instructions take 4
-// bytes immediates and can jump to anywhere within PC ± 2 GiB.
+// RISC instructions are usually up to 4 bytes long, so the immediates of
+// their branch instructions are naturally smaller than 32 bits.  This is
+// contrary to x86-64 on which branch instructions take 4 bytes immediates
+// and can jump to anywhere within PC ± 2 GiB.
 //
-// In fact, ARM32's branch instructions can jump only within ±16 MiB
-// and ARM64's ±128 MiB, for example. If a branch target is further
-// than that, we need to let it branch to a linker-synthesized code
-// sequence that construct a full 32 bit address in a register and
-// jump there. That linker-synthesized code is called "thunk".
+// In fact, ARM32's branch instructions can jump only within ±16 MiB and
+// ARM64's ±128 MiB, for example. If a branch target is further than that,
+// we need to let it branch to a linker-synthesized code sequence that
+// construct a full 32 bit address in a register and jump there. That
+// linker-synthesized code is called "thunk".
 //
 // The function in this file creates thunks.
+//
+// Note that although thunks play an important role in an executable, they
+// don't take up too much space in it. For example, among the clang-16's
+// text segment whose size is ~300 MiB on ARM64, thunks in total occupy
+// only ~30 KiB or 0.01%. Of course the number depends on an ISA; we would
+// need more thunks on ARM32 whose branch range is shorter than ARM64.
+// That said, the total size of thunks still isn't that much. Therefore,
+// we don't need to try too hard to reduce thunk size to the absolute
+// minimum.
 
 #include "mold.h"
 
@@ -18,10 +27,11 @@
 
 namespace mold::elf {
 
-// The number of immediate bits in branch instructions.
+// Branch reach in bytes.
 //
 // ARM64's branch has 26 bits immediate, and it's scaled by 4 because all
 // instructions are 4 bytes aligned, so it's effectively 28 bits long.
+// That means the range is [-2^27, 2^27).
 //
 // ARM32's Thumb branch has 24 bits immediate, and the instructions are
 // aligned to 2, so it's effectively 25 bits. ARM32's non-Thumb branches
@@ -37,22 +47,18 @@ namespace mold::elf {
 //   ARM32: PC ± 16 MiB
 //   PPC64: PC ± 32 MiB
 template <typename E>
-static constexpr i64 jump_bits =
-  std::is_same_v<E, ARM64> ? 28 : std::is_same_v<E, ARM32> ? 25 : 26;
-
-// We redirect a branch to a thunk if its destination is further than
-// this number.
-//
-// 5 MiB is a safety margin; we assume that there's no crazy big input
-// .text section that is larger than 5 MiB.
-template <typename E>
-static constexpr i64 max_distance = (1LL << (jump_bits<E> - 1)) - 5 * 1024 * 1024;
+static constexpr i64 max_distance =
+  1LL << (std::is_same_v<E, ARM64> ? 27 : std::is_same_v<E, ARM32> ? 24 : 25);
 
 // We create thunks for each 12.8/1.6/3.2 MiB code block for
 // ARM64/ARM32/PPC64, respectively.
 template <typename E>
-static constexpr i64 group_size = (1LL << (jump_bits<E> - 1)) / 10;
+static constexpr i64 batch_size = max_distance<E> / 10;
 
+// We assume that a single thunk group is smaller than 100 KiB.
+static constexpr i64 max_thunk_size = 102400;
+
+// Returns true if a given relocation is of type used for function calls.
 template <typename E>
 static bool needs_thunk_rel(const ElfRel<E> &r) {
   u32 ty = r.r_type;
@@ -103,8 +109,8 @@ static bool is_reachable(Context<E> &ctx, InputSection<E> &isec,
   i64 S = sym.get_addr(ctx, NO_OPD);
   i64 A = isec.get_addend(rel);
   i64 P = isec.get_addr() + rel.r_offset;
-  u64 val = S + A - P;
-  return sign_extend(val, jump_bits<E> - 1) == val;
+  i64 val = S + A - P;
+  return -max_distance<E> <= val && val < max_distance<E>;
 }
 
 template <typename E>
@@ -160,17 +166,17 @@ static void scan_rels(Context<E> &ctx, InputSection<E> &isec,
 
 template <typename E>
 void create_range_extension_thunks(Context<E> &ctx, OutputSection<E> &osec) {
-  std::span<InputSection<E> *> members = osec.members;
-  if (members.empty())
+  std::span<InputSection<E> *> m = osec.members;
+  if (m.empty())
     return;
 
-  members[0]->offset = 0;
+  m[0]->offset = 0;
 
   // Initialize input sections with a dummy offset so that we can
   // distinguish sections that have got an address with the one who
   // haven't.
-  tbb::parallel_for((i64)1, (i64)members.size(), [&](i64 i) {
-    members[i]->offset = -1;
+  tbb::parallel_for((i64)1, (i64)m.size(), [&](i64 i) {
+    m[i]->offset = -1;
   });
 
   // We create thunks from the beginning of the section to the end.
@@ -182,27 +188,30 @@ void create_range_extension_thunks(Context<E> &ctx, OutputSection<E> &osec) {
   i64 d = 0;
   i64 offset = 0;
 
-  while (b < members.size()) {
-    // Move D foward as far as we can jump from B to D.
-    while (d < members.size() && offset - members[b]->offset < max_distance<E>) {
-      offset = align_to(offset, 1 << members[d]->p2align);
-      members[d]->offset = offset;
-      offset += members[d]->sh_size;
+  while (b < m.size()) {
+    // Move D foward as far as we can jump from B to anywhere in a thunk after D.
+    while (d < m.size() &&
+           align_to(offset, 1 << m[d]->p2align) + m[d]->sh_size + max_thunk_size <
+           m[b]->offset + max_distance<E>) {
+      offset = align_to(offset, 1 << m[d]->p2align);
+      m[d]->offset = offset;
+      offset += m[d]->sh_size;
       d++;
     }
 
-    // Move C forward so that C is apart from B by GROUP_SIZE.
-    while (c < members.size() &&
-           members[c]->offset - members[b]->offset < group_size<E>)
+    // Move C forward so that C is apart from B by BATCH_SIZE. We want
+    // to make sure that there's at least one section between B and C
+    // to ensure progress.
+    c = b + 1;
+    while (c < m.size() &&
+           m[c]->offset + m[c]->sh_size < m[b]->offset + batch_size<E>)
       c++;
 
     // Move A forward so that A is reachable from C.
-    if (c > 0) {
-      i64 c_end = members[c - 1]->offset + members[c - 1]->sh_size;
-      while (a < osec.thunks.size() &&
-             osec.thunks[a]->offset < c_end - max_distance<E>)
-        reset_thunk(*osec.thunks[a++]);
-    }
+    i64 c_offset = (c == m.size()) ? offset : m[c]->offset;
+    while (a < osec.thunks.size() &&
+           osec.thunks[a]->offset + max_distance<E> < c_offset)
+      reset_thunk(*osec.thunks[a++]);
 
     // Create a thunk for input sections between B and C and place it at D.
     osec.thunks.emplace_back(new RangeExtensionThunk<E>{osec});
@@ -213,13 +222,13 @@ void create_range_extension_thunks(Context<E> &ctx, OutputSection<E> &osec) {
     thunk.offset = offset;
 
     // Scan relocations between B and C to collect symbols that need thunks.
-    tbb::parallel_for_each(members.begin() + b, members.begin() + c,
-                           [&](InputSection<E> *isec) {
+    tbb::parallel_for_each(&m[b], &m[c], [&](InputSection<E> *isec) {
       scan_rels(ctx, *isec, thunk);
     });
 
     // Now that we know the number of symbols in the thunk, we can compute
     // its size.
+    assert(thunk.size() < max_thunk_size);
     offset += thunk.size();
 
     // Sort symbols added to the thunk to make the output deterministic.
@@ -235,8 +244,7 @@ void create_range_extension_thunks(Context<E> &ctx, OutputSection<E> &osec) {
     }
 
     // Scan relocations again to fix symbol offsets in the last thunk.
-    tbb::parallel_for_each(members.begin() + b, members.begin() + c,
-                           [&](InputSection<E> *isec) {
+    tbb::parallel_for_each(&m[b], &m[c], [&](InputSection<E> *isec) {
       std::span<Symbol<E> *> syms = isec->file.symbols;
       std::span<const ElfRel<E>> rels = isec->get_rels(ctx);
       std::span<RangeExtensionRef> range_extn = isec->extra.range_extn;
@@ -246,7 +254,7 @@ void create_range_extension_thunks(Context<E> &ctx, OutputSection<E> &osec) {
           range_extn[i].sym_idx = syms[rels[i].r_sym]->extra.thunk_sym_idx;
     });
 
-    // Move B forward to point to the begining of the next group.
+    // Move B forward to point to the begining of the next batch.
     b = c;
   }
 

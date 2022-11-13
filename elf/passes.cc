@@ -39,8 +39,23 @@ void create_synthetic_sections(Context<E> &ctx) {
   };
 
   if (!ctx.arg.oformat_binary) {
-    ctx.ehdr = push(new OutputEhdr<E>);
-    ctx.phdr = push(new OutputPhdr<E>);
+    auto find = [&](std::string_view name) {
+      for (SectionOrder &ord : ctx.arg.section_order)
+        if (ord.type == SectionOrder::SECTION && ord.name == name)
+          return true;
+      return false;
+    };
+
+    if (ctx.arg.section_order.empty() || find("EHDR"))
+      ctx.ehdr = push(new OutputEhdr<E>(SHF_ALLOC));
+    else
+      ctx.ehdr = push(new OutputEhdr<E>(0));
+
+    if (ctx.arg.section_order.empty() || find("PHDR"))
+      ctx.phdr = push(new OutputPhdr<E>(SHF_ALLOC));
+    else
+      ctx.phdr = push(new OutputPhdr<E>(0));
+
     ctx.shdr = push(new OutputShdr<E>);
   }
 
@@ -56,7 +71,6 @@ void create_synthetic_sections(Context<E> &ctx) {
     ctx.relrdyn = push(new RelrDynSection<E>);
 
   ctx.strtab = push(new StrtabSection<E>);
-  ctx.shstrtab = push(new ShstrtabSection<E>);
   ctx.plt = push(new PltSection<E>);
   ctx.pltgot = push(new PltGotSection<E>);
   ctx.symtab = push(new SymtabSection<E>);
@@ -66,6 +80,9 @@ void create_synthetic_sections(Context<E> &ctx) {
   ctx.copyrel = push(new CopyrelSection<E>(false));
   ctx.copyrel_relro = push(new CopyrelSection<E>(true));
 
+  if (!ctx.arg.oformat_binary)
+    ctx.shstrtab = push(new ShstrtabSection<E>);
+
   if (!ctx.arg.dynamic_linker.empty())
     ctx.interp = push(new InterpSection<E>);
   if (ctx.arg.build_id.kind != BuildId::NONE)
@@ -74,7 +91,8 @@ void create_synthetic_sections(Context<E> &ctx) {
     ctx.eh_frame_hdr = push(new EhFrameHdrSection<E>);
   if (ctx.arg.gdb_index)
     ctx.gdb_index = push(new GdbIndexSection<E>);
-  if (ctx.arg.z_relro && ctx.arg.z_separate_code != SEPARATE_LOADABLE_SEGMENTS)
+  if (ctx.arg.z_relro && ctx.arg.section_order.empty() &&
+      ctx.arg.z_separate_code != SEPARATE_LOADABLE_SEGMENTS)
     ctx.relro_padding = push(new RelroPaddingSection<E>);
   if (ctx.arg.hash_style_sysv)
     ctx.hash = push(new HashSection<E>);
@@ -142,8 +160,20 @@ static void mark_live_objects(Context<E> &ctx) {
   });
 }
 
+// Due to legacy reasons, archive members will only get included in the final binary if they satisfy one of the
+// undefined symbols in a non-archive object file. This is called archive extraction.
+// In finalize_archive_extraction, this is processed as follows:
+// 1. Do preliminary symbol resolution assuming all archive members are included. This matches the undefined symbols
+//    with ones to be extracted from archives.
+// 2. Do a mark & sweep pass to eliminate unneeded archive members.
+//
+// Note that the symbol resolution inside finalize_archive_extraction uses a different rule. In order to prevent
+// extracting archive members that can be satisfied by either non-archive object files or DSOs, the archive members are
+// given a lower priority. This is not correct for the general case, where *extracted* object files have precedence over
+// DSOs and even non-archive files that are passed earlier in the command line. Hence, the symbol resolution is thrown
+// away once we determine which archive members to extract, and redone later with the formal rule.
 template <typename E>
-void do_resolve_symbols(Context<E> &ctx) {
+void finalize_archive_extraction(Context<E> &ctx) {
   auto for_each_file = [&](std::function<void(InputFile<E> *)> fn) {
     tbb::parallel_for_each(ctx.objs, fn);
     tbb::parallel_for_each(ctx.dsos, fn);
@@ -156,23 +186,39 @@ void do_resolve_symbols(Context<E> &ctx) {
   // This also merges symbol visibility.
   mark_live_objects(ctx);
 
-  // Remove symbols of eliminated files.
+  // Cleanup. The rule used for archive extraction isn't accurate for the general case of symbol extraction, so reset
+  // the resolution to be redone later.
   for_each_file([](InputFile<E> *file) {
-    if (!file->is_alive)
-      file->clear_symbols();
+    file->clear_symbols();
   });
+
+  // Now that the symbol references are gone, remove the eliminated files from the file list.
+  std::erase_if(ctx.objs, [](InputFile<E> *file) { return !file->is_alive; });
+  std::erase_if(ctx.dsos, [](InputFile<E> *file) { return !file->is_alive; });
+}
+
+template <typename E>
+void do_resolve_symbols(Context<E> &ctx) {
+  finalize_archive_extraction(ctx);
+
+  // COMDAT elimination needs to happen exactly here.
+  //
+  // It needs to be after archive extraction, otherwise we might assign COMDAT leader to an archive member that is not
+  // supposed to be extracted.
+  //
+  // It needs to happen before symbol resolution, otherwise we could eliminate a symbol that is already resolved to
+  // and cause dangling references.
+  eliminate_comdats(ctx);
 
   // Since we have turned on object files live bits, their symbols
   // may now have higher priority than before. So run the symbol
   // resolution pass again to get the final resolution result.
-  for_each_file([&](InputFile<E> *file) {
-    if (file->is_alive)
-      file->resolve_symbols(ctx);
+  tbb::parallel_for_each(ctx.objs, [&](InputFile<E> *file) {
+    file->resolve_symbols(ctx);
   });
-
-  // Remove unused files
-  std::erase_if(ctx.objs, [](InputFile<E> *file) { return !file->is_alive; });
-  std::erase_if(ctx.dsos, [](InputFile<E> *file) { return !file->is_alive; });
+  tbb::parallel_for_each(ctx.dsos, [&](InputFile<E> *file) {
+    file->resolve_symbols(ctx);
+  });
 }
 
 template <typename E>
@@ -206,13 +252,6 @@ void resolve_symbols(Context<E> &ctx) {
 
     append(ctx.objs, lto_objs);
 
-    // Remove IR object files.
-    for (ObjectFile<E> *file : ctx.objs)
-      if (file->is_lto_obj)
-        file->is_alive = false;
-
-    std::erase_if(ctx.objs, [](ObjectFile<E> *file) { return file->is_lto_obj; });
-
     // Redo name resolution from scratch.
     tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
       file->clear_symbols();
@@ -224,6 +263,13 @@ void resolve_symbols(Context<E> &ctx) {
       file->is_alive = !file->is_needed;
     });
 
+    // Remove IR object files.
+    for (ObjectFile<E> *file : ctx.objs)
+      if (file->is_lto_obj)
+        file->is_alive = false;
+
+    std::erase_if(ctx.objs, [](ObjectFile<E> *file) { return file->is_lto_obj; });
+
     do_resolve_symbols(ctx);
   }
 }
@@ -231,6 +277,10 @@ void resolve_symbols(Context<E> &ctx) {
 template <typename E>
 void register_section_pieces(Context<E> &ctx) {
   Timer t(ctx, "register_section_pieces");
+
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    file->initialize_mergeable_sections(ctx);
+  });
 
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     file->register_section_pieces(ctx);
@@ -293,7 +343,8 @@ void compute_merged_section_sizes(Context<E> &ctx) {
   }
 
   // Add an identification string to .comment.
-  add_comment_string(ctx, mold_version);
+  if (!ctx.arg.oformat_binary)
+    add_comment_string(ctx, mold_version);
 
   // Embed command line arguments for debugging.
   if (char *env = getenv("MOLD_DEBUG"); env && env[0])
@@ -381,9 +432,7 @@ void create_internal_file(Context<E> &ctx) {
   obj->features = -1;
   obj->priority = 1;
 
-  // Add symbols for --defsym.
-  for (i64 i = 0; i < ctx.arg.defsyms.size(); i++) {
-    Symbol<E> *sym = ctx.arg.defsyms[i].first;
+  auto add = [&](Symbol<E> *sym) {
     obj->symbols.push_back(sym);
 
     // An actual value will be set to a linker-synthesized symbol by
@@ -401,8 +450,44 @@ void create_internal_file(Context<E> &ctx) {
     ctx.internal_esyms.push_back(esym);
   };
 
+  // Add --defsym symbols
+  for (i64 i = 0; i < ctx.arg.defsyms.size(); i++)
+    add(ctx.arg.defsyms[i].first);
+
+  // Add --section-order symbols
+  for (SectionOrder &ord : ctx.arg.section_order)
+    if (ord.type == SectionOrder::SYMBOL)
+      add(get_symbol(ctx, ord.name));
+
   obj->elf_syms = ctx.internal_esyms;
   obj->symvers.resize(ctx.internal_esyms.size() - 1);
+}
+
+template <typename E>
+static std::optional<std::string>
+get_start_stop_name(Context<E> &ctx, Chunk<E> &chunk) {
+  if ((chunk.shdr.sh_flags & SHF_ALLOC) && !chunk.name.empty()) {
+    if (is_c_identifier(chunk.name))
+      return std::string(chunk.name);
+
+    if (ctx.arg.start_stop) {
+      auto isalnum = [](char c) {
+        return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') ||
+          ('0' <= c && c <= '9');
+      };
+
+      std::string s{chunk.name};
+      if (s.starts_with('.'))
+        s = s.substr(1);
+
+      for (i64 i = 0; i < s.size(); i++)
+        if (!isalnum(s[i]))
+          s[i] = '_';
+      return s;
+    }
+  }
+
+  return {};
 }
 
 template <typename E>
@@ -473,9 +558,14 @@ void add_synthetic_symbols(Context<E> &ctx) {
     ctx.TOC = add(".TOC.");
 
   for (Chunk<E> *chunk : ctx.chunks) {
-    if (is_c_identifier(chunk->name)) {
-      add(save_string(ctx, "__start_" + std::string(chunk->name)));
-      add(save_string(ctx, "__stop_" + std::string(chunk->name)));
+    if (std::optional<std::string> name = get_start_stop_name(ctx, *chunk)) {
+      add(save_string(ctx, "__start_" + *name));
+      add(save_string(ctx, "__stop_" + *name));
+
+      if (ctx.arg.physical_image_base) {
+        add(save_string(ctx, "__phys_start_" + *name));
+        add(save_string(ctx, "__phys_stop_" + *name));
+      }
     }
   }
 
@@ -510,6 +600,7 @@ void add_synthetic_symbols(Context<E> &ctx) {
     if (!target || target->is_absolute())
       sym->origin = 0;
   }
+
 }
 
 template <typename E>
@@ -677,10 +768,13 @@ void check_duplicate_symbols(Context<E> &ctx) {
       const ElfSym<E> &esym = file->elf_syms[i];
       Symbol<E> &sym = *file->symbols[i];
 
+      // Skip if our symbol is undef or weak
       if (sym.file == file || sym.file == ctx.internal_obj ||
           esym.is_undef() || esym.is_common() || (esym.st_bind == STB_WEAK))
         continue;
 
+      // Skip if our symbol is in a dead section. In most cases, the
+      // section has been eliminated due to comdat deduplication.
       if (!esym.is_abs()) {
         InputSection<E> *isec = file->get_section(esym);
         if (!isec || !isec->is_alive)
@@ -920,6 +1014,10 @@ void compute_section_sizes(Context<E> &ctx) {
       }
     }
   }
+
+  for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections)
+    if (u32 align = ctx.arg.section_align[osec->name])
+      osec->shdr.sh_addralign = std::max<u32>(osec->shdr.sh_addralign, align);
 }
 
 template <typename E>
@@ -1055,24 +1153,6 @@ void create_reloc_sections(Context<E> &ctx) {
     ctx.chunks.push_back(r);
     ctx.chunk_pool.emplace_back(r);
   }
-
-  // Create a table to map input symbol indices to output symbol indices
-  auto set_indices = [&](InputFile<E> *file) {
-    file->output_sym_indices.resize(file->elf_syms.size(), -1);
-
-    for (i64 i = 1, j = 0; i < file->first_global; i++)
-      if (Symbol<E> &sym = *file->symbols[i];
-          sym.file == file && sym.write_to_symtab)
-        file->output_sym_indices[i] = j++;
-
-    for (i64 i = file->first_global, j = 0; i < file->elf_syms.size(); i++)
-      if (Symbol<E> &sym = *file->symbols[i];
-          sym.file == file && sym.write_to_symtab)
-        file->output_sym_indices[i] = j++;
-  };
-
-  tbb::parallel_for_each(ctx.objs, set_indices);
-  tbb::parallel_for_each(ctx.dsos, set_indices);
 }
 
 template <typename E>
@@ -1089,7 +1169,7 @@ void copy_chunks(Context<E> &ctx) {
   report_undef_errors(ctx);
 
   if constexpr (std::is_same_v<E, ARM32>)
-    sort_arm_exidx(ctx);
+    fixup_arm_exidx_section(ctx);
 }
 
 template <typename E>
@@ -1147,12 +1227,13 @@ void apply_version_script(Context<E> &ctx) {
   MultiGlob matcher;
   MultiGlob cpp_matcher;
 
-  for (VersionPattern &v : ctx.version_patterns) {
+  for (i64 i = 0; i < ctx.version_patterns.size(); i++) {
+    VersionPattern &v = ctx.version_patterns[i];
     if (v.is_cpp) {
-      if (!cpp_matcher.add(v.pattern, v.ver_idx))
+      if (!cpp_matcher.add(v.pattern, i))
         Fatal(ctx) << "invalid version pattern: " << v.pattern;
     } else {
-      if (!matcher.add(v.pattern, v.ver_idx))
+      if (!matcher.add(v.pattern, i))
         Fatal(ctx) << "invalid version pattern: " << v.pattern;
     }
   }
@@ -1163,18 +1244,22 @@ void apply_version_script(Context<E> &ctx) {
         continue;
 
       std::string_view name = sym->name();
+      i64 match = INT64_MAX;
 
-      if (std::optional<u16> ver = matcher.find(name)) {
-        sym->ver_idx = *ver;
-        continue;
-      }
+      if (std::optional<u32> idx = matcher.find(name))
+        match = std::min<i64>(match, *idx);
 
+      // Match non-mangled symbols against the C++ pattern as well.
+      // Weird, but required to match other linkers' behavior.
       if (!cpp_matcher.empty()) {
         if (std::optional<std::string_view> s = cpp_demangle(name))
           name = *s;
-        if (std::optional<u16> ver = cpp_matcher.find(name))
-          sym->ver_idx = *ver;
+        if (std::optional<u32> idx = cpp_matcher.find(name))
+          match = std::min<i64>(match, *idx);
       }
+
+      if (match != INT64_MAX)
+        sym->ver_idx = ctx.version_patterns[match].ver_idx;
     }
   });
 }
@@ -1312,10 +1397,10 @@ void clear_padding(Context<E> &ctx) {
 
 // We want to sort output chunks in the following order.
 //
-//   ELF header
-//   program header
+//   <ELF header>
+//   <program header>
 //   .interp
-//   alloc note
+//   .note
 //   .hash
 //   .gnu.hash
 //   .dynsym
@@ -1324,23 +1409,23 @@ void clear_padding(Context<E> &ctx) {
 //   .gnu.version_r
 //   .rela.dyn
 //   .rela.plt
-//   alloc readonly data
-//   alloc readonly code
-//   alloc writable tdata
-//   alloc writable tbss
-//   alloc writable RELRO data
+//   <readonly data>
+//   <readonly code>
+//   <writable tdata>
+//   <writable tbss>
+//   <writable RELRO data>
 //   .got
 //   .toc
-//   alloc writable RELRO bss
+//   <writable RELRO bss>
 //   .relro_padding
-//   alloc writable non-RELRO data
-//   alloc writable non-RELRO bss
-//   nonalloc
-//   section header
+//   <writable non-RELRO data>
+//   <writable non-RELRO bss>
+//   <non-memory-allocated sections>
+//   <section header>
 //
-// The reason to place .interp and other sections at the beginning of
-// a file is because they are needed by the loader. Especially on a
-// hard drive with spinnning disks, it is important to read these
+// .interp and some other linker-synthesized sections are placed at the
+// beginning of a file because they are needed by loader. Especially on
+// a hard drive with spinnning disks, it is important to read these
 // sections in a single seek.
 //
 // .note sections are also placed at the beginning so that they are
@@ -1363,15 +1448,10 @@ void clear_padding(Context<E> &ctx) {
 // Other file layouts are possible, but this layout is chosen to keep
 // the number of segments as few as possible.
 template <typename E>
-void sort_output_sections(Context<E> &ctx) {
+void sort_output_sections_regular(Context<E> &ctx) {
   auto get_rank1 = [&](Chunk<E> *chunk) {
     u64 type = chunk->shdr.sh_type;
     u64 flags = chunk->shdr.sh_flags;
-
-    if (chunk == ctx.shdr)
-      return INT32_MAX;
-    if (!(flags & SHF_ALLOC))
-      return INT32_MAX - 1;
 
     if (chunk == ctx.ehdr)
       return 0;
@@ -1379,7 +1459,7 @@ void sort_output_sections(Context<E> &ctx) {
       return 1;
     if (chunk == ctx.interp)
       return 2;
-    if (type == SHT_NOTE)
+    if (type == SHT_NOTE && (flags & SHF_ALLOC))
       return 3;
     if (chunk == ctx.hash)
       return 4;
@@ -1397,15 +1477,18 @@ void sort_output_sections(Context<E> &ctx) {
       return 10;
     if (chunk == ctx.relplt)
       return 11;
+    if (chunk == ctx.shdr)
+      return INT32_MAX;
 
+    bool alloc = (flags & SHF_ALLOC);
     bool writable = (flags & SHF_WRITE);
     bool exec = (flags & SHF_EXECINSTR);
     bool tls = (flags & SHF_TLS);
     bool relro = is_relro(ctx, chunk);
     bool is_bss = (type == SHT_NOBITS);
 
-    return (1 << 10) | (writable << 9) | (exec << 8) | (!tls << 7) |
-           (!relro << 6) | (is_bss << 5);
+    return (1 << 10) | (!alloc << 9) | (writable << 8) | (exec << 7) |
+           (!tls << 6) | (!relro << 5) | (is_bss << 4);
   };
 
   auto get_rank2 = [&](Chunk<E> *chunk) -> i64 {
@@ -1431,6 +1514,71 @@ void sort_output_sections(Context<E> &ctx) {
     // Ties are broken by additional rules
     return get_rank2(a) < get_rank2(b);
   });
+}
+
+template <typename E>
+static std::string_view get_section_order_group(Chunk<E> &chunk) {
+  if (chunk.shdr.sh_type == SHT_NOBITS)
+    return "BSS";
+  if (chunk.shdr.sh_flags & SHF_EXECINSTR)
+    return "TEXT";
+  if (chunk.shdr.sh_flags & SHF_WRITE)
+    return "DATA";
+  return "RODATA";
+};
+
+// Sort sections according to a --section-order argument.
+template <typename E>
+void sort_output_sections_by_order(Context<E> &ctx) {
+  auto get_rank = [&](Chunk<E> *chunk) -> i64 {
+    u64 flags = chunk->shdr.sh_flags;
+
+    if (chunk == ctx.ehdr && !(chunk->shdr.sh_flags & SHF_ALLOC))
+      return -2;
+    if (chunk == ctx.phdr && !(chunk->shdr.sh_flags & SHF_ALLOC))
+      return -1;
+
+    if (chunk == ctx.shdr)
+      return INT32_MAX;
+    if (!(flags & SHF_ALLOC))
+      return INT32_MAX - 1;
+
+    for (i64 i = 0; const SectionOrder &arg : ctx.arg.section_order) {
+      if (arg.type == SectionOrder::SECTION && arg.name == chunk->name)
+        return i;
+      i++;
+    }
+
+    std::string_view group = get_section_order_group(*chunk);
+
+    for (i64 i = 0; i < ctx.arg.section_order.size(); i++) {
+      SectionOrder arg = ctx.arg.section_order[i];
+      if (arg.type == SectionOrder::GROUP && arg.name == group)
+        return i;
+    }
+
+    Error(ctx) << "--section-order: missing section specification for "
+               << chunk->name;
+    return 0;
+  };
+
+  // It is an error if a section order cannot be determined by a given
+  // section order list.
+  for (Chunk<E> *chunk : ctx.chunks)
+    chunk->sect_order = get_rank(chunk);
+
+  // Sort output sections by --section-order
+  sort(ctx.chunks, [&](Chunk<E> *a, Chunk<E> *b) {
+    return a->sect_order < b->sect_order;
+  });
+}
+
+template <typename E>
+void sort_output_sections(Context<E> &ctx) {
+  if (ctx.arg.section_order.empty())
+    sort_output_sections_regular(ctx);
+  else
+    sort_output_sections_by_order(ctx);
 }
 
 template <typename E>
@@ -1468,7 +1616,7 @@ static bool is_tbss(Chunk<E> *chunk) {
 //   the executable segment and the first page of the read-only data
 //   segment. This doesn't save memory but saves disk space.
 template <typename E>
-static void set_virtual_addresses(Context<E> &ctx) {
+static void set_virtual_addresses_regular(Context<E> &ctx) {
   constexpr i64 RELRO = 1LL << 32;
 
   auto get_flags = [&](Chunk<E> *chunk) {
@@ -1561,6 +1709,73 @@ static void set_virtual_addresses(Context<E> &ctx) {
   }
 }
 
+template <typename E>
+static void set_virtual_addresses_by_order(Context<E> &ctx) {
+  std::vector<Chunk<E> *> &c = ctx.chunks;
+  u64 addr = ctx.arg.image_base;
+  i64 i = 0;
+
+  while (i < c.size() && !(c[i]->shdr.sh_flags & SHF_ALLOC))
+    i++;
+
+  auto assign_addr = [&] {
+    if (i != 0) {
+      i64 flags1 = to_phdr_flags(ctx, c[i - 1]);
+      i64 flags2 = to_phdr_flags(ctx, c[i]);
+
+      // Memory protection works at page size granularity. We need to
+      // put sections with different memory attributes into different
+      // pages. We do it by inserting paddings here.
+      if (flags1 != flags2) {
+        switch (ctx.arg.z_separate_code) {
+        case SEPARATE_LOADABLE_SEGMENTS:
+          addr = align_to(addr, ctx.page_size);
+          break;
+        case SEPARATE_CODE:
+          if ((flags1 & PF_X) != (flags2 & PF_X))
+            addr = align_to(addr, ctx.page_size);
+          break;
+        default:
+          break;
+        }
+      }
+    }
+
+    addr = align_to(addr, c[i]->shdr.sh_addralign);
+    c[i]->shdr.sh_addr = addr;
+    addr += c[i]->shdr.sh_size;
+
+    do {
+      i++;
+    } while (i < c.size() && !(c[i]->shdr.sh_flags & SHF_ALLOC));
+  };
+
+  for (i64 j = 0; j < ctx.arg.section_order.size(); j++) {
+    SectionOrder &ord = ctx.arg.section_order[j];
+    switch (ord.type) {
+    case SectionOrder::SECTION:
+      if (i < c.size() && j == c[i]->sect_order)
+        assign_addr();
+      break;
+    case SectionOrder::GROUP:
+      while (i < c.size() && j == c[i]->sect_order)
+        assign_addr();
+      break;
+    case SectionOrder::ADDR:
+      addr = ord.value;
+      break;
+    case SectionOrder::ALIGN:
+      addr = align_to(addr, ord.value);
+      break;
+    case SectionOrder::SYMBOL:
+      get_symbol(ctx, ord.name)->value = addr;
+      break;
+    default:
+      unreachable();
+    }
+  }
+}
+
 // Returns the smallest integer N that satisfies N >= val and
 // N mod align == skew mod align.
 //
@@ -1578,8 +1793,17 @@ static i64 set_file_offsets(Context<E> &ctx) {
   u64 fileoff = 0;
   i64 i = 0;
 
-  while (i < chunks.size() && (chunks[i]->shdr.sh_flags & SHF_ALLOC)) {
+  while (i < chunks.size()) {
     Chunk<E> &first = *chunks[i];
+
+    if (!(first.shdr.sh_flags & SHF_ALLOC)) {
+      fileoff = align_to(fileoff, first.shdr.sh_addralign);
+      first.shdr.sh_offset = fileoff;
+      fileoff += first.shdr.sh_size;
+      i++;
+      continue;
+    }
+
     if (first.shdr.sh_type == SHT_NOBITS) {
       i++;
       continue;
@@ -1625,12 +1849,6 @@ static i64 set_file_offsets(Context<E> &ctx) {
       i++;
   }
 
-  // Assign file offsets to non-memory-allocated sections.
-  for (; i < chunks.size(); i++) {
-    fileoff = align_to(fileoff, chunks[i]->shdr.sh_addralign);
-    chunks[i]->shdr.sh_offset = fileoff;
-    fileoff += chunks[i]->shdr.sh_size;
-  }
   return fileoff;
 }
 
@@ -1640,7 +1858,11 @@ i64 set_osec_offsets(Context<E> &ctx) {
   Timer t(ctx, "set_osec_offsets");
 
   for (;;) {
-    set_virtual_addresses(ctx);
+    if (ctx.arg.section_order.empty())
+      set_virtual_addresses_regular(ctx);
+    else
+      set_virtual_addresses_by_order(ctx);
+
     i64 fileoff = set_file_offsets(ctx);
 
     // Assigning new offsets may change the contents and the length
@@ -1663,6 +1885,15 @@ static i64 get_num_irelative_relocs(Context<E> &ctx) {
 }
 
 template <typename E>
+static u64 to_paddr(Context<E> &ctx, u64 vaddr) {
+  for (ElfPhdr<E> &phdr : ctx.phdr->phdrs)
+    if (phdr.p_type == PT_LOAD)
+      if (phdr.p_vaddr <= vaddr && vaddr < phdr.p_vaddr + phdr.p_memsz)
+        return phdr.p_paddr + (vaddr - phdr.p_vaddr);
+  return 0;
+}
+
+template <typename E>
 void fix_synthetic_symbols(Context<E> &ctx) {
   auto start = [](Symbol<E> *sym, auto &chunk, i64 bias = 0) {
     if (sym && chunk) {
@@ -1678,13 +1909,13 @@ void fix_synthetic_symbols(Context<E> &ctx) {
     }
   };
 
-  std::vector<Chunk<E> *> output_sections;
+  std::vector<Chunk<E> *> sections;
   for (Chunk<E> *chunk : ctx.chunks)
-    if (chunk->kind() != HEADER)
-      output_sections.push_back(chunk);
+    if (chunk->kind() != HEADER && (chunk->shdr.sh_flags & SHF_ALLOC))
+      sections.push_back(chunk);
 
   auto find = [&](std::string name) -> Chunk<E> * {
-    for (Chunk<E> *chunk : output_sections)
+    for (Chunk<E> *chunk : sections)
       if (chunk->name == name)
         return chunk;
     return nullptr;
@@ -1694,16 +1925,16 @@ void fix_synthetic_symbols(Context<E> &ctx) {
   if (Chunk<E> *chunk = find(".bss"))
     start(ctx.__bss_start, chunk);
 
-  if (ctx.ehdr) {
-    ctx.__ehdr_start->set_output_section(output_sections[0]);
+  if (ctx.ehdr && (ctx.ehdr->shdr.sh_flags & SHF_ALLOC)) {
+    ctx.__ehdr_start->set_output_section(sections[0]);
     ctx.__ehdr_start->value = ctx.ehdr->shdr.sh_addr;
-    ctx.__executable_start->set_output_section(output_sections[0]);
+    ctx.__executable_start->set_output_section(sections[0]);
     ctx.__executable_start->value = ctx.ehdr->shdr.sh_addr;
+  }
 
-    if (ctx.__dso_handle) {
-      ctx.__dso_handle->set_output_section(output_sections[0]);
-      ctx.__dso_handle->value = ctx.ehdr->shdr.sh_addr;
-    }
+  if (ctx.__dso_handle) {
+    ctx.__dso_handle->set_output_section(sections[0]);
+    ctx.__dso_handle->value = sections[0]->shdr.sh_addr;
   }
 
   // __rel_iplt_start and __rel_iplt_end. These symbols need to be
@@ -1725,7 +1956,7 @@ void fix_synthetic_symbols(Context<E> &ctx) {
   }
 
   // __{init,fini}_array_{start,end}
-  for (Chunk<E> *chunk : output_sections) {
+  for (Chunk<E> *chunk : sections) {
     switch (chunk->shdr.sh_type) {
     case SHT_INIT_ARRAY:
       start(ctx.__init_array_start, chunk);
@@ -1743,7 +1974,7 @@ void fix_synthetic_symbols(Context<E> &ctx) {
   }
 
   // _end, _etext, _edata and the like
-  for (Chunk<E> *chunk : output_sections) {
+  for (Chunk<E> *chunk : sections) {
     if (chunk->shdr.sh_flags & SHF_ALLOC) {
       stop(ctx._end, chunk);
       stop(ctx.end, chunk);
@@ -1780,7 +2011,7 @@ void fix_synthetic_symbols(Context<E> &ctx) {
   // create a reference to it, but Intel compiler seems to be using
   // this symbol.
   if (ctx._TLS_MODULE_BASE_) {
-    ctx._TLS_MODULE_BASE_->set_output_section(output_sections[0]);
+    ctx._TLS_MODULE_BASE_->set_output_section(sections[0]);
     ctx._TLS_MODULE_BASE_->value = ctx.tls_begin;
   }
 
@@ -1792,7 +2023,7 @@ void fix_synthetic_symbols(Context<E> &ctx) {
     if (Chunk<E> *chunk = find(".sdata")) {
       start(ctx.__global_pointer, chunk, 0x800);
     } else {
-      ctx.__global_pointer->set_output_section(output_sections[0]);
+      ctx.__global_pointer->set_output_section(sections[0]);
       ctx.__global_pointer->value = 0;
     }
   }
@@ -1812,21 +2043,28 @@ void fix_synthetic_symbols(Context<E> &ctx) {
     } else if (Chunk<E> *chunk = find(".toc")) {
       start(ctx.TOC, chunk, 0x8000);
     } else {
-      ctx.TOC->set_output_section(output_sections[0]);
+      ctx.TOC->set_output_section(sections[0]);
       ctx.TOC->value = 0;
     }
   }
 
   // __start_ and __stop_ symbols
-  for (Chunk<E> *chunk : output_sections) {
-    if (is_c_identifier(chunk->name)) {
-      std::string_view sym1 =
-        save_string(ctx, "__start_" + std::string(chunk->name));
-      std::string_view sym2 =
-        save_string(ctx, "__stop_" + std::string(chunk->name));
+  for (Chunk<E> *chunk : sections) {
+    if (std::optional<std::string> name = get_start_stop_name(ctx, *chunk)) {
+      start(get_symbol(ctx, save_string(ctx, "__start_" + *name)), chunk);
+      stop(get_symbol(ctx, save_string(ctx, "__stop_" + *name)), chunk);
 
-      start(get_symbol(ctx, sym1), chunk);
-      stop(get_symbol(ctx, sym2), chunk);
+      if (ctx.arg.physical_image_base) {
+        u64 paddr = to_paddr(ctx, chunk->shdr.sh_addr);
+
+        Symbol<E> *x = get_symbol(ctx, save_string(ctx, "__phys_start_" + *name));
+        x->set_output_section(chunk);
+        x->value = paddr;
+
+        Symbol<E> *y = get_symbol(ctx, save_string(ctx, "__phys_stop_" + *name));
+        y->set_output_section(chunk);
+        y->value = paddr + chunk->shdr.sh_size;
+      }
     }
   }
 
@@ -1851,6 +2089,12 @@ void fix_synthetic_symbols(Context<E> &ctx) {
     sym->origin = sym2->origin;
     sym->visibility = sym2->visibility.load();
   }
+
+
+  // --section-order symbols
+  for (SectionOrder &ord : ctx.arg.section_order)
+    if (ord.type == SectionOrder::SYMBOL)
+      get_symbol(ctx, ord.name)->set_output_section(sections[0]);
 }
 
 template <typename E>

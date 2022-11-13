@@ -1,5 +1,3 @@
-cmake_minimum_required(VERSION 3.9)
-
 # Get a git hash value. We do not want to use git command here
 # because we don't want to make git a build-time dependency.
 if(EXISTS "${SOURCE_DIR}/.git/HEAD")
@@ -7,8 +5,14 @@ if(EXISTS "${SOURCE_DIR}/.git/HEAD")
   string(STRIP "${HASH}" HASH)
 
   if(HASH MATCHES "^ref: (.*)")
-    file(READ "${SOURCE_DIR}/.git/${CMAKE_MATCH_1}" HASH)
-    string(STRIP "${HASH}" HASH)
+    set(HEAD "${CMAKE_MATCH_1}")
+    if(EXISTS "${SOURCE_DIR}/.git/${HEAD}")
+      file(READ "${SOURCE_DIR}/.git/${HEAD}" HASH)
+      string(STRIP "${HASH}" HASH)
+    else()
+      file(READ "${SOURCE_DIR}/.git/packed-refs" PACKED_REFS)
+      string(REGEX REPLACE ".*\n([0-9a-f]+) ${HEAD}\n.*" "\\1" HASH "\n${PACKED_REFS}")
+    endif()
   endif()
 endif()
 

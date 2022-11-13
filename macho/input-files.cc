@@ -12,10 +12,19 @@ std::ostream &operator<<(std::ostream &out, const InputFile<E> &file) {
   return out;
 }
 
+// This function is actually racy, in that "tearing" might be observed
+// during the read or write of `sym->file`. However, on most platforms
+// read/write of pointers never tears, and even if it did, it would be
+// harmless, as `sym->file` will not become equal to `sym`, or even if
+// it did by chance, we just wipe a symbol twice.
+//
+// Doing this in a standard-compliant way is too cumbersome, hence
+// here we just pretend a compiler will never optimize this into a
+// form that actually exploits the UB.
 template <typename E>
+__attribute__((no_sanitize("thread")))
 void InputFile<E>::clear_symbols() {
   for (Symbol<E> *sym : syms) {
-    std::scoped_lock lock(sym->mu);
     if (sym->file == this) {
       sym->file = nullptr;
       sym->scope = SCOPE_LOCAL;
@@ -409,11 +418,18 @@ LoadCommand *ObjectFile<E>::find_load_command(Context<E> &ctx, u32 type) {
 template <typename E>
 Subsection<E> *
 ObjectFile<E>::find_subsection(Context<E> &ctx, u32 secidx, u32 addr) {
-  Subsection<E> *ret = nullptr;
-  for (Subsection<E> *subsec : subsections)
-    if (subsec->isec.secidx == secidx && subsec->input_addr <= addr)
-      ret = subsec;
-  return ret;
+  assert(subsections.size() > 0);
+  auto begin = subsections.begin();
+  auto end = subsections.end();
+  auto upper = std::upper_bound(begin, end, addr,
+      [](u32 addr, Subsection<E> *subsec) { return addr < subsec->input_addr; });
+
+  if (upper == begin)
+    return nullptr;
+  Subsection<E> *subsec = *(upper - 1);
+  if (subsec->isec.secidx == secidx)
+    return subsec;
+  return nullptr;
 }
 
 template <typename E>
@@ -658,7 +674,7 @@ ObjectFile<E>::mark_live_objects(Context<E> &ctx,
 
     if (msym.is_undef() || (msym.is_common() && !sym.is_common))
       if (InputFile<E> *file = sym.file)
-        if (!file->is_alive.exchange(true) && !file->is_dylib)
+        if (fast_mark(file->is_alive) && !file->is_dylib)
           feeder((ObjectFile<E> *)file);
   }
 
@@ -666,7 +682,7 @@ ObjectFile<E>::mark_live_objects(Context<E> &ctx,
     for (UnwindRecord<E> &rec : subsec->get_unwind_records())
       if (Symbol<E> *sym = rec.personality)
         if (InputFile<E> *file = sym->file)
-          if (!file->is_alive.exchange(true) && !file->is_dylib)
+          if (fast_mark(file->is_alive) && !file->is_dylib)
             feeder((ObjectFile<E> *)file);
 }
 

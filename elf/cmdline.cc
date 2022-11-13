@@ -81,11 +81,11 @@ Options:
     --no-demangle
   --enable-new-dtags          Emit DT_RUNPATH for --rpath (default)
     --disable-new-dtags       Emit DT_RPATH for --rpath
+  --execute-only              Make executable segments unreadable
   --dp                        Ignored
   --dynamic-list              Read a list of dynamic symbols (implies -Bsymbolic)
   --eh-frame-hdr              Create .eh_frame_hdr section
     --no-eh-frame-hdr
-  --enable-new-dtags          Ignored
   --exclude-libs LIB,LIB,..   Mark all symbols in given libraries hidden
   --export-dynamic-symbol     Put symbols matching glob in the dynamic symbol table
   --export-dynamic-symbol-list
@@ -183,6 +183,7 @@ Options:
   -z nodump                   Mark DSO not available to dldump
   -z now                      Disable lazy function resolution
   -z origin                   Mark object requiring immediate $ORIGIN processing at runtime
+  -z pack-relative-relocs     Alias for --pack-dyn-relocs=relr
   -z separate-loadable-segments
                               Separate all loadable segments to different pages
     -z separate-code          Separate code and data into different pages
@@ -193,8 +194,8 @@ Options:
     -z notext
     -z textoff
 
-mold: supported targets: elf32-i386 elf64-x86-64 elf32-littlearm elf64-littleaarch64 elf32-littleriscv elf32-bigriscv elf64-littleriscv elf64-bigriscv elf64-powerpc elf64-powerpc elf64-powerpcle elf64-s390 elf64-sparc
-mold: supported emulations: elf_i386 elf_x86_64 armelf_linux_eabi aarch64linux aarch64elf elf32lriscv elf32briscv elf64lriscv elf64briscv elf64_s390 elf64_sparc)";
+mold: supported targets: elf32-i386 elf64-x86-64 elf32-littlearm elf64-littleaarch64 elf32-littleriscv elf32-bigriscv elf64-littleriscv elf64-bigriscv elf64-powerpc elf64-powerpc elf64-powerpcle elf64-s390 elf64-sparc elf32-m68k
+mold: supported emulations: elf_i386 elf_x86_64 armelf_linux_eabi aarch64linux aarch64elf elf32lriscv elf32briscv elf64lriscv elf64briscv elf64ppc elf64lppc elf64_s390 elf64_sparc m68kelf)";
 
 static std::vector<std::string> add_dashes(std::string name) {
   // Single-letter option
@@ -314,6 +315,63 @@ static bool is_file(std::string_view path) {
 }
 
 template <typename E>
+static std::vector<SectionOrder>
+parse_section_order(Context<E> &ctx, std::string_view arg) {
+  auto flags = std::regex_constants::ECMAScript | std::regex_constants::icase |
+               std::regex_constants::optimize;
+  static std::regex re1(R"(^\s*(TEXT|DATA|RODATA|BSS)(?:\s|$))", flags);
+  static std::regex re2(R"(^\s*([a-zA-Z0-9_.][^\s]*|EHDR|PHDR)(?:\s|$))", flags);
+  static std::regex re3(R"(^\s*=(0x[0-9a-f]+|\d+)(?:\s|$))", flags);
+  static std::regex re4(R"(^\s*%(0x[0-9a-f]+|\d*)(?:\s|$))", flags);
+  static std::regex re5(R"(^\s*!(\S+)(?:\s|$))", flags);
+
+  std::vector<SectionOrder> vec;
+  arg = string_trim(arg);
+
+  while (!arg.empty()) {
+    SectionOrder ord;
+    std::cmatch m;
+
+    if (std::regex_search(arg.data(), arg.data() + arg.size(), m, re1)) {
+      ord.type = SectionOrder::GROUP;
+      ord.name = m[1].str();
+    } else if (std::regex_search(arg.data(), arg.data() + arg.size(), m, re2)) {
+      ord.type = SectionOrder::SECTION;
+      ord.name = m[1].str();
+    } else if (std::regex_search(arg.data(), arg.data() + arg.size(), m, re3)) {
+      ord.type = SectionOrder::ADDR;
+      std::string s = m[1];
+      ord.value = std::stoull(s, nullptr, s.starts_with("0x") ? 16 : 10);
+    } else if (std::regex_search(arg.data(), arg.data() + arg.size(), m, re4)) {
+      ord.type = SectionOrder::ALIGN;
+      std::string s = m[1];
+      ord.value = std::stoull(s, nullptr, s.starts_with("0x") ? 16 : 10);
+    } else if (std::regex_search(arg.data(), arg.data() + arg.size(), m, re5)) {
+      ord.type = SectionOrder::SYMBOL;
+      ord.name = m[1].str();
+    } else {
+      Fatal(ctx) << "--section-order: parse error: " << arg;
+    }
+
+    vec.push_back(ord);
+    arg = arg.substr(m[0].length());
+  }
+
+  bool is_first = true;
+  for (SectionOrder &ord : vec) {
+    if (ord.type == SectionOrder::SECTION) {
+      if (is_first) {
+        is_first = false;
+      } else if (ord.name == "EHDR")
+        Fatal(ctx) << "--section-order: EHDR must be the first "
+                   << "section specifier: " << arg;
+    }
+  }
+
+  return vec;
+}
+
+template <typename E>
 static std::variant<Symbol<E> *, u64>
 parse_defsym_value(Context<E> &ctx, std::string_view s) {
   if (s.starts_with("0x") || s.starts_with("0X")) {
@@ -342,6 +400,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
 
   bool version_shown = false;
   bool warn_shared_textrel = false;
+  std::optional<SeparateCodeKind> z_separate_code;
+  std::optional<bool> z_relro;
 
   // RISC-V object files contains lots of local symbols, so by default
   // we discard them. This is compatible with GNU ld.
@@ -447,7 +507,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
                    << "\n  Supported emulations:\n   elf_x86_64\n   elf_i386\n"
                    << "   aarch64linux\n   armelf_linux_eabi\n   elf64lriscv\n"
                    << "   elf64briscv\n   elf32lriscv\n   elf32briscv\n"
-                   << "   elf64ppc\n   elf64lppc\n   elf64_s390\n   elf64_sparc";
+                   << "   elf64ppc\n   elf64lppc\n   elf64_s390\n   elf64_sparc\n"
+                   << "   m68kelf";
       version_shown = true;
     } else if (read_arg("m")) {
       if (arg == "elf_x86_64") {
@@ -474,6 +535,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
         ctx.arg.emulation = MachineType::S390X;
       } else if (arg == "elf64_sparc") {
         ctx.arg.emulation = MachineType::SPARC64;
+      } else if (arg == "m68kelf") {
+        ctx.arg.emulation = MachineType::M68K;
       } else {
         Fatal(ctx) << "unknown -m argument: " << arg;
       }
@@ -517,6 +580,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.spare_dynamic_tags = parse_number(ctx, "spare-dynamic-tags", arg);
     } else if (read_flag("start-lib")) {
       remaining.push_back("--start-lib");
+    } else if (read_flag("start-stop")) {
+      ctx.arg.start_stop = true;
     } else if (read_arg("dependency-file")) {
       ctx.arg.dependency_file = arg;
     } else if (read_arg("defsym")) {
@@ -656,6 +721,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.enable_new_dtags = true;
     } else if (read_flag("disable-new-dtags")) {
       ctx.arg.enable_new_dtags = false;
+    } else if (read_flag("execute-only")) {
+      ctx.arg.execute_only = true;
     } else if (read_arg("compress-debug-sections")) {
       if (arg == "zlib" || arg == "zlib-gabi")
         ctx.arg.compress_debug_sections = COMPRESS_ZLIB;
@@ -678,12 +745,22 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.oformat_binary = true;
     } else if (read_arg("retain-symbols-file")) {
       read_retain_symbols_file(ctx, arg);
+    } else if (read_arg("section-align")) {
+      size_t pos = arg.find('=');
+      if (pos == arg.npos || pos == arg.size() - 1)
+        Fatal(ctx) << "--section-align: syntax error: " << arg;
+      i64 value = parse_number(ctx, "section-align", arg.substr(pos + 1));
+      if (!has_single_bit(value))
+        Fatal(ctx) << "--section-align=" << arg << ": value must be a power of 2";
+      ctx.arg.section_align[arg.substr(0, pos)] = value;
     } else if (read_arg("section-start")) {
       size_t pos = arg.find('=');
       if (pos == arg.npos || pos == arg.size() - 1)
-        Fatal(ctx) << "-section-start: syntax error: " << arg;
+        Fatal(ctx) << "--section-start: syntax error: " << arg;
       ctx.arg.section_start[arg.substr(0, pos)] =
         parse_hex(ctx, "section-start", arg.substr(pos + 1));
+    } else if (read_arg("section-order")) {
+      ctx.arg.section_order = parse_section_order(ctx, arg);
     } else if (read_arg("Tbss")) {
       ctx.arg.section_start[".bss"] = parse_hex(ctx, "Tbss", arg);
     } else if (read_arg("Tdata")) {
@@ -713,9 +790,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_z_flag("noexecstack")) {
       ctx.arg.z_execstack = false;
     } else if (read_z_flag("relro")) {
-      ctx.arg.z_relro = true;
+      z_relro = true;
     } else if (read_z_flag("norelro")) {
-      ctx.arg.z_relro = false;
+      z_relro = false;
     } else if (read_z_flag("defs")) {
       ctx.arg.z_defs = true;
     } else if (read_z_flag("nodefs")) {
@@ -751,12 +828,14 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.z_origin = true;
     } else if (read_z_flag("nodefaultlib")) {
       ctx.arg.z_nodefaultlib = true;
+    } else if (read_z_flag("pack-relative-relocs")) {
+      ctx.arg.pack_dyn_relocs_relr = true;
     } else if (read_z_flag("separate-loadable-segments")) {
-      ctx.arg.z_separate_code = SEPARATE_LOADABLE_SEGMENTS;
+      z_separate_code = SEPARATE_LOADABLE_SEGMENTS;
     } else if (read_z_flag("separate-code")) {
-      ctx.arg.z_separate_code = SEPARATE_CODE;
+      z_separate_code = SEPARATE_CODE;
     } else if (read_z_flag("noseparate-code")) {
-      ctx.arg.z_separate_code = NOSEPARATE_CODE;
+      z_separate_code = NOSEPARATE_CODE;
     } else if (read_flag("no-undefined")) {
       ctx.arg.z_defs = true;
     } else if (read_flag("fatal-warnings")) {
@@ -792,6 +871,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.ignore_data_address_equality = true;
     } else if (read_arg("image-base")) {
       ctx.arg.image_base = parse_number(ctx, "image-base", arg);
+    } else if (read_arg("physical-image-base")) {
+      ctx.arg.physical_image_base = parse_number(ctx, "physical-image-base", arg);
     } else if (read_flag("print-icf-sections")) {
       ctx.arg.print_icf_sections = true;
     } else if (read_flag("no-print-icf-sections")) {
@@ -1050,6 +1131,18 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if (ctx.arg.relocatable)
     ctx.arg.is_static = true;
 
+  // --section-order implies `-z separate-loadable-segments`
+  if (z_separate_code)
+    ctx.arg.z_separate_code = *z_separate_code;
+  else if (!ctx.arg.section_order.empty())
+    ctx.arg.z_separate_code = SEPARATE_LOADABLE_SEGMENTS;
+
+  // --section-order implies `-z norelro`
+  if (z_relro)
+    ctx.arg.z_relro = *z_relro;
+  else if (!ctx.arg.section_order.empty())
+    ctx.arg.z_relro = false;
+
   if (!ctx.arg.shared) {
     if (!ctx.arg.filter.empty())
       Fatal(ctx) << "-filter may not be used without -shared";
@@ -1064,11 +1157,14 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if (is_sparc<E> && ctx.arg.apply_dynamic_relocs)
     Fatal(ctx) << "--apply-dynamic-relocs may not be used on SPARC64";
 
-  if (ctx.arg.thread_count == 0)
-    ctx.arg.thread_count = get_default_thread_count();
+  if (!ctx.arg.section_start.empty() && !ctx.arg.section_order.empty())
+    Fatal(ctx) << "--section-start may not be used with --section-order";
 
   if (ctx.arg.image_base % ctx.page_size)
     Fatal(ctx) << "-image-base must be a multiple of -max-page-size";
+
+  if (ctx.arg.thread_count == 0)
+    ctx.arg.thread_count = get_default_thread_count();
 
   if (char *env = getenv("MOLD_REPRO"); env && env[0])
     ctx.arg.repro = true;
@@ -1089,6 +1185,12 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     ctx.arg.warn_textrel = true;
 
   ctx.arg.undefined.push_back(ctx.arg.entry);
+
+  // --oformat=binary implies --strip-all because without a section
+  // header, there's no way to identify the locations of a symbol
+  // table in an output file in the first place.
+  if (ctx.arg.oformat_binary)
+    ctx.arg.strip_all = true;
 
   // By default, mold tries to ovewrite to an output file if exists
   // because at least on Linux, writing to an existing file is much

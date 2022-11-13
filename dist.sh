@@ -8,19 +8,16 @@
 # and librt, as they almost always exist on any Linux systems.
 
 if [ $# -ne 1 ]; then
-  echo "Usage: $0 [ x86_64 | aarch64 ]"
+  echo "Usage: $0 [ x86_64 | aarch64 | arm | ppc64le | s390x ]"
   exit 1
 fi
 
 arch=$1
-if [ $arch != x86_64 -a $arch != aarch64 ]; then
-  echo "Error: no docker image for $arch"
-  exit 1
-fi
+echo $arch | grep -Eq '^(x86_64|aarch64|arm|ppc64le|s390x)$' || \
+  { echo "Error: no docker image for $arch"; exit 1; }
 
-version=$(grep '^VERSION =' $(dirname $0)/Makefile | sed 's/.* = //')
+version=$(sed -n 's/^project(mold VERSION \(.*\))/\1/p' $(dirname $0)/CMakeLists.txt)
 dest=mold-$version-$arch-linux
-
 set -e -x
 
 docker run --platform linux/$arch -it --rm -v "$(pwd):/mold" \
@@ -29,6 +26,7 @@ docker run --platform linux/$arch -it --rm -v "$(pwd):/mold" \
 cd /tmp/build &&
 cmake -DCMAKE_C_COMPILER=gcc-10 -DCMAKE_CXX_COMPILER=g++-10 -DMOLD_MOSTLY_STATIC=On -DCMAKE_BUILD_TYPE=Release /mold &&
 cmake --build . -j\$(nproc) &&
+[ $arch = arm ] || ctest -j\$(nproc) &&
 cmake --install . --prefix $dest --strip &&
 tar czf /mold/$dest.tar.gz $dest &&
 cp mold mold-wrapper.so /mold &&

@@ -220,16 +220,29 @@ inline i64 sign_extend(u64 val, i64 size) {
 
 template <typename T, typename Compare = std::less<T>>
 void update_minimum(std::atomic<T> &atomic, u64 new_val, Compare cmp = {}) {
-  T old_val = atomic;
+  T old_val = atomic.load(std::memory_order_relaxed);
   while (cmp(new_val, old_val) &&
-         !atomic.compare_exchange_weak(old_val, new_val));
+         !atomic.compare_exchange_weak(old_val, new_val,
+                                       std::memory_order_relaxed));
 }
 
 template <typename T, typename Compare = std::less<T>>
 void update_maximum(std::atomic<T> &atomic, u64 new_val, Compare cmp = {}) {
-  T old_val = atomic;
+  T old_val = atomic.load(std::memory_order_relaxed);
   while (cmp(old_val, new_val) &&
-         !atomic.compare_exchange_weak(old_val, new_val));
+         !atomic.compare_exchange_weak(old_val, new_val,
+                                       std::memory_order_relaxed));
+}
+
+// An optimized "mark" operation for parallel mark-and-sweep algorithms.
+// Returns true if `visited` was false and updated to true.
+inline bool fast_mark(std::atomic<bool> &visited) {
+  // A relaxed load + branch (assuming miss) takes only around 20 cycles,
+  // while an atomic RMW can easily take hundreds on x86. We note that it's
+  // common that another thread beat us in marking, so doing an optimistic
+  // early test tends to improve performance in the ~20% ballpark.
+  return !visited.load(std::memory_order_relaxed) &&
+         !visited.exchange(true, std::memory_order_relaxed);
 }
 
 template <typename T, typename U>
@@ -554,7 +567,6 @@ private:
   std::vector<std::string> strings;
   std::unique_ptr<TrieNode> root;
   std::vector<std::pair<Glob, u32>> globs;
-  std::vector<u32> values;
   std::once_flag once;
   bool is_compiled = false;
 };
