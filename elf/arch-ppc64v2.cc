@@ -59,17 +59,6 @@ namespace mold::elf {
 
 using E = PPC64V2;
 
-// As a special case, we do not create copy relocations nor canonical
-// PLTs for .toc sections. PPC64's .toc is a compiler-generated
-// GOT-like section, and no user-generated code directly uses values
-// in it.
-static constexpr ScanAction toc_table[3][4] = {
-  // Absolute  Local    Imported data  Imported code
-  {  NONE,     BASEREL, DYNREL,        DYNREL },  // Shared object
-  {  NONE,     BASEREL, DYNREL,        DYNREL },  // Position-independent exec
-  {  NONE,     NONE,    DYNREL,        DYNREL },  // Position-dependent exec
-};
-
 static u64 lo(u64 x)       { return x & 0xffff; }
 static u64 hi(u64 x)       { return x >> 16; }
 static u64 ha(u64 x)       { return (x + 0x8000) >> 16; }
@@ -190,9 +179,9 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     switch (rel.r_type) {
     case R_PPC64_ADDR64:
       if (name() == ".toc")
-        apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, dynrel, toc_table);
+        apply_toc_rel(ctx, sym, rel, loc, S, A, P, dynrel);
       else
-        apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, dynrel, dyn_absrel_table);
+        apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, dynrel);
       break;
     case R_PPC64_TOC16_HA:
       *(ul16 *)loc = ha(S + A - ctx.TOC->value);
@@ -261,13 +250,13 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul16 *)loc = ctx.got->get_tlsld_addr(ctx) - ctx.TOC->value;
       break;
     case R_PPC64_DTPREL16_HA:
-      *(ul16 *)loc = ha(S + A - ctx.tls_begin - E::tls_dtp_offset);
+      *(ul16 *)loc = ha(S + A - ctx.dtp_addr);
       break;
     case R_PPC64_TPREL16_HA:
       *(ul16 *)loc = ha(S + A - ctx.tp_addr);
       break;
     case R_PPC64_DTPREL16_LO:
-      *(ul16 *)loc = S + A - ctx.tls_begin - E::tls_dtp_offset;
+      *(ul16 *)loc = S + A - ctx.dtp_addr;
       break;
     case R_PPC64_TPREL16_LO:
       *(ul16 *)loc = S + A - ctx.tp_addr;
@@ -338,7 +327,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       break;
     }
     case R_PPC64_DTPREL64:
-      *(ul64 *)loc = S + A - ctx.tls_begin - E::tls_dtp_offset;
+      *(ul64 *)loc = S + A - ctx.dtp_addr;
       break;
     default:
       Fatal(ctx) << *this << ": apply_reloc_nonalloc: " << rel;
@@ -370,30 +359,30 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     }
 
     if (sym.is_ifunc())
-      sym.flags |= (NEEDS_GOT | NEEDS_PLT);
+      sym.flags.fetch_or(NEEDS_GOT | NEEDS_PLT, std::memory_order_relaxed);
 
     switch (rel.r_type) {
     case R_PPC64_ADDR64:
       if (name() == ".toc")
-        scan_rel(ctx, sym, rel, toc_table);
+        scan_toc_rel(ctx, sym, rel);
       else
-        scan_rel(ctx, sym, rel, dyn_absrel_table);
+        scan_dyn_absrel(ctx, sym, rel);
       break;
     case R_PPC64_GOT_TPREL16_HA:
-      sym.flags |= NEEDS_GOTTP;
+      sym.flags.fetch_or(NEEDS_GOTTP, std::memory_order_relaxed);
       break;
     case R_PPC64_REL24:
       if (sym.is_imported)
-        sym.flags |= NEEDS_PLT;
+        sym.flags.fetch_or(NEEDS_PLT, std::memory_order_relaxed);
       break;
     case R_PPC64_PLT16_HA:
-      sym.flags |= NEEDS_GOT;
+      sym.flags.fetch_or(NEEDS_GOT, std::memory_order_relaxed);
       break;
     case R_PPC64_GOT_TLSGD16_HA:
-      sym.flags |= NEEDS_TLSGD;
+      sym.flags.fetch_or(NEEDS_TLSGD, std::memory_order_relaxed);
       break;
     case R_PPC64_GOT_TLSLD16_HA:
-      ctx.needs_tlsld = true;
+      ctx.needs_tlsld.store(true, std::memory_order_relaxed);
       break;
     case R_PPC64_REL64:
     case R_PPC64_TOC16_HA:

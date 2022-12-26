@@ -61,6 +61,8 @@ void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
   u8 *loc = ctx.buf + this->shdr.sh_offset + offset;
 
   switch (rel.r_type) {
+  case R_NONE:
+    break;
   case R_68K_32:
     *(ub32 *)loc = val;
     break;
@@ -181,13 +183,13 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       write8(ctx.got->get_tlsld_addr(ctx) + A - GOT);
       break;
     case R_68K_TLS_LDO32:
-      *(ub32 *)loc = S + A - ctx.tls_begin - E::tls_dtp_offset;
+      *(ub32 *)loc = S + A - ctx.dtp_addr;
       break;
     case R_68K_TLS_LDO16:
-      write16s(S + A - ctx.tls_begin - E::tls_dtp_offset);
+      write16s(S + A - ctx.dtp_addr);
       break;
     case R_68K_TLS_LDO8:
-      write8s(S + A - ctx.tls_begin - E::tls_dtp_offset);
+      write8s(S + A - ctx.dtp_addr);
       break;
     case R_68K_TLS_IE32:
       *(ub32 *)loc = sym.get_gottp_addr(ctx) + A - GOT;
@@ -284,16 +286,16 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 
     switch (rel.r_type) {
     case R_68K_32:
-      scan_rel(ctx, sym, rel, dyn_absrel_table);
+      scan_dyn_absrel(ctx, sym, rel);
       break;
     case R_68K_16:
     case R_68K_8:
-      scan_rel(ctx, sym, rel, absrel_table);
+      scan_absrel(ctx, sym, rel);
       break;
     case R_68K_PC32:
     case R_68K_PC16:
     case R_68K_PC8:
-      scan_rel(ctx, sym, rel, pcrel_table);
+      scan_pcrel(ctx, sym, rel);
       break;
     case R_68K_GOTPCREL32:
     case R_68K_GOTPCREL16:
@@ -301,28 +303,28 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_68K_GOTOFF32:
     case R_68K_GOTOFF16:
     case R_68K_GOTOFF8:
-      sym.flags |= NEEDS_GOT;
+      sym.flags.fetch_or(NEEDS_GOT, std::memory_order_relaxed);
       break;
     case R_68K_PLT32:
     case R_68K_PLT16:
     case R_68K_PLT8:
       if (sym.is_imported)
-        sym.flags |= NEEDS_PLT;
+        sym.flags.fetch_or(NEEDS_PLT, std::memory_order_relaxed);
       break;
     case R_68K_TLS_GD32:
     case R_68K_TLS_GD16:
     case R_68K_TLS_GD8:
-      sym.flags |= NEEDS_TLSGD;
+      sym.flags.fetch_or(NEEDS_TLSGD, std::memory_order_relaxed);
       break;
     case R_68K_TLS_LDM32:
     case R_68K_TLS_LDM16:
     case R_68K_TLS_LDM8:
-      ctx.needs_tlsld = true;
+      ctx.needs_tlsld.store(true, std::memory_order_relaxed);
       break;
     case R_68K_TLS_IE32:
     case R_68K_TLS_IE16:
     case R_68K_TLS_IE8:
-      sym.flags |= NEEDS_GOTTP;
+      sym.flags.fetch_or(NEEDS_GOTTP, std::memory_order_relaxed);
       break;
     case R_68K_TLS_LDO32:
     case R_68K_TLS_LDO16:

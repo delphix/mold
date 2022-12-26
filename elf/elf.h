@@ -75,6 +75,7 @@ std::ostream &operator<<(std::ostream &out, const ElfRel<E> &rel) {
 static constexpr u32 SHN_UNDEF = 0;
 static constexpr u32 SHN_ABS = 0xfff1;
 static constexpr u32 SHN_COMMON = 0xfff2;
+static constexpr u32 SHN_LORESERVE = 0xff00;
 static constexpr u32 SHN_XINDEX = 0xffff;
 
 static constexpr u32 SHT_NULL = 0;
@@ -128,6 +129,21 @@ static constexpr u32 STT_COMMON = 5;
 static constexpr u32 STT_TLS = 6;
 static constexpr u32 STT_GNU_IFUNC = 10;
 static constexpr u32 STT_SPARC_REGISTER = 13;
+
+inline std::string stt_to_string(u32 st_type) {
+  switch (st_type) {
+  case STT_NOTYPE:         return "STT_NOTYPE";
+  case STT_OBJECT:         return "STT_OBJECT";
+  case STT_FUNC:           return "STT_FUNC";
+  case STT_SECTION:        return "STT_SECTION";
+  case STT_FILE:           return "STT_FILE";
+  case STT_COMMON:         return "STT_COMMON";
+  case STT_TLS:            return "STT_TLS";
+  case STT_GNU_IFUNC:      return "STT_GNU_IFUNC";
+  case STT_SPARC_REGISTER: return "STT_SPARC_REGISTER";
+  default:                 return "unknown st_type (" + std::to_string(st_type) + ")";
+  }
+}
 
 static constexpr u32 STB_LOCAL = 0;
 static constexpr u32 STB_GLOBAL = 1;
@@ -271,11 +287,18 @@ static constexpr u32 NT_GNU_GOLD_VERSION = 4;
 static constexpr u32 NT_GNU_PROPERTY_TYPE_0 = 5;
 static constexpr u32 NT_FDO_PACKAGING_METADATA = 0xcafe1a7e;
 
-static constexpr u32 GNU_PROPERTY_AARCH64_FEATURE_1_AND = 0xc0000000;
-static constexpr u32 GNU_PROPERTY_X86_FEATURE_1_AND = 0xc0000002;
+static constexpr u32 GNU_PROPERTY_X86_UINT32_AND_LO = 0xc0000002;
+static constexpr u32 GNU_PROPERTY_X86_UINT32_AND_HI = 0xc0007fff;
+
+static constexpr u32 GNU_PROPERTY_X86_UINT32_OR_LO = 0xc0008000;
+static constexpr u32 GNU_PROPERTY_X86_UINT32_OR_HI = 0xc000ffff;
+
+static constexpr u32 GNU_PROPERTY_X86_UINT32_OR_AND_LO = 0xc0010000;
+static constexpr u32 GNU_PROPERTY_X86_UINT32_OR_AND_HI = 0xc0017fff;
 
 static constexpr u32 GNU_PROPERTY_X86_FEATURE_1_IBT = 1;
 static constexpr u32 GNU_PROPERTY_X86_FEATURE_1_SHSTK = 2;
+static constexpr u32 GNU_PROPERTY_X86_FEATURE_1_AND = 0xc0000002;
 
 static constexpr u32 ELFCOMPRESS_ZLIB = 1;
 static constexpr u32 ELFCOMPRESS_ZSTD = 2;
@@ -2457,7 +2480,6 @@ struct X86_64 {
   static constexpr u32 plt_hdr_size = 32;
   static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 16;
-  static constexpr u32 tls_dtp_offset = 0;
 };
 
 template <> struct ElfSym<X86_64>     : EL64Sym {};
@@ -2493,7 +2515,6 @@ struct I386 {
   static constexpr u32 plt_hdr_size = 16;
   static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 16;
-  static constexpr u32 tls_dtp_offset = 0;
 };
 
 template <> struct ElfSym<I386>     : EL32Sym {};
@@ -2529,7 +2550,6 @@ struct ARM64 {
   static constexpr u32 plt_hdr_size = 32;
   static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 16;
-  static constexpr u32 tls_dtp_offset = 0;
   static constexpr u32 thunk_hdr_size = 0;
   static constexpr u32 thunk_size = 12;
 };
@@ -2567,7 +2587,6 @@ struct ARM32 {
   static constexpr u32 plt_hdr_size = 32;
   static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 16;
-  static constexpr u32 tls_dtp_offset = 0;
   static constexpr u32 thunk_hdr_size = 12;
   static constexpr u32 thunk_size = 20;
 };
@@ -2604,29 +2623,6 @@ struct RV64LE {
   static constexpr u32 plt_hdr_size = 32;
   static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 16;
-
-  // When __tls_get_addr is called to resolve a thread-local variable's
-  // address, the following two arguments are passed to the function:
-  //
-  // 1. the module number that the variable belongs, and
-  // 2. the variable's offset within the module's TLS block.
-  //
-  // These values are usually computed by the dynamic linker and set to
-  // GOT slots as a result of resolving R_DTPMOD and R_DTPOFF dynamic
-  // relocations.
-  //
-  // On RISC-V, R_DTPOFF is resolved to the address 0x800 past the start
-  // of the TLS block. The bias maximizes the accessible range for
-  // load/store instructions with 12-bits signed immediates. That is, if
-  // the offset was right at the beginning of the start of the TLS block,
-  // the half of addressible space (negative immediates) would have been
-  // wasted.
-  //
-  // In most cases we don't have to think about the bias, as the DTPOFF
-  // values are usually computed and used only by runtime. But when we do
-  // compute DTPOFF for statically-linked executable, we need to offset
-  // the bias by subtracting 0x800.
-  static constexpr u32 tls_dtp_offset = 0x800;
 };
 
 template <> struct ElfSym<RV64LE>     : EL64Sym {};
@@ -2661,7 +2657,6 @@ struct RV64BE {
   static constexpr u32 plt_hdr_size = 32;
   static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 16;
-  static constexpr u32 tls_dtp_offset = 0x800;
 };
 
 template <> struct ElfSym<RV64BE>     : EB64Sym {};
@@ -2696,7 +2691,6 @@ struct RV32LE {
   static constexpr u32 plt_hdr_size = 32;
   static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 16;
-  static constexpr u32 tls_dtp_offset = 0x800;
 };
 
 template <> struct ElfSym<RV32LE>     : EL32Sym {};
@@ -2731,7 +2725,6 @@ struct RV32BE {
   static constexpr u32 plt_hdr_size = 32;
   static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 16;
-  static constexpr u32 tls_dtp_offset = 0x800;
 };
 
 template <> struct ElfSym<RV32BE>     : EB32Sym {};
@@ -2766,7 +2759,6 @@ struct PPC64V1 {
   static constexpr u32 plt_hdr_size = 52;
   static constexpr u32 plt_size = 8;
   static constexpr u32 pltgot_size = 0;
-  static constexpr u32 tls_dtp_offset = 0x8000;
   static constexpr u32 thunk_hdr_size = 0;
   static constexpr u32 thunk_size = 28;
 };
@@ -2803,7 +2795,6 @@ struct PPC64V2 {
   static constexpr u32 plt_hdr_size = 60;
   static constexpr u32 plt_size = 4;
   static constexpr u32 pltgot_size = 0;
-  static constexpr u32 tls_dtp_offset = 0x8000;
   static constexpr u32 thunk_hdr_size = 0;
   static constexpr u32 thunk_size = 20;
 };
@@ -2840,7 +2831,6 @@ struct S390X {
   static constexpr u32 plt_hdr_size = 32;
   static constexpr u32 plt_size = 32;
   static constexpr u32 pltgot_size = 16;
-  static constexpr u32 tls_dtp_offset = 0;
 };
 
 template <> struct ElfSym<S390X>     : EB64Sym {};
@@ -2875,7 +2865,6 @@ struct SPARC64 {
   static constexpr u32 plt_hdr_size = 128;
   static constexpr u32 plt_size = 32;
   static constexpr u32 pltgot_size = 32;
-  static constexpr u32 tls_dtp_offset = 0;
 };
 
 template <> struct ElfSym<SPARC64>     : EB64Sym {};
@@ -2910,7 +2899,6 @@ struct M68K {
   static constexpr u32 plt_hdr_size = 18;
   static constexpr u32 plt_size = 14;
   static constexpr u32 pltgot_size = 8;
-  static constexpr u32 tls_dtp_offset = 0x8000;
 };
 
 template <> struct ElfSym<M68K>     : EB32Sym {};

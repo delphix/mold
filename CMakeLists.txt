@@ -44,7 +44,7 @@
 # features and behave exactly the same.
 
 cmake_minimum_required(VERSION 3.13)
-project(mold VERSION 1.7.1)
+project(mold VERSION 1.8.0)
 
 include(CMakeDependentOption)
 include(GNUInstallDirs)
@@ -157,8 +157,8 @@ if(MOLD_USE_MIMALLOC)
     target_compile_definitions(mold PRIVATE USE_SYSTEM_MIMALLOC)
   else()
     function(mold_add_mimalloc)
-      set(MI_BUILD_STATIC ON)
-      option(MI_BUILD_TESTS "Build test executables" OFF)
+      set(MI_BUILD_STATIC ON CACHE INTERNAL "")
+      set(MI_BUILD_TESTS OFF CACHE INTERNAL "")
       add_subdirectory(third-party/mimalloc EXCLUDE_FROM_ALL)
       target_compile_definitions(mimalloc-static PRIVATE MI_USE_ENVIRON=0)
       target_link_libraries(mold PRIVATE mimalloc-static)
@@ -189,6 +189,11 @@ else()
   endfunction()
 
   mold_add_tbb()
+endif()
+
+# Check if this is a commercial version of mold (a.k.a. "sold")
+if(EXISTS "${CMAKE_SOURCE_DIR}/LICENSE.md")
+  set(MOLD_IS_SOLD ON)
 endif()
 
 # We always use Clang to build mold on Windows. MSVC can't compile mold.
@@ -226,15 +231,23 @@ endif()
 # If atomics doesn't work by default, add -latomic.
 # We need the flag on riscv, armv6 and m68k.
 include(CheckCXXSourceCompiles)
-check_cxx_source_compiles("#include <cstdint>
+check_cxx_source_compiles("#include <atomic>
 int main() {
-  uint64_t x = 1;
-  __atomic_add_fetch(&x, 0, __ATOMIC_RELAXED);
-  return x;
-}" HAVE_ATOMIC_ADD_FETCH)
+  std::atomic_uint8_t  a;
+  std::atomic_uint16_t b;
+  std::atomic_uint32_t c;
+  std::atomic_uint64_t d;
+  return ++a + ++b + ++c + ++d;
+}" HAVE_FULL_ATOMIC_SUPPORT)
 
-if(NOT HAVE_ATOMIC_ADD_FETCH)
+if(NOT HAVE_FULL_ATOMIC_SUPPORT)
   target_link_libraries(mold PRIVATE atomic)
+endif()
+
+# Add -pthread
+if(NOT APPLE AND NOT WIN32)
+  target_compile_options(mold PRIVATE -pthread)
+  target_link_options(mold PRIVATE -pthread)
 endif()
 
 # Create a .cc file containing the current git hash for `mold --version`.
@@ -312,11 +325,13 @@ foreach (SOURCE IN LISTS MOLD_ELF_TEMPLATE_FILES)
   endforeach()
 endforeach()
 
-foreach (SOURCE IN LISTS MOLD_MACHO_TEMPLATE_FILES)
-  foreach(TARGET IN LISTS MOLD_MACHO_TARGETS)
-    mold_instantiate_templates(${SOURCE} ${TARGET})
+if(MOLD_IS_SOLD)
+  foreach (SOURCE IN LISTS MOLD_MACHO_TEMPLATE_FILES)
+    foreach(TARGET IN LISTS MOLD_MACHO_TARGETS)
+      mold_instantiate_templates(${SOURCE} ${TARGET})
+    endforeach()
   endforeach()
-endforeach()
+endif()
 
 # Add other non-template source files.
 target_sources(mold PRIVATE
@@ -336,9 +351,6 @@ target_sources(mold PRIVATE
   git-hash.cc
   glob.cc
   hyperloglog.cc
-  macho/arch-arm64.cc
-  macho/arch-x86-64.cc
-  macho/yaml.cc
   main.cc
   multi-glob.cc
   perf.cc
@@ -347,12 +359,25 @@ target_sources(mold PRIVATE
   uuid.cc
   )
 
+if(MOLD_IS_SOLD)
+  target_sources(mold PRIVATE
+    macho/arch-arm64.cc
+    macho/arch-x86-64.cc
+    macho/yaml.cc
+    )
+endif()
+
 # Add frequently included header files for pre-compiling.
 # target_precompile_headers is supported by CMake 3.16.0 or newer.
 if(${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.16.0")
-  target_precompile_headers(mold PRIVATE
-    "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_SOURCE_DIR}/elf/mold.h>"
-    "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_SOURCE_DIR}/macho/mold.h>")
+  if(MOLD_IS_SOLD)
+    target_precompile_headers(mold PRIVATE
+      "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_SOURCE_DIR}/elf/mold.h>"
+      "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_SOURCE_DIR}/macho/mold.h>")
+  else()
+    target_precompile_headers(mold PRIVATE
+      "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_SOURCE_DIR}/elf/mold.h>")
+  endif()
 
   # ccache needs this flag along with `sloppiness = pch_defines,time_macros`
   # to enable caching
@@ -367,14 +392,24 @@ if(BUILD_TESTING)
     add_custom_command(
       TARGET mold POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E create_symlink mold ld
-      COMMAND ${CMAKE_COMMAND} -E create_symlink mold ld64
-      BYPRODUCTS ld ld64
+      BYPRODUCTS ld
       WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
       VERBATIM)
+
+    if(MOLD_IS_SOLD)
+      add_custom_command(
+        TARGET mold POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E create_symlink mold ld64
+        BYPRODUCTS ld64
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+        VERBATIM)
+    endif()
   endif()
 
   if(${APPLE})
-    add_subdirectory(test/macho)
+    if(MOLD_IS_SOLD)
+      add_subdirectory(test/macho)
+    endif()
   elseif(${UNIX})
     add_subdirectory(test/elf)
   endif()
@@ -387,21 +422,29 @@ if(NOT CMAKE_SKIP_INSTALL_RULES)
 
   function(mold_install_relative_symlink OLD NEW)
     install(CODE "
-      get_filename_component(PREFIX_ABS \${CMAKE_INSTALL_PREFIX} ABSOLUTE)
+      get_filename_component(PREFIX_ABS \${CMAKE_INSTALL_PREFIX}/ ABSOLUTE)
       get_filename_component(OLD_ABS ${OLD} ABSOLUTE BASE_DIR \${PREFIX_ABS})
       get_filename_component(NEW_ABS ${NEW} ABSOLUTE BASE_DIR \${PREFIX_ABS})
       get_filename_component(NEW_DIR \${NEW_ABS} DIRECTORY)
       file(RELATIVE_PATH OLD_REL \${NEW_DIR} \${OLD_ABS})
-      message(STATUS \"Installing symlink: \$ENV{DESTDIR}/\${NEW_ABS} -> \${OLD_REL}\")
-      file(MAKE_DIRECTORY \$ENV{DESTDIR}/\${NEW_DIR})
-      file(CREATE_LINK \${OLD_REL} \$ENV{DESTDIR}/\${NEW_ABS} SYMBOLIC)")
+      message(STATUS \"Installing symlink: \$ENV{DESTDIR}\${NEW_ABS} -> \${OLD_REL}\")
+      file(MAKE_DIRECTORY \$ENV{DESTDIR}\${NEW_DIR})
+      file(CREATE_LINK \${OLD_REL} \$ENV{DESTDIR}\${NEW_ABS} SYMBOLIC)")
   endfunction()
+
   mold_install_relative_symlink(${CMAKE_INSTALL_BINDIR}/mold
     ${CMAKE_INSTALL_LIBEXECDIR}/mold/ld)
   mold_install_relative_symlink(${CMAKE_INSTALL_BINDIR}/mold
     ${CMAKE_INSTALL_BINDIR}/ld.mold)
-  mold_install_relative_symlink(${CMAKE_INSTALL_BINDIR}/mold
-    ${CMAKE_INSTALL_BINDIR}/ld64.mold)
   mold_install_relative_symlink(${CMAKE_INSTALL_MANDIR}/man1/mold.1
     ${CMAKE_INSTALL_MANDIR}/man1/ld.mold.1)
+
+  if(MOLD_IS_SOLD)
+    mold_install_relative_symlink(${CMAKE_INSTALL_BINDIR}/mold
+      ${CMAKE_INSTALL_BINDIR}/ld64.mold)
+    mold_install_relative_symlink(${CMAKE_INSTALL_BINDIR}/mold
+      ${CMAKE_INSTALL_BINDIR}/ld.sold)
+    mold_install_relative_symlink(${CMAKE_INSTALL_BINDIR}/mold
+      ${CMAKE_INSTALL_BINDIR}/ld64.sold)
+  endif()
 endif()

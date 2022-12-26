@@ -687,40 +687,40 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     }
 
     if (sym.is_ifunc())
-      sym.flags |= (NEEDS_GOT | NEEDS_PLT);
+      sym.flags.fetch_or(NEEDS_GOT | NEEDS_PLT, std::memory_order_relaxed);
 
     switch (rel.r_type) {
     case R_RISCV_32:
       if constexpr (E::is_64)
-        scan_rel(ctx, sym, rel, absrel_table);
+        scan_absrel(ctx, sym, rel);
       else
-        scan_rel(ctx, sym, rel, dyn_absrel_table);
+        scan_dyn_absrel(ctx, sym, rel);
       break;
     case R_RISCV_HI20:
-      scan_rel(ctx, sym, rel, absrel_table);
+      scan_absrel(ctx, sym, rel);
       break;
     case R_RISCV_64:
       if constexpr (!E::is_64)
         Fatal(ctx) << *this << ": R_RISCV_64 cannot be used on RV32";
-      scan_rel(ctx, sym, rel, dyn_absrel_table);
+      scan_dyn_absrel(ctx, sym, rel);
       break;
     case R_RISCV_CALL:
     case R_RISCV_CALL_PLT:
       if (sym.is_imported)
-        sym.flags |= NEEDS_PLT;
+        sym.flags.fetch_or(NEEDS_PLT, std::memory_order_relaxed);
       break;
     case R_RISCV_GOT_HI20:
-      sym.flags |= NEEDS_GOT;
+      sym.flags.fetch_or(NEEDS_GOT, std::memory_order_relaxed);
       break;
     case R_RISCV_TLS_GOT_HI20:
-      ctx.has_gottp_rel = true;
-      sym.flags |= NEEDS_GOTTP;
+      ctx.has_gottp_rel.store(true, std::memory_order_relaxed);
+      sym.flags.fetch_or(NEEDS_GOTTP, std::memory_order_relaxed);
       break;
     case R_RISCV_TLS_GD_HI20:
-      sym.flags |= NEEDS_TLSGD;
+      sym.flags.fetch_or(NEEDS_TLSGD, std::memory_order_relaxed);
       break;
     case R_RISCV_32_PCREL:
-      scan_rel(ctx, sym, rel, pcrel_table);
+      scan_pcrel(ctx, sym, rel);
       break;
     case R_RISCV_BRANCH:
     case R_RISCV_JAL:
