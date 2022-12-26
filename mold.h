@@ -72,10 +72,15 @@ inline std::string mold_version;
 extern std::string mold_version_string;
 extern std::string mold_git_hash;
 
-std::string_view errno_string();
+std::string errno_string();
+std::string get_self_path();
 void cleanup();
 void install_signal_handler();
 i64 get_default_thread_count();
+
+static u64 combine_hash(u64 a, u64 b) {
+  return a ^ (b + 0x9e3779b9 + (a << 6) + (a >> 2));
+}
 
 //
 // Error output
@@ -219,16 +224,29 @@ inline i64 sign_extend(u64 val, i64 size) {
 
 template <typename T, typename Compare = std::less<T>>
 void update_minimum(std::atomic<T> &atomic, u64 new_val, Compare cmp = {}) {
-  T old_val = atomic;
+  T old_val = atomic.load(std::memory_order_relaxed);
   while (cmp(new_val, old_val) &&
-         !atomic.compare_exchange_weak(old_val, new_val));
+         !atomic.compare_exchange_weak(old_val, new_val,
+                                       std::memory_order_relaxed));
 }
 
 template <typename T, typename Compare = std::less<T>>
 void update_maximum(std::atomic<T> &atomic, u64 new_val, Compare cmp = {}) {
-  T old_val = atomic;
+  T old_val = atomic.load(std::memory_order_relaxed);
   while (cmp(old_val, new_val) &&
-         !atomic.compare_exchange_weak(old_val, new_val));
+         !atomic.compare_exchange_weak(old_val, new_val,
+                                       std::memory_order_relaxed));
+}
+
+// An optimized "mark" operation for parallel mark-and-sweep algorithms.
+// Returns true if `visited` was false and updated to true.
+inline bool fast_mark(std::atomic<bool> &visited) {
+  // A relaxed load + branch (assuming miss) takes only around 20 cycles,
+  // while an atomic RMW can easily take hundreds on x86. We note that it's
+  // common that another thread beat us in marking, so doing an optimistic
+  // early test tends to improve performance in the ~20% ballpark.
+  return !visited.load(std::memory_order_relaxed) &&
+         !visited.exchange(true, std::memory_order_relaxed);
 }
 
 template <typename T, typename U>
@@ -401,18 +419,19 @@ public:
     i64 retry = 0;
 
     while (retry < MAX_RETRY) {
-      const char *ptr = keys[idx];
+      const char *ptr = keys[idx].load(std::memory_order_acquire);
       if (ptr == marker) {
         pause();
         continue;
       }
 
       if (ptr == nullptr) {
-        if (!keys[idx].compare_exchange_weak(ptr, marker))
+        if (!keys[idx].compare_exchange_weak(ptr, marker,
+                                             std::memory_order_acq_rel))
           continue;
         new (values + idx) T(val);
         key_sizes[idx] = key.size();
-        keys[idx] = key.data();
+        keys[idx].store(key.data(), std::memory_order_release);
         return {values + idx, true};
       }
 
@@ -553,7 +572,6 @@ private:
   std::vector<std::string> strings;
   std::unique_ptr<TrieNode> root;
   std::vector<std::pair<Glob, u32>> globs;
-  std::vector<u32> values;
   std::once_flag once;
   bool is_compiled = false;
 };
@@ -731,7 +749,8 @@ public:
   static MappedFile *open(C &ctx, std::string path);
   static MappedFile *must_open(C &ctx, std::string path);
 
-  ~MappedFile();
+  ~MappedFile() { unmap(); }
+  void unmap();
 
   MappedFile *slice(C &ctx, std::string name, u64 start, u64 size);
 
@@ -777,7 +796,6 @@ template <typename C>
 MappedFile<C> *MappedFile<C>::open(C &ctx, std::string path) {
   if (path.starts_with('/') && !ctx.arg.chroot.empty())
     path = ctx.arg.chroot + "/" + path_clean(path);
-
 
   i64 fd;
 #ifdef _WIN32
@@ -851,8 +869,8 @@ MappedFile<C>::slice(C &ctx, std::string name, u64 start, u64 size) {
 }
 
 template <typename C>
-MappedFile<C>::~MappedFile() {
-  if (size == 0 || parent)
+void MappedFile<C>::unmap() {
+  if (size == 0 || parent || !data)
     return;
 
 #ifdef _WIN32
@@ -862,6 +880,8 @@ MappedFile<C>::~MappedFile() {
 #else
   munmap(data, size);
 #endif
+
+  data = nullptr;
 }
 
 } // namespace mold

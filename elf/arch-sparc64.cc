@@ -76,11 +76,13 @@ using E = SPARC64;
 // Self-modifying code is nowadays considered really bad from the security
 // point of view, though.
 template <>
-void PltSection<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + this->shdr.sh_offset;
-  memset(buf, 0, this->shdr.sh_size);
+void write_plt_header(Context<E> &ctx, u8 *buf) {
+  memset(buf, 0, E::plt_hdr_size);
+}
 
-  static ub32 plt[] = {
+template <>
+void write_plt_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
+  static ub32 insn[] = {
     0x0300'0000, // sethi (. - .PLT0), %g1
     0x3068'0000, // ba,a  %xcc, .PLT1
     0x0100'0000, // nop
@@ -91,26 +93,17 @@ void PltSection<E>::copy_buf(Context<E> &ctx) {
     0x0100'0000, // nop
   };
 
-  static_assert(sizeof(plt) == E::plt_size);
-
   u64 plt0 = ctx.plt->shdr.sh_addr;
   u64 plt1 = ctx.plt->shdr.sh_addr + E::plt_size;
+  u64 entry = sym.get_plt_addr(ctx);
 
-  for (i64 i = 0; i < symbols.size(); i++) {
-    ub32 *loc = (ub32 *)(buf + E::plt_hdr_size + i * E::plt_size);
-    memcpy(loc, plt, sizeof(plt));
-
-    u64 ent_addr = symbols[i]->get_plt_addr(ctx);
-    loc[0] |= bits(ent_addr - plt0, 21, 0);
-    loc[1] |= bits(plt1 - ent_addr - 4, 20, 2);
-  }
+  memcpy(buf, insn, sizeof(insn));
+  *(ub32 *)buf |= bits(entry - plt0, 21, 0);
+  *(ub32 *)(buf + 4) |= bits(plt1 - entry - 4, 20, 2);
 }
 
 template <>
-void PltGotSection<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + this->shdr.sh_offset;
-  memset(buf, 0, this->shdr.sh_size);
-
+void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
   static ub32 entry[] = {
     0x8a10'000f, // mov  %o7, %g5
     0x4000'0002, // call . + 8
@@ -122,13 +115,8 @@ void PltGotSection<E>::copy_buf(Context<E> &ctx) {
     0x0000'0000,
   };
 
-  static_assert(sizeof(entry) == E::pltgot_size);
-
-  for (Symbol<E> *sym : symbols) {
-    u8 *loc = buf + sym->get_pltgot_idx(ctx) * E::pltgot_size;
-    memcpy(loc, entry, sizeof(entry));
-    *(ub64 *)(loc + 24) = sym->get_got_addr(ctx) - sym->get_plt_addr(ctx) - 4;
-  }
+  memcpy(buf, entry, sizeof(entry));
+  *(ub64 *)(buf + 24) = sym.get_got_addr(ctx) - sym.get_plt_addr(ctx) - 4;
 }
 
 template <>
@@ -168,6 +156,13 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     Symbol<E> &sym = *file.symbols[rel.r_sym];
     u8 *loc = base + rel.r_offset;
 
+    auto check = [&](i64 val, i64 lo, i64 hi) {
+      if (val < lo || hi <= val)
+        Error(ctx) << *this << ": relocation " << rel << " against "
+                   << sym << " out of range: " << val << " is not in ["
+                   << lo << ", " << hi << ")";
+    };
+
 #define S   sym.get_addr(ctx)
 #define A   rel.r_addend
 #define P   (get_addr() + rel.r_offset)
@@ -176,76 +171,127 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 
     switch (rel.r_type) {
     case R_SPARC_64:
-      apply_abs_dyn_rel(ctx, sym, rel, loc, S, A, P, dynrel);
+      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, dynrel);
       break;
-    case R_SPARC_5:
-      *(ub32 *)loc |= bits(S + A, 4, 0);
+    case R_SPARC_5: {
+      i64 val = S + A;
+      check(val, 0, 1 << 5);
+      *(ub32 *)loc |= bits(val, 4, 0);
       break;
-    case R_SPARC_6:
-      *(ub32 *)loc |= bits(S + A, 5, 0);
+    }
+    case R_SPARC_6: {
+      i64 val = S + A;
+      check(val, 0, 1 << 6);
+      *(ub32 *)loc |= bits(val, 5, 0);
       break;
-    case R_SPARC_7:
-      *(ub32 *)loc |= bits(S + A, 6, 0);
+    }
+    case R_SPARC_7: {
+      i64 val = S + A;
+      check(val, 0, 1 << 7);
+      *(ub32 *)loc |= bits(val, 6, 0);
       break;
-    case R_SPARC_8:
-      *(u8 *)loc = S + A;
+    }
+    case R_SPARC_8: {
+      i64 val = S + A;
+      check(val, 0, 1 << 8);
+      *(u8 *)loc = val;
       break;
-    case R_SPARC_10:
+    }
+    case R_SPARC_10: {
+      i64 val = S + A;
+      check(val, 0, 1 << 10);
+      *(ub32 *)loc |= bits(val, 9, 0);
+      break;
+    }
     case R_SPARC_LO10:
     case R_SPARC_LOPLT10:
       *(ub32 *)loc |= bits(S + A, 9, 0);
       break;
-    case R_SPARC_11:
-      *(ub32 *)loc |= bits(S + A, 10, 0);
+    case R_SPARC_11: {
+      i64 val = S + A;
+      check(val, 0, 1 << 11);
+      *(ub32 *)loc |= bits(val, 10, 0);
       break;
-    case R_SPARC_13:
-      *(ub32 *)loc |= bits(S + A, 12, 0);
+    }
+    case R_SPARC_13: {
+      i64 val = S + A;
+      check(val, 0, 1 << 13);
+      *(ub32 *)loc |= bits(val, 12, 0);
       break;
+    }
     case R_SPARC_16:
-    case R_SPARC_UA16:
-      *(ub16 *)loc = S + A;
+    case R_SPARC_UA16: {
+      i64 val = S + A;
+      check(val, 0, 1 << 16);
+      *(ub16 *)loc = val;
       break;
-    case R_SPARC_22:
-      *(ub32 *)loc |= bits(S + A, 21, 0);
+    }
+    case R_SPARC_22: {
+      i64 val = S + A;
+      check(val, 0, 1 << 22);
+      *(ub32 *)loc |= bits(val, 21, 0);
       break;
+    }
     case R_SPARC_32:
     case R_SPARC_UA32:
-    case R_SPARC_PLT32:
-      *(ub32 *)loc = S + A;
+    case R_SPARC_PLT32: {
+      i64 val = S + A;
+      check(val, 0, 1LL << 32);
+      *(ub32 *)loc = val;
       break;
+    }
     case R_SPARC_PLT64:
     case R_SPARC_UA64:
     case R_SPARC_REGISTER:
       *(ub64 *)loc = S + A;
       break;
-    case R_SPARC_DISP8:
-      *(u8 *)loc = S + A - P;
+    case R_SPARC_DISP8: {
+      i64 val = S + A - P;
+      check(val, -(1 << 7), 1 << 7);
+      *(u8 *)loc = val;
       break;
-    case R_SPARC_DISP16:
-      *(ub16 *)loc = S + A - P;
+    }
+    case R_SPARC_DISP16: {
+      i64 val = S + A - P;
+      check(val, -(1 << 15), 1 << 15);
+      *(ub16 *)loc = val;
       break;
+    }
     case R_SPARC_DISP32:
-    case R_SPARC_PCPLT32:
-      *(ub32 *)loc = S + A - P;
+    case R_SPARC_PCPLT32: {
+      i64 val = S + A - P;
+      check(val, -(1LL << 31), 1LL << 31);
+      *(ub32 *)loc = val;
       break;
+    }
     case R_SPARC_DISP64:
       *(ub64 *)loc = S + A - P;
       break;
     case R_SPARC_WDISP16: {
       i64 val = S + A - P;
+      check(val, -(1 << 16), 1 << 16);
       *(ub16 *)loc |= (bit(val, 16) << 21) | bits(val, 15, 2);
       break;
     }
-    case R_SPARC_WDISP19:
-      *(ub32 *)loc |= bits(S + A - P, 20, 2);
+    case R_SPARC_WDISP19: {
+      i64 val = S + A - P;
+      check(val, -(1 << 20), 1 << 20);
+      *(ub32 *)loc |= bits(val, 20, 2);
       break;
-    case R_SPARC_WDISP22:
-      *(ub32 *)loc |= bits(S + A - P, 23, 2);
+    }
+    case R_SPARC_WDISP22: {
+      i64 val = S + A - P;
+      check(val, -(1 << 23), 1 << 23);
+      *(ub32 *)loc |= bits(val, 23, 2);
       break;
+    }
     case R_SPARC_WDISP30:
-    case R_SPARC_WPLT30:
-      *(ub32 *)loc |= bits(S + A - P, 31, 2);
+    case R_SPARC_WPLT30: {
+      i64 val = S + A - P;
+      check(val, -(1LL << 31), 1LL << 31);
+      *(ub32 *)loc |= bits(val, 31, 2);
       break;
+    }
     case R_SPARC_HI22:
     case R_SPARC_HIPLT22:
     case R_SPARC_LM22:
@@ -255,6 +301,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ub32 *)loc |= bits(G, 9, 0);
       break;
     case R_SPARC_GOT13:
+      check(G, 0, 1 << 12);
       *(ub32 *)loc |= bits(G, 12, 0);
       break;
     case R_SPARC_GOT22:
@@ -274,8 +321,8 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       // We always have to relax a GOT load to a load immediate if a
       // symbol is local, because R_SPARC_GOTDATA_OP cannot represent
       // an addend for a local symbol.
-      if (sym.is_imported) {
-        *(ub32 *)loc |= bits(G < 0 ? ~G : G, 31, 10);
+      if (sym.is_imported || sym.is_ifunc()) {
+        *(ub32 *)loc |= bits(G, 31, 10);
       } else if (sym.is_absolute()) {
         i64 val = S + A;
         *(ub32 *)loc |= bits(val < 0 ? ~val : val, 31, 10);
@@ -285,8 +332,8 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       }
       break;
     case R_SPARC_GOTDATA_OP_LOX10: {
-      if (sym.is_imported) {
-        *(ub32 *)loc |= bits(G, 9, 0) | (G < 0 ? 0b1'1100'0000'0000 : 0);
+      if (sym.is_imported || sym.is_ifunc()) {
+        *(ub32 *)loc |= bits(G, 9, 0);
       } else if (sym.is_absolute()) {
         i64 val = S + A;
         *(ub32 *)loc |= bits(val, 9, 0) | (val < 0 ? 0b1'1100'0000'0000 : 0);
@@ -297,7 +344,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       break;
     }
     case R_SPARC_GOTDATA_OP:
-      if (sym.is_imported)
+      if (sym.is_imported || sym.is_ifunc())
         break;
 
       if (sym.is_absolute()) {
@@ -355,16 +402,12 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ub32 *)loc |= bits(sym.get_tlsgd_addr(ctx) + A - GOT, 9, 0);
       break;
     case R_SPARC_TLS_GD_CALL:
-    case R_SPARC_TLS_LDM_CALL: {
-      u64 addr;
+    case R_SPARC_TLS_LDM_CALL:
       if (ctx.arg.is_static)
-        addr = ctx.sparc_tls_get_addr->shdr.sh_addr;
+        *(ub32 *)loc |= bits(ctx.sparc_tls_get_addr->shdr.sh_addr + A - P, 31, 2);
       else
-        addr = get_symbol(ctx, "__tls_get_addr")->get_addr(ctx);
-
-      *(ub32 *)loc |= bits(addr + A - P, 31, 2);
+        *(ub32 *)loc |= bits(ctx.tls_get_addr->get_addr(ctx) + A - P, 31, 2);
       break;
-    }
     case R_SPARC_TLS_LDM_HI22:
       *(ub32 *)loc |= bits(ctx.got->get_tlsld_addr(ctx) + A - GOT, 31, 10);
       break;
@@ -428,6 +471,13 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       continue;
     }
 
+    auto check = [&](i64 val, i64 lo, i64 hi) {
+      if (val < lo || hi <= val)
+        Error(ctx) << *this << ": relocation " << rel << " against "
+                   << sym << " out of range: " << val << " is not in ["
+                   << lo << ", " << hi << ")";
+    };
+
     SectionFragment<E> *frag;
     i64 frag_addend;
     std::tie(frag, frag_addend) = get_fragment(ctx, rel);
@@ -436,8 +486,6 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
 #define A (frag ? frag_addend : (i64)rel.r_addend)
 
     switch (rel.r_type) {
-    case R_NONE:
-      break;
     case R_SPARC_64:
     case R_SPARC_UA64:
       if (std::optional<u64> val = get_tombstone(sym, frag))
@@ -446,9 +494,12 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
         *(ub64 *)loc = S + A;
       break;
     case R_SPARC_32:
-    case R_SPARC_UA32:
-      *(ub32 *)loc = S + A;
+    case R_SPARC_UA32: {
+      i64 val = S + A;
+      check(val, 0, 1LL << 32);
+      *(ub32 *)loc = val;
       break;
+    }
     case R_SPARC_TLS_DTPOFF32:
       *(ub32 *)loc = S + A - ctx.tls_begin;
       break;
@@ -484,12 +535,12 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       continue;
     }
 
-    if (sym.get_type() == STT_GNU_IFUNC)
-      sym.flags |= (NEEDS_GOT | NEEDS_PLT);
+    if (sym.is_ifunc())
+      sym.flags.fetch_or(NEEDS_GOT | NEEDS_PLT, std::memory_order_relaxed);
 
     switch (rel.r_type) {
     case R_SPARC_64:
-      scan_abs_dyn_rel(ctx, sym, rel);
+      scan_dyn_absrel(ctx, sym, rel);
       break;
     case R_SPARC_8:
     case R_SPARC_5:
@@ -517,10 +568,11 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_SPARC_HI22:
     case R_SPARC_H44:
     case R_SPARC_HH22:
-      scan_abs_rel(ctx, sym, rel);
+      scan_absrel(ctx, sym, rel);
       break;
     case R_SPARC_PLT32:
     case R_SPARC_WPLT30:
+    case R_SPARC_WDISP30:
     case R_SPARC_HIPLT22:
     case R_SPARC_LOPLT10:
     case R_SPARC_PCPLT32:
@@ -528,17 +580,17 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_SPARC_PCPLT10:
     case R_SPARC_PLT64:
       if (sym.is_imported)
-        sym.flags |= NEEDS_PLT;
+        sym.flags.fetch_or(NEEDS_PLT, std::memory_order_relaxed);
       break;
     case R_SPARC_GOT13:
     case R_SPARC_GOT10:
     case R_SPARC_GOT22:
     case R_SPARC_GOTDATA_HIX22:
-      sym.flags |= NEEDS_GOT;
+      sym.flags.fetch_or(NEEDS_GOT, std::memory_order_relaxed);
       break;
     case R_SPARC_GOTDATA_OP_HIX22:
       if (sym.is_imported)
-        sym.flags |= NEEDS_GOT;
+        sym.flags.fetch_or(NEEDS_GOT, std::memory_order_relaxed);
       break;
     case R_SPARC_DISP16:
     case R_SPARC_DISP32:
@@ -550,26 +602,22 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_SPARC_WDISP16:
     case R_SPARC_WDISP19:
     case R_SPARC_WDISP22:
-    case R_SPARC_WDISP30:
     case R_SPARC_PC_HH22:
-      scan_pcrel_rel(ctx, sym, rel);
+      scan_pcrel(ctx, sym, rel);
       break;
     case R_SPARC_TLS_GD_HI22:
-      sym.flags |= NEEDS_TLSGD;
+      sym.flags.fetch_or(NEEDS_TLSGD, std::memory_order_relaxed);
       break;
     case R_SPARC_TLS_LDM_HI22:
-      ctx.needs_tlsld = true;
+      ctx.needs_tlsld.store(true, std::memory_order_relaxed);
       break;
     case R_SPARC_TLS_IE_HI22:
-      sym.flags |= NEEDS_GOTTP;
+      sym.flags.fetch_or(NEEDS_GOTTP, std::memory_order_relaxed);
       break;
     case R_SPARC_TLS_GD_CALL:
     case R_SPARC_TLS_LDM_CALL:
-      if (!ctx.arg.is_static) {
-        Symbol<E> *sym2 = get_symbol(ctx, "__tls_get_addr");
-        if (sym2->is_imported)
-          sym2->flags |= NEEDS_PLT;
-      }
+      if (!ctx.arg.is_static && ctx.tls_get_addr->is_imported)
+        ctx.tls_get_addr->flags.fetch_or(NEEDS_PLT, std::memory_order_relaxed);
       break;
     case R_SPARC_GOTDATA_OP_LOX10:
     case R_SPARC_GOTDATA_OP:

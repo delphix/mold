@@ -1,16 +1,5 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-t=out/test/elf/$MACHINE/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
 cat <<EOF | $CC -o $t/a.o -c -x assembler -
   .text
@@ -19,10 +8,8 @@ main:
   nop
 EOF
 
-$CC -B. -o $t/exe $t/a.o \
-  -Wl,-rpath,/foo -Wl,-rpath,/bar -Wl,-R/no/such/directory -Wl,-R/
+$CC -B. -o $t/exe1 $t/a.o -Wl,-rpath,/foo,-rpath,/bar,-R/no/such/directory,-R/
+readelf --dynamic $t/exe1 | grep -Fq 'Library runpath: [/foo:/bar:/no/such/directory:/]'
 
-readelf --dynamic $t/exe | \
-  grep -Fq 'Library runpath: [/foo:/bar:/no/such/directory:/]'
-
-echo OK
+$CC -B. -o $t/exe2 $t/a.o -Wl,-rpath,/foo,-rpath,/bar,-rpath,/foo,-rpath,/baz
+readelf --dynamic $t/exe2 | grep -Fq 'Library runpath: [/foo:/bar:/baz]'

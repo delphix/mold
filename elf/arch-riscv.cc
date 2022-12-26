@@ -51,14 +51,14 @@
 //
 // RISC-V object files tend to have way more relocations than those for
 // other targets. This is because all branches, including ones that jump
-// within the same section, are explicitly annotated with relocations. Here
-// is why we need them: all control-flow statements such as `if` or `for`
-// are implemented using branch instructions. For other targets, the
+// within the same section, are explicitly expressed with relocations.
+// Here is why we need them: all control-flow statements such as `if` or
+// `for` are implemented using branch instructions. For other targets, the
 // compiler doesn't emit relocations for such branches because they know
-// at compile-time exactly how many bytes has to be skipped. That's not true
-// to RISC-V because the linker may delete bytes between a branch and its
-// destination. Therefore, all branches including in-section ones have to
-// be explicitly annotated with relocations.
+// at compile-time exactly how many bytes has to be skipped. That's not
+// true to RISC-V because the linker may delete bytes between a branch and
+// its destination. Therefore, all branches including in-section ones have
+// to be explicitly expressed with relocations.
 //
 // Note that this mechanism only shrink sections and never enlarge, as
 // the compiler always emits the longest instruction sequence. This
@@ -115,38 +115,38 @@ static u32 cjtype(u32 val) {
 }
 
 static void write_itype(u8 *loc, u32 val) {
-  u32 mask = 0b000000'00000'11111'111'11111'1111111;
-  *(ul32 *)loc = (*(ul32 *)loc & mask) | itype(val);
+  *(ul32 *)loc &= 0b000000'00000'11111'111'11111'1111111;
+  *(ul32 *)loc |= itype(val);
 }
 
 static void write_stype(u8 *loc, u32 val) {
-  u32 mask = 0b000000'11111'11111'111'00000'1111111;
-  *(ul32 *)loc = (*(ul32 *)loc & mask) | stype(val);
+  *(ul32 *)loc &= 0b000000'11111'11111'111'00000'1111111;
+  *(ul32 *)loc |= stype(val);
 }
 
 static void write_btype(u8 *loc, u32 val) {
-  u32 mask = 0b000000'11111'11111'111'00000'1111111;
-  *(ul32 *)loc = (*(ul32 *)loc & mask) | btype(val);
+  *(ul32 *)loc &= 0b000000'11111'11111'111'00000'1111111;
+  *(ul32 *)loc |= btype(val);
 }
 
 static void write_utype(u8 *loc, u32 val) {
-  u32 mask = 0b000000'00000'00000'000'11111'1111111;
-  *(ul32 *)loc = (*(ul32 *)loc & mask) | utype(val);
+  *(ul32 *)loc &= 0b000000'00000'00000'000'11111'1111111;
+  *(ul32 *)loc |= utype(val);
 }
 
 static void write_jtype(u8 *loc, u32 val) {
-  u32 mask = 0b000000'00000'00000'000'11111'1111111;
-  *(ul32 *)loc = (*(ul32 *)loc & mask) | jtype(val);
+  *(ul32 *)loc &= 0b000000'00000'00000'000'11111'1111111;
+  *(ul32 *)loc |= jtype(val);
 }
 
 static void write_cbtype(u8 *loc, u32 val) {
-  u32 mask = 0b111'000'111'00000'11;
-  *(ul16 *)loc = (*(ul16 *)loc & mask) | cbtype(val);
+  *(ul16 *)loc &= 0b111'000'111'00000'11;
+  *(ul16 *)loc |= cbtype(val);
 }
 
 static void write_cjtype(u8 *loc, u32 val) {
-  u32 mask = 0b111'00000000000'11;
-  *(ul16 *)loc = (*(ul16 *)loc & mask) | cjtype(val);
+  *(ul16 *)loc &= 0b111'00000000000'11;
+  *(ul16 *)loc |= cjtype(val);
 }
 
 // Returns the rd register of an R/I/U/J-type instruction.
@@ -161,10 +161,8 @@ static void set_rs1(u8 *loc, u32 rs1) {
 }
 
 template <typename E>
-static void write_plt_header(Context<E> &ctx) {
-  u8 *buf = ctx.buf + ctx.plt->shdr.sh_offset;
-
-  static const ul32 plt0_64[] = {
+void write_plt_header(Context<E> &ctx, u8 *buf) {
+  static const ul32 insn_64[] = {
     0x0000'0397, // auipc  t2, %pcrel_hi(.got.plt)
     0x41c3'0333, // sub    t1, t1, t3               # .plt entry + hdr + 12
     0x0003'be03, // ld     t3, %pcrel_lo(1b)(t2)    # _dl_runtime_resolve
@@ -175,7 +173,7 @@ static void write_plt_header(Context<E> &ctx) {
     0x000e'0067, // jr     t3
   };
 
-  static const ul32 plt0_32[] = {
+  static const ul32 insn_32[] = {
     0x0000'0397, // auipc  t2, %pcrel_hi(.got.plt)
     0x41c3'0333, // sub    t1, t1, t3               # .plt entry + hdr + 12
     0x0003'ae03, // lw     t3, %pcrel_lo(1b)(t2)    # _dl_runtime_resolve
@@ -187,13 +185,12 @@ static void write_plt_header(Context<E> &ctx) {
   };
 
   if constexpr (E::is_64)
-    memcpy(buf, plt0_64, sizeof(plt0_64));
+    memcpy(buf, insn_64, sizeof(insn_64));
   else
-    memcpy(buf, plt0_32, sizeof(plt0_32));
+    memcpy(buf, insn_32, sizeof(insn_32));
 
   u64 gotplt = ctx.gotplt->shdr.sh_addr;
   u64 plt = ctx.plt->shdr.sh_addr;
-
   write_utype(buf, gotplt - plt);
   write_itype(buf + 8, gotplt - plt);
   write_itype(buf + 16, gotplt - plt);
@@ -214,43 +211,29 @@ static const ul32 plt_entry_32[] = {
 };
 
 template <typename E>
-void PltSection<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + ctx.plt->shdr.sh_offset;
+void write_plt_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
+  if constexpr (E::is_64)
+    memcpy(buf, plt_entry_64, sizeof(plt_entry_64));
+  else
+    memcpy(buf, plt_entry_32, sizeof(plt_entry_32));
 
-  write_plt_header(ctx);
-
-  for (Symbol<E> *sym : symbols) {
-    u8 *ent = buf + E::plt_hdr_size + sym->get_plt_idx(ctx) * E::plt_size;
-    u64 gotplt = sym->get_gotplt_addr(ctx);
-    u64 plt = sym->get_plt_addr(ctx);
-
-    if constexpr (E::is_64)
-      memcpy(ent, plt_entry_64, sizeof(plt_entry_64));
-    else
-      memcpy(ent, plt_entry_32, sizeof(plt_entry_32));
-
-    write_utype(ent, gotplt - plt);
-    write_itype(ent + 4, gotplt - plt);
-  }
+  u64 gotplt = sym.get_gotplt_addr(ctx);
+  u64 plt = sym.get_plt_addr(ctx);
+  write_utype(buf, gotplt - plt);
+  write_itype(buf + 4, gotplt - plt);
 }
 
 template <typename E>
-void PltGotSection<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + this->shdr.sh_offset;
+void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
+  if constexpr (E::is_64)
+    memcpy(buf, plt_entry_64, sizeof(plt_entry_64));
+  else
+    memcpy(buf, plt_entry_32, sizeof(plt_entry_32));
 
-  for (Symbol<E> *sym : symbols) {
-    u8 *ent = buf + sym->get_pltgot_idx(ctx) * E::pltgot_size;
-    u64 got = sym->get_got_addr(ctx);
-    u64 plt = sym->get_plt_addr(ctx);
-
-    if constexpr (E::is_64)
-      memcpy(ent, plt_entry_64, sizeof(plt_entry_64));
-    else
-      memcpy(ent, plt_entry_32, sizeof(plt_entry_32));
-
-    write_utype(ent, got - plt);
-    write_itype(ent + 4, got - plt);
-  }
+  u64 got = sym.get_got_addr(ctx);
+  u64 plt = sym.get_plt_addr(ctx);
+  write_utype(buf, got - plt);
+  write_itype(buf + 4, got - plt);
 }
 
 template <typename E>
@@ -337,11 +320,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       if constexpr (E::is_64)
         *(U32<E> *)loc = S + A;
       else
-        apply_abs_dyn_rel(ctx, sym, rel, loc, S, A, P, dynrel);
+        apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, dynrel);
       break;
     case R_RISCV_64:
       assert(E::is_64);
-      apply_abs_dyn_rel(ctx, sym, rel, loc, S, A, P, dynrel);
+      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, dynrel);
       break;
     case R_RISCV_BRANCH: {
       i64 val = S + A - P;
@@ -479,14 +462,14 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       // We need to guarantee that the NOP sequence is valid after byte
       // removal (e.g. we can't remove the first 2 bytes of a 4-byte NOP).
       // For the sake of simplicity, we always rewrite the entire NOP sequence.
-      i64 padding_size = align_to(P, bit_ceil(rel.r_addend + 1)) - P;
-      assert(padding_size % 2 == 0);
+      i64 padding_bytes = rel.r_addend - removed_bytes;
+      assert((padding_bytes & 1) == 0);
 
       i64 i = 0;
-      for (; i <= padding_size - 4; i += 4)
+      for (; i <= padding_bytes - 4; i += 4)
         *(ul32 *)(loc + i) = 0x0000'0013; // nop
-      if (i != padding_size)
-        *(ul16 *)(loc + i) = 0x0001;     // c.nop
+      if (i < padding_bytes)
+        *(ul16 *)(loc + i) = 0x0001;      // c.nop
       break;
     }
     case R_RISCV_RVC_BRANCH: {
@@ -538,7 +521,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
   // relocations overwrote instructions with full 32-bit values to allow
   // their corresponding pcrel LO12 relocations to read their values.
   for (i64 i = 0; i < rels.size(); i++) {
-    switch (rels[i].r_type)
+    switch (rels[i].r_type) {
     case R_RISCV_PCREL_LO12_I:
     case R_RISCV_PCREL_LO12_S: {
       Symbol<E> &sym = *file.symbols[rels[i].r_sym];
@@ -552,6 +535,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       else
         write_stype(loc, val);
     }
+    }
   }
 
   // Restore the original instructions pcrel HI20 relocations overwrote.
@@ -563,7 +547,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_RISCV_TLS_GD_HI20: {
       u8 *loc = base + rels[i].r_offset - get_r_delta(i);
       u32 val = *(ul32 *)loc;
-      *(ul32 *)loc = *(ul32 *)(contents.data() + rels[i].r_offset);
+      memcpy(loc, contents.data() + rels[i].r_offset, 4);
       write_utype(loc, val);
     }
     }
@@ -702,41 +686,41 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       continue;
     }
 
-    if (sym.get_type() == STT_GNU_IFUNC)
-      sym.flags |= (NEEDS_GOT | NEEDS_PLT);
+    if (sym.is_ifunc())
+      sym.flags.fetch_or(NEEDS_GOT | NEEDS_PLT, std::memory_order_relaxed);
 
     switch (rel.r_type) {
     case R_RISCV_32:
       if constexpr (E::is_64)
-        scan_abs_rel(ctx, sym, rel);
+        scan_absrel(ctx, sym, rel);
       else
-        scan_abs_dyn_rel(ctx, sym, rel);
+        scan_dyn_absrel(ctx, sym, rel);
       break;
     case R_RISCV_HI20:
-      scan_abs_rel(ctx, sym, rel);
+      scan_absrel(ctx, sym, rel);
       break;
     case R_RISCV_64:
       if constexpr (!E::is_64)
         Fatal(ctx) << *this << ": R_RISCV_64 cannot be used on RV32";
-      scan_abs_dyn_rel(ctx, sym, rel);
+      scan_dyn_absrel(ctx, sym, rel);
       break;
     case R_RISCV_CALL:
     case R_RISCV_CALL_PLT:
       if (sym.is_imported)
-        sym.flags |= NEEDS_PLT;
+        sym.flags.fetch_or(NEEDS_PLT, std::memory_order_relaxed);
       break;
     case R_RISCV_GOT_HI20:
-      sym.flags |= NEEDS_GOT;
+      sym.flags.fetch_or(NEEDS_GOT, std::memory_order_relaxed);
       break;
     case R_RISCV_TLS_GOT_HI20:
-      ctx.has_gottp_rel = true;
-      sym.flags |= NEEDS_GOTTP;
+      ctx.has_gottp_rel.store(true, std::memory_order_relaxed);
+      sym.flags.fetch_or(NEEDS_GOTTP, std::memory_order_relaxed);
       break;
     case R_RISCV_TLS_GD_HI20:
-      sym.flags |= NEEDS_TLSGD;
+      sym.flags.fetch_or(NEEDS_TLSGD, std::memory_order_relaxed);
       break;
     case R_RISCV_32_PCREL:
-      scan_pcrel_rel(ctx, sym, rel);
+      scan_pcrel(ctx, sym, rel);
       break;
     case R_RISCV_BRANCH:
     case R_RISCV_JAL:
@@ -850,7 +834,7 @@ static void shrink_section(Context<E> &ctx, InputSection<E> &isec, bool use_rvc)
       // allow to jump to anywhere in PC ± 2 GiB. If the jump target is
       // close enough to PC, we can use C.J, C.JAL or JAL instead.
       i64 dist = compute_distance(ctx, sym, isec, r);
-      if (dist % 2)
+      if (dist & 1)
         break;
 
       std::string_view contents = isec.contents;
@@ -960,9 +944,10 @@ i64 riscv_resize_sections(Context<E> &ctx) {
   return set_osec_offsets(ctx);
 }
 
-#define INSTANTIATE_RISCV(E)                                                 \
-  template void PltSection<E>::copy_buf(Context<E> &);                       \
-  template void PltGotSection<E>::copy_buf(Context<E> &);                    \
+#define INSTANTIATE(E)                                                       \
+  template void write_plt_header(Context<E> &, u8 *);                        \
+  template void write_plt_entry(Context<E> &, u8 *, Symbol<E> &);            \
+  template void write_pltgot_entry(Context<E> &, u8 *, Symbol<E> &);         \
   template void                                                              \
   EhFrameSection<E>::apply_reloc(Context<E> &, const ElfRel<E> &, u64, u64); \
   template void InputSection<E>::apply_reloc_alloc(Context<E> &, u8 *);      \
@@ -971,9 +956,9 @@ i64 riscv_resize_sections(Context<E> &ctx) {
   template void InputSection<E>::scan_relocations(Context<E> &);             \
   template i64 riscv_resize_sections(Context<E> &);
 
-INSTANTIATE_RISCV(RV64LE);
-INSTANTIATE_RISCV(RV64BE);
-INSTANTIATE_RISCV(RV32LE);
-INSTANTIATE_RISCV(RV32BE);
+INSTANTIATE(RV64LE);
+INSTANTIATE(RV64BE);
+INSTANTIATE(RV32LE);
+INSTANTIATE(RV32BE);
 
 } // namespace mold::elf

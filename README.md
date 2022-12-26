@@ -1,5 +1,13 @@
 # mold: A Modern Linker
 
+[![CI](https://github.com/rui314/mold/actions/workflows/ci.yml/badge.svg)](https://github.com/rui314/mold/actions/workflows/ci.yml)
+[![build result](https://build.opensuse.org/projects/home:marxin:mold/packages/mold/badge.svg?type=default)](https://build.opensuse.org/package/show/home:marxin:mold/mold)
+
+<i>This is a repo of a free, AGPL-licensed version of the linker.
+If you are looking for a commercial, non-AGPL version of the same linker,
+please visit the
+[repo of the sold linker](https://github.com/bluewhalesystems/sold).</i>
+
 mold is a faster drop-in replacement for existing Unix linkers.
 It is several times faster than the LLVM lld linker, the second-fastest
 open-source linker which I originally created a few years ago.
@@ -22,8 +30,12 @@ mold is so fast that it is only 2x _slower_ than `cp` on the same
 machine. Feel free to [file a bug](https://github.com/rui314/mold/issues)
 if you find mold is not faster than other linkers.
 
-mold officially supports x86-64, i386, ARM64, ARM32, 64-bit RISC-V and
-32-bit RISC-V. Little-endian PowerPC64 ELFv2 is partially supported.
+mold supports x86-64, i386, ARM64, ARM32, 64-bit/32-bit little/big-endian
+RISC-V, 64-bit big-endian PowerPC ELFv1, 64-bit little-endian PowerPC ELFv2,
+s390x, SPARC64 and m68k.
+
+mold/macOS is commercial software. For mold/macOS, please visit
+https://github.com/bluewhalesystems/sold.
 
 ## Why does the speed of linking matter?
 
@@ -63,7 +75,7 @@ necessary packages. You may want to run it as root.
 git clone https://github.com/rui314/mold.git
 mkdir mold/build
 cd mold/build
-git checkout v1.5.1
+git checkout v1.8.0
 ../install-build-deps.sh
 cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=c++ ..
 cmake --build . -j $(nproc)
@@ -74,7 +86,9 @@ You may need to pass a C++20 compiler command name to `cmake`.
 In the above case, `c++` is passed. If it doesn't work for you,
 try a specific version of a compiler such as `g++-10` or `clang++-12`.
 
-By default, `mold` is installed to `/usr/local/bin`.
+By default, `mold` is installed to `/usr/local/bin`. You can change
+that by passing `-DCMAKE_INSTALL_PREFIX=<directory>`. For other cmake
+options, see the comments in `CMakeLists.txt`.
 
 If you don't use a recent enough Linux distribution, or if for any reason
 `cmake` in the above commands doesn't work for you, you can use Docker to
@@ -127,8 +141,15 @@ linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=/path/to/mold"]
 ```
 
-where `/path/to/mold` is an absolute path to `mold` exectuable.
-Please make sure you have installed `clang`.
+where `/path/to/mold` is an absolute path to `mold` exectuable. In the
+above example, we use `clang` as a linker driver as it can always take
+the `-fuse-ld` option. If your GCC is recent enough to recognize the
+option, you may be able to remove the `linker = "clang"` line.
+
+```toml
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=/path/to/mold"]
+```
 
 If you want to use mold for all projects, put the above snippet to
 `~/.cargo/config.toml`.
@@ -144,6 +165,30 @@ rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 [target.aarch64-apple-darwin]
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+```
+
+</details>
+
+<details><summary>If you are using Nim</summary>
+
+Create `config.nims` in your project directory with the following:
+
+```nim
+when findExe("mold").len > 0 and defined(linux):
+  switch("passL", "-fuse-ld=mold")
+```
+
+where `mold` must be included in the PATH environment variable. In this example
+The above example uses `gcc` as the linker driver.
+Use the `fuse-ld` option. If your GCC is recent enough to recognize this option.
+
+If you want to use mold for all projects, put the above snippet to `~/.config/config.nims`.
+
+If you are using macOS, you can modify config.nims in a similar manner. Here is an example with mold installed via Homebrew.
+
+```nim
+when findExe("ld64.mold").len > 0 and defined(macosx):
+  switch("passL", "-fuse-ld=ld64.mold")
 ```
 
 </details>
@@ -255,7 +300,7 @@ concern. By purchasing a license, you are guaranteed that mold will be
 maintained for you. Please [contact us](mailto:contact@bluewhale.systems)
 for a commercial license inquiry.
 
-## Acknowledgement
+## Sponsors
 
 We accept donations via [GitHub Sponsors](https://github.com/sponsors/rui314)
 and [OpenCollective](https://opencollective.com/mold-linker).
@@ -263,7 +308,16 @@ We thank you to everybody who sponsors our project. In particular,
 we'd like to acknowledge the following people and organizations who
 have sponsored $128/month or more:
 
-- [300baud](https://github.com/300baud)
-- [Mercury](https://github.com/MercuryTechnologies)
-- [Wei Wu](https://github.com/lazyparser)
+### Corporate sponsors
+
+<a href="https://mercury.com/"><img src="docs/mercury-logo.png" align=center height=120 width=400 alt=Mercury></a>
+
+- [Uber](https://uber.com)
 - [Signal Slot Inc.](https://github.com/signal-slot)
+
+### Individual sponsors
+
+- [300baud](https://github.com/300baud)
+- [Johan Andersson](https://github.com/repi)
+- [Wei Wu](https://github.com/lazyparser)
+- [kyle-elliott](https://github.com/kyle-elliott)

@@ -37,13 +37,22 @@ static void write_adr(u8 *buf, u64 val) {
   *(ul32 *)buf |= (lo << 29) | (hi << 5);
 }
 
+static void write_movn_movz(u8 *buf, i64 val) {
+  *(ul32 *)buf &= 0b0000'0000'0110'0000'0000'0000'0001'1111;
+
+  if (val >= 0)
+    *(ul32 *)buf |= 0xd280'0000 | (bits(val, 15, 0) << 5);  // rewrite to movz
+  else
+    *(ul32 *)buf |= 0x9280'0000 | (bits(~val, 15, 0) << 5); // rewrite to movn
+}
+
 static u64 page(u64 val) {
   return val & 0xffff'ffff'ffff'f000;
 }
 
-static void write_plt_header(Context<E> &ctx, u8 *buf) {
-  // Write PLT header
-  static const ul32 plt0[] = {
+template <>
+void write_plt_header(Context<E> &ctx, u8 *buf) {
+  static const ul32 insn[] = {
     0xa9bf'7bf0, // stp  x16, x30, [sp,#-16]!
     0x9000'0010, // adrp x16, .got.plt[2]
     0xf940'0211, // ldr  x17, [x16, .got.plt[2]]
@@ -57,16 +66,15 @@ static void write_plt_header(Context<E> &ctx, u8 *buf) {
   u64 gotplt = ctx.gotplt->shdr.sh_addr + 16;
   u64 plt = ctx.plt->shdr.sh_addr;
 
-  memcpy(buf, plt0, sizeof(plt0));
+  memcpy(buf, insn, sizeof(insn));
   write_adrp(buf + 4, page(gotplt) - page(plt + 4));
   *(ul32 *)(buf + 8) |= bits(gotplt, 11, 3) << 10;
   *(ul32 *)(buf + 12) |= (gotplt & 0xfff) << 10;
 }
 
-static void write_plt_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
-  u8 *ent = buf + E::plt_hdr_size + sym.get_plt_idx(ctx) * E::plt_size;
-
-  static const ul32 data[] = {
+template <>
+void write_plt_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
+  static const ul32 insn[] = {
     0x9000'0010, // adrp x16, .got.plt[n]
     0xf940'0211, // ldr  x17, [x16, .got.plt[n]]
     0x9100'0210, // add  x16, x16, .got.plt[n]
@@ -76,41 +84,27 @@ static void write_plt_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
   u64 gotplt = sym.get_gotplt_addr(ctx);
   u64 plt = sym.get_plt_addr(ctx);
 
-  memcpy(ent, data, sizeof(data));
-  write_adrp(ent, page(gotplt) - page(plt));
-  *(ul32 *)(ent + 4) |= bits(gotplt, 11, 3) << 10;
-  *(ul32 *)(ent + 8) |= (gotplt & 0xfff) << 10;
+  memcpy(buf, insn, sizeof(insn));
+  write_adrp(buf, page(gotplt) - page(plt));
+  *(ul32 *)(buf + 4) |= bits(gotplt, 11, 3) << 10;
+  *(ul32 *)(buf + 8) |= (gotplt & 0xfff) << 10;
 }
 
 template <>
-void PltSection<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + this->shdr.sh_offset;
-  write_plt_header(ctx, buf);
-  for (Symbol<E> *sym : symbols)
-    write_plt_entry(ctx, buf, *sym);
-}
+void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
+  static const ul32 insn[] = {
+    0x9000'0010, // adrp x16, GOT[n]
+    0xf940'0211, // ldr  x17, [x16, GOT[n]]
+    0xd61f'0220, // br   x17
+    0xd503'201f, // nop
+  };
 
-template <>
-void PltGotSection<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + this->shdr.sh_offset;
+  u64 got = sym.get_got_addr(ctx);
+  u64 plt = sym.get_plt_addr(ctx);
 
-  for (Symbol<E> *sym : symbols) {
-    u8 *ent = buf + sym->get_pltgot_idx(ctx) * E::pltgot_size;
-
-    static const ul32 data[] = {
-      0x9000'0010, // adrp x16, GOT[n]
-      0xf940'0211, // ldr  x17, [x16, GOT[n]]
-      0xd61f'0220, // br   x17
-      0xd503'201f, // nop
-    };
-
-    u64 got = sym->get_got_addr(ctx);
-    u64 plt = sym->get_plt_addr(ctx);
-
-    memcpy(ent, data, sizeof(data));
-    write_adrp(ent, page(got) - page(plt));
-    *(ul32 *)(ent + 4) |= bits(got, 11, 3) << 10;
-  }
+  memcpy(buf, insn, sizeof(insn));
+  write_adrp(buf, page(got) - page(plt));
+  *(ul32 *)(buf + 4) |= bits(got, 11, 3) << 10;
 }
 
 template <>
@@ -167,7 +161,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 
     switch (rel.r_type) {
     case R_AARCH64_ABS64:
-      apply_abs_dyn_rel(ctx, sym, rel, loc, S, A, P, dynrel);
+      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, dynrel);
       break;
     case R_AARCH64_LDST8_ABS_LO12_NC:
       *(ul32 *)loc |= bits(S + A, 11, 0) << 10;
@@ -297,6 +291,30 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC:
       *(ul32 *)loc |= bits(sym.get_gottp_addr(ctx) + A, 11, 3) << 10;
       break;
+    case R_AARCH64_TLSLE_MOVW_TPREL_G0: {
+      i64 val = S + A - ctx.tp_addr;
+      check(val, -(1 << 15), 1 << 15);
+      write_movn_movz(loc, val);
+      break;
+    }
+    case R_AARCH64_TLSLE_MOVW_TPREL_G0_NC:
+      *(ul32 *)loc |= bits(S + A - ctx.tp_addr, 15, 0) << 5;
+      break;
+    case R_AARCH64_TLSLE_MOVW_TPREL_G1: {
+      i64 val = S + A - ctx.tp_addr;
+      check(val, -(1LL << 31), 1LL << 31);
+      write_movn_movz(loc, val >> 16);
+      break;
+    }
+    case R_AARCH64_TLSLE_MOVW_TPREL_G1_NC:
+      *(ul32 *)loc |= bits(S + A - ctx.tp_addr, 31, 16) << 5;
+      break;
+    case R_AARCH64_TLSLE_MOVW_TPREL_G2: {
+      i64 val = S + A - ctx.tp_addr;
+      check(val, -(1LL << 47), 1LL << 47);
+      write_movn_movz(loc, val >> 32);
+      break;
+    }
     case R_AARCH64_TLSLE_ADD_TPREL_HI12: {
       i64 val = S + A - ctx.tp_addr;
       check(val, 0, 1LL << 24);
@@ -316,38 +334,37 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_AARCH64_TLSGD_ADD_LO12_NC:
       *(ul32 *)loc |= bits(sym.get_tlsgd_addr(ctx) + A, 11, 0) << 10;
       break;
-    case R_AARCH64_TLSDESC_ADR_PAGE21: {
-      if (ctx.relax_tlsdesc && !sym.is_imported) {
+    case R_AARCH64_TLSDESC_ADR_PAGE21:
+      if (sym.has_tlsdesc(ctx)) {
+        i64 val = page(sym.get_tlsdesc_addr(ctx) + A) - page(P);
+        check(val, -(1LL << 32), 1LL << 32);
+        write_adrp(loc, val);
+      } else {
         // adrp x0, 0 -> movz x0, #tls_ofset_hi, lsl #16
         i64 val = (S + A - ctx.tp_addr);
         check(val, -(1LL << 32), 1LL << 32);
         *(ul32 *)loc = 0xd2a0'0000 | (bits(val, 32, 16) << 5);
-      } else {
-        i64 val = page(sym.get_tlsdesc_addr(ctx) + A) - page(P);
-        check(val, -(1LL << 32), 1LL << 32);
-        write_adrp(loc, val);
       }
       break;
-    }
     case R_AARCH64_TLSDESC_LD64_LO12:
-      if (ctx.relax_tlsdesc && !sym.is_imported) {
+      if (sym.has_tlsdesc(ctx)) {
+        *(ul32 *)loc |= bits(sym.get_tlsdesc_addr(ctx) + A, 11, 3) << 10;
+      } else {
         // ldr x2, [x0] -> movk x0, #tls_ofset_lo
         u32 offset_lo = (S + A - ctx.tp_addr) & 0xffff;
         *(ul32 *)loc = 0xf280'0000 | (offset_lo << 5);
-      } else {
-        *(ul32 *)loc |= bits(sym.get_tlsdesc_addr(ctx) + A, 11, 3) << 10;
       }
       break;
     case R_AARCH64_TLSDESC_ADD_LO12:
-      if (ctx.relax_tlsdesc && !sym.is_imported) {
+      if (sym.has_tlsdesc(ctx)) {
+        *(ul32 *)loc |= bits(sym.get_tlsdesc_addr(ctx) + A, 11, 0) << 10;
+      } else {
         // add x0, x0, #0 -> nop
         *(ul32 *)loc = 0xd503'201f;
-      } else {
-        *(ul32 *)loc |= bits(sym.get_tlsdesc_addr(ctx) + A, 11, 0) << 10;
       }
       break;
     case R_AARCH64_TLSDESC_CALL:
-      if (ctx.relax_tlsdesc && !sym.is_imported) {
+      if (!sym.has_tlsdesc(ctx)) {
         // blr x2 -> nop
         *(ul32 *)loc = 0xd503'201f;
       }
@@ -381,6 +398,13 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       continue;
     }
 
+    auto check = [&](i64 val, i64 lo, i64 hi) {
+      if (val < lo || hi <= val)
+        Error(ctx) << *this << ": relocation " << rel << " against "
+                   << sym << " out of range: " << val << " is not in ["
+                   << lo << ", " << hi << ")";
+    };
+
     SectionFragment<E> *frag;
     i64 frag_addend;
     std::tie(frag, frag_addend) = get_fragment(ctx, rel);
@@ -395,9 +419,12 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       else
         *(ul64 *)loc = S + A;
       break;
-    case R_AARCH64_ABS32:
-      *(ul32 *)loc = S + A;
+    case R_AARCH64_ABS32: {
+      i64 val = S + A;
+      check(val, 0, 1LL << 32);
+      *(ul32 *)loc = val;
       break;
+    }
     default:
       Fatal(ctx) << *this << ": invalid relocation for non-allocated sections: "
                  << rel;
@@ -429,38 +456,38 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       continue;
     }
 
-    if (sym.get_type() == STT_GNU_IFUNC)
-      sym.flags |= (NEEDS_GOT | NEEDS_PLT);
+    if (sym.is_ifunc())
+      sym.flags.fetch_or(NEEDS_GOT | NEEDS_PLT, std::memory_order_relaxed);
 
     switch (rel.r_type) {
     case R_AARCH64_ABS64:
-      scan_abs_dyn_rel(ctx, sym, rel);
+      scan_dyn_absrel(ctx, sym, rel);
       break;
     case R_AARCH64_ADR_GOT_PAGE:
     case R_AARCH64_LD64_GOT_LO12_NC:
     case R_AARCH64_LD64_GOTPAGE_LO15:
-      sym.flags |= NEEDS_GOT;
+      sym.flags.fetch_or(NEEDS_GOT, std::memory_order_relaxed);
       break;
     case R_AARCH64_CALL26:
     case R_AARCH64_JUMP26:
       if (sym.is_imported)
-        sym.flags |= NEEDS_PLT;
+        sym.flags.fetch_or(NEEDS_PLT, std::memory_order_relaxed);
       break;
     case R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21:
     case R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC:
-      sym.flags |= NEEDS_GOTTP;
+      sym.flags.fetch_or(NEEDS_GOTTP, std::memory_order_relaxed);
       break;
     case R_AARCH64_ADR_PREL_PG_HI21:
-      scan_pcrel_rel(ctx, sym, rel);
+      scan_pcrel(ctx, sym, rel);
       break;
     case R_AARCH64_TLSGD_ADR_PAGE21:
-      sym.flags |= NEEDS_TLSGD;
+      sym.flags.fetch_or(NEEDS_TLSGD, std::memory_order_relaxed);
       break;
     case R_AARCH64_TLSDESC_ADR_PAGE21:
     case R_AARCH64_TLSDESC_LD64_LO12:
     case R_AARCH64_TLSDESC_ADD_LO12:
-      if (!ctx.relax_tlsdesc || sym.is_imported)
-        sym.flags |= NEEDS_TLSDESC;
+      if (!relax_tlsdesc(ctx, sym))
+        sym.flags.fetch_or(NEEDS_TLSDESC, std::memory_order_relaxed);
       break;
     case R_AARCH64_ADD_ABS_LO12_NC:
     case R_AARCH64_ADR_PREL_LO21:
@@ -481,6 +508,11 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_AARCH64_PREL16:
     case R_AARCH64_PREL32:
     case R_AARCH64_PREL64:
+    case R_AARCH64_TLSLE_MOVW_TPREL_G0:
+    case R_AARCH64_TLSLE_MOVW_TPREL_G0_NC:
+    case R_AARCH64_TLSLE_MOVW_TPREL_G1:
+    case R_AARCH64_TLSLE_MOVW_TPREL_G1_NC:
+    case R_AARCH64_TLSLE_MOVW_TPREL_G2:
     case R_AARCH64_TLSLE_ADD_TPREL_HI12:
     case R_AARCH64_TLSLE_ADD_TPREL_LO12:
     case R_AARCH64_TLSLE_ADD_TPREL_LO12_NC:

@@ -1,49 +1,42 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-t=out/test/elf/$MACHINE/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
-echo 'int main() {}' | $CC -o /dev/null -xc - -static >& /dev/null || \
-  { echo skipped; exit; }
+cat <<EOF | $CC -o $t/a.o -c -xc - -O2
+#include <uchar.h>
+#include <wchar.h>
 
-# Skip if target is not x86-64
-[ $MACHINE = x86_64 ] || { echo skipped; exit; }
-
-cat <<'EOF' | $CC -o $t/a.o -c -x assembler -
-  .text
-  .globl main
-main:
-  sub $8, %rsp
-  mov $.L.str+3, %rdi
-  xor %rax, %rax
-  call printf
-  mov $.rodata.str1.1+16, %rdi
-  xor %rax, %rax
-  call printf
-  xor %rax, %rax
-  add $8, %rsp
-  ret
-
-  .section .rodata.str1.1, "aMS", @progbits, 1
-  .string "bar"
-.L.str:
-foo:
-  .string "xyzHello"
-  .string "foo world\n"
+char *cstr1 = "foo";
+wchar_t *wide1 = L"foo";
+char16_t *utf16_1 = u"foo";
+char32_t *utf32_1 = U"foo";
 EOF
 
-$CC -B. -static -o $t/exe $t/a.o
-$QEMU $t/exe | grep -q 'Hello world'
+cat <<EOF | $CC -o $t/b.o -c -xc - -O2
+#include <stdio.h>
+#include <uchar.h>
+#include <wchar.h>
 
-readelf -sW $t/exe | grep -Eq '[0-9] foo$'
+extern char *cstr1;
+extern wchar_t *wide1;
+extern char16_t *utf16_1;
+extern char32_t *utf32_1;
 
-echo OK
+char *cstr2 = "foo";
+wchar_t *wide2 = L"foo";
+char16_t *utf16_2 = u"foo";
+char32_t *utf32_2 = U"foo";
+
+int main() {
+  printf("%p %p %p %p %p %p %p %p\n",
+         cstr1, cstr2, wide1, wide2, utf16_1, utf16_2, utf32_1, utf32_2);
+}
+EOF
+
+# String merging is an optional feature, so test it with the default
+# linker first to verify that it does work on this system.
+$CC -o $t/exe1 $t/a.o $t/b.o -no-pie
+
+if $QEMU $t/exe1 | grep -Eq '^(\S+) \1 (\S+) \2 (\S+) \3 (\S+) \4$'; then
+  $CC -B. -o $t/exe2 $t/a.o $t/b.o -no-pie
+  $QEMU $t/exe2 | grep -Eq '^(\S+) \1 (\S+) \2 (\S+) \3 (\S+) \4$'
+fi

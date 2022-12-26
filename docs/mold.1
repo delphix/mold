@@ -229,7 +229,119 @@ such as system-dependent library search paths, are hard-coded.
 depends only on its command-line arguments.
 .
 .\"=============================================================================
-.Sh OPTIONS
+.Sh MOLD-SPECIFIC OPTIONS
+.Bl -tag -width 6n -compact
+.Pp
+.It Fl -chroot Ns = Ns Ar dir
+Set
+.Ar dir
+to root directory.
+.Pp
+.It Fl -color-diagnostics Ns = Ns Op Sy auto | always | never
+.It Fl -color-diagnostics
+.It Fl -no-color-diagnostics
+.Pp
+Show diagnostics messages in color using ANSI escape sequences.
+.Ar auto
+means that
+.Nm
+prints out messages in color only if the standard output is connected to a TTY. \
+Default is
+.Ar auto .
+.Pp
+.It Fl -fork
+.It Fl -no-fork
+Spawn a child process and let it do the actual linking. \
+When linking a large program, the OS kernel can take a few hundred \
+milliseconds to terminate a
+.Nm
+process.
+.Fl -fork
+hides that latency. By default, it does fork.
+.Pp
+.It Fl -perf
+Print performance statistics.
+.Pp
+.It Fl -repro
+Archive input files as a tar file.
+.Pp
+.It Fl -reverse-sections
+Reverses the order of input sections before assigning them the offsets \
+in the output file.
+.Pp
+This option is useful for finding a bug that depends on an initialization \
+order of global objects. In C++, constructors of global objects in a single \
+ source file are guaranteed to be executed in the source order, but \
+there's no such guarantee across compilation units. Usually, constructors \
+are executed in the order given to the linker, but depending on it is a mistake.
+.Pp
+By reversing the order of input sections using
+.Fl -reverse-sections ,
+you can easily test that your program works in the reversed initialization order.
+.Pp
+.It Fl -run Cm command Ar arg Ar
+Run
+.Cm command
+with
+.Nm
+as
+.Pa /usr/bin/ld .
+.Pp
+.It Fl -shuffle-sections
+.It Fl -shuffle-sections Ns = Ns Ar number
+Randomizes the output by shuffling the order of input sections before \
+assigning them the offsets in the output file. If
+.Ar number
+is given, it's used as a seed for the random number generator, so that \
+the linker produces the same output as for the same seed. If no seed \
+is given, a random number is used as a seed.
+.Pp
+This option is useful for benchmarking. Modern CPUs are sensitive to program's \
+memory layout. A seeming benign change in program layout (such as a small \
+size increase of a function in the middle of a program) can affect program's \
+performance. Therefore, \
+even if you write new code and get a good benchmark result, it is hard \
+to say whether or not the new code improves the programs performance. \
+It is possible that the new memory layout happens to perform better.
+.Pp
+By running a benchmark multiple time with shuffling memory layout using
+.Fl -shuffle-sections ,
+you can isolate your program's real performance number from the randomness \
+caused by memory layout changes.
+.Pp
+.It Fl -stats
+Print input statistics.
+.Pp
+.It Fl -thread-count Ns = Ns Ar count
+Use
+.Ar count
+number of threads.
+.Pp
+.It Fl -threads
+.It Fl -no-threads
+Use multiple threads.
+By default,
+.Nm
+uses as many threads as the number of cores or 32, whichever is the smallest.
+The reason why it is capped to 32 is because
+.Nm
+doesn't scale well beyond that point.
+To use only one thread, pass
+.Fl -no-threads
+or
+.Fl -thread-count Ns = Ns Sy 1 .
+.Pp
+.Pp
+.It Fl -quick-exit
+.It Fl -no-quick-exit
+Use or do not use
+.Dv quick_exit
+to exit.
+.
+.El \" End of options list
+.
+.\"-----------------------------------------------------------------------------
+.Sh GNU-COMPATIBLE OPTIONS
 .Bl -tag -width 6n -compact
 .It Fl -help
 Report usage information to stdout and exit.
@@ -366,6 +478,26 @@ Instead of generating an executable or a shared object file, combine
 input object files to generate another object file that can be used as
 an input to a linker.
 .Pp
+.It Fl -relocatable-merge-sections
+By default,
+.Nm
+doesn't merge input sections by name when merging input object files into a \
+single output object file for
+.Fl r .
+For example,
+.Ar .text.foo
+and
+.Ar .text.bar
+aren't merged for
+.Fl r
+even though they are merged into
+.Ar .text
+according to the default section merging rules.
+.Pp
+This option changes the behavior so that
+.Nm
+merges input sections by name by the default section merging rules.
+.Pp
 .It Fl s , Fl -strip-all
 Omit
 .Li \.symtab
@@ -468,23 +600,6 @@ sets a random 128-bit UUID.
 sets
 .Ar hexstring .
 .Pp
-.It Fl -chroot Ns = Ns Ar dir
-Set
-.Ar dir
-to root directory.
-.Pp
-.It Fl -color-diagnostics Ns = Ns Op Sy auto | always | never
-.It Fl -color-diagnostics
-.It Fl -no-color-diagnostics
-.Pp
-Show diagnostics messages in color using ANSI escape sequences.
-.Ar auto
-means that
-.Nm
-prints out messages in color only if the standard output is connected to a TTY. \
-Default is
-.Ar auto .
-.Pp
 .It Fl -defsym Ns = Ns Ar symbol Ns = Ns Ar value
 .Pp
 .It Fl -compress-debug-sections Ns = Ns Op Sy none | zlib | zlib-gabi | zstd
@@ -523,7 +638,7 @@ Write a dependency file to
 The contents of the written file is readable by
 .Cm make ,
 which defines only one rule with the linker's output file as a target \
-and all input fiels as its prerequisite. Users are expected to include \
+and all input files as its prerequisite. Users are expected to include \
 the generated dependency file into a Makefile to automate the \
 dependency management. This option is analogous to the compiler's
 .Fl MM Fl MF
@@ -536,6 +651,11 @@ Same as
 .Fl -export-dynamic-symbol-list ,
 except that it implies
 .Fl -Bsymbolic .
+.Pp
+If
+.Ar file
+does not exist in the current directory, it is searched from library \
+search paths for the sake of compatibility with GNU ld.
 .Pp
 .It Fl -eh-frame-hdr
 .It Fl -no-eh-frame-hdr
@@ -554,10 +674,6 @@ instructs the linker to leave relocation sections in the output file. \
 Some post-link binary analysis or optimization tools such as LLVM Bolt \
 need them.
 .Pp
-.Nm
-always creates RELA-type relocation sections even if the native \
-ELF format is REL-type so that it is easy to read addends.
-.Pp
 .It Fl -enable-new-dtags
 .It Fl -disable-new-dtags
 By default,
@@ -570,6 +686,19 @@ mold emits DT_RPATH for
 .Fl -rpath
 instead.
 .Pp
+.It Fl -execute-only
+Traditionally, most processors require both executable and readable bits to 1 \
+to make the page executable, which allows machine code to read itself as data
+at runtime. This is actually what an attacker often does after gaining a limited \
+control of a process to find pieces of machine code they can use to gain the \
+full control of the process.
+.Pp
+As a mitigation, some recent processors allows "execute-only" pages. \
+If a page is execute-only, you can call a function there as long as you know \
+its address but can't read it as data.
+.Pp
+This option marks text segments execute-only. This option currently works only \
+on some ARM64 processors.
 .Pp
 .It Fl -exclude-libs Ns = Ns Ar libraries Ns ...
 Mark all symbols in the given
@@ -598,16 +727,6 @@ Treat warnings as errors.
 Call
 .Ar symbol
 at unload-time.
-.Pp
-.It Fl -fork
-.It Fl -no-fork
-Spawn a child process and let it do the actual linking.
-When linking a large program, the OS kernel can take a few hundred \
-milliseconds to terminate a
-.Nm
-process.
-.Fl -fork
-hides that latency.
 .Pp
 .It Fl -gc-sections
 .It Fl -no-gc-sections
@@ -644,7 +763,7 @@ is given,
 tries to merge all identical functions. This reduces the size of the output \
 most, but it is not
 .Dq safe
-optimization. It is guaranteed in C and C++ that two pointeres pointing two \
+optimization. It is guaranteed in C and C++ that two pointers pointing two \
 different functions will never be equal, but
 .Fl -icf=all
 breaks that assumption as two functions have the same address after merging. \
@@ -722,15 +841,9 @@ package management command such as
 .Cm rpm
 to embed metadata regarding a package to each executable file.
 .Pp
-.It Fl -perf
-Print performance statistics.
-.Pp
 .It Fl -pie , -pic-executable
 .It Fl -no-pie , -no-pic-executable
 Create a position-independent executable.
-.Pp
-.It Fl -preload
-Preload object files.
 .Pp
 .It Fl -print-gc-sections
 .It Fl -no-print-gc-sections
@@ -765,12 +878,6 @@ by as-needed basis but don't want to change the global state of
 you can append "--push-state --as-needed -lfoo --pop-state" to the \
 linker command line options.
 .Pp
-.It Fl -quick-exit
-.It Fl -no-quick-exit
-Use
-.Dv quick_exit
-to exit.
-.Pp
 .It Fl -relax
 .It Fl -no-relax
 Rewrite machine instructions with more efficient ones for some relocations.
@@ -781,11 +888,6 @@ Like
 .Fl -undefined ,
 except the new symbol must be defined by the end of the link.
 .Pp
-.It Fl -repro
-Embed input files into
-.Dv .repro
-section.
-.Pp
 .It Fl -retain-symbols-file Ns = Ns Ar file
 Keep only symbols listed in
 .Ar file .
@@ -795,7 +897,7 @@ is a text file
 containing a symbol name on each line.
 .Nm
 discards all local
-symbols as well as global sybmol that are not in
+symbols as well as global symbol that are not in
 .Ar file .
 Note that this option removes symbols only from
 .Dv .symtab
@@ -803,22 +905,10 @@ section and does not affect
 .Dv .dynsym
 section, which is used for dynamic linking.
 .Pp
-.It Fl -reverse-sections
-Reverses the order of input sections before assigning them the offsets \
-in the output file.
-.Pp
 .It Fl -rpath Ns = Ns Ar dir
 Add
 .Ar dir
 to runtime search path.
-.Pp
-.It Fl -run Cm command Ar arg Ar
-Run
-.Cm command
-with
-.Nm
-as
-.Pa /usr/bin/ld .
 .Pp
 .It Fl -section-start Ns = Ns Ar section Ns = Ns Ar address
 Set
@@ -831,15 +921,6 @@ is a hexadecimal number that may start with an optional
 .Pp
 .It Fl -shared , -Bshareable
 Create a share library.
-.Pp
-.It Fl -shuffle-sections
-.It Fl -shuffle-sections Ns = Ns Ar number
-Randomizes the output by shuffleing the order of input sections before \
-assigning them the offsets in the output file. If
-.Ar number
-is given, it's used as a seed for the random number generator, so that \
-the linker produces the same output as for the same seed. If no seed \
-is given, it uses a random number as a seed.
 .Pp
 .It Fl -spare-dynamic-tags Ns = Ns Ar number
 Reserve given
@@ -863,34 +944,20 @@ needed but want to avoid the overhead of running
 .It Fl -static
 Do not link against shared libraries.
 .Pp
-.It Fl -stats
-Print input statistics.
-.Pp
 .It Fl -sysroot Ns = Ns Ar dir
 Set target system root directory to
 .Ar dir .
-.Pp
-.It Fl -thread-count Ns = Ns Ar count
-Use
-.Ar count
-number of threads.
-.Pp
-.It Fl -threads
-.It Fl -no-threads
-Use multiple threads.
-By default,
-.Nm
-uses as many threads as the number of cores or 32, whichever is the smallest.
-The reason why it is capped to 32 is because
-.Nm
-doesn't scale well beyond that point.
-To use only one thread, pass
-.Fl -no-threads
-or
-.Fl -thread-count Ns = Ns Sy 1 .
-.Pp
 .It Fl -trace
 Print name of each input file.
+.Pp
+.It Fl -undefined-version
+.It Fl -no-undefined-version
+By default,
+.Nm
+warns on a symbol specified by a version script or by
+.Fl -export-dynamic-symbol
+if it is not defined. You can silence the warning by
+.Fl -undefined-version .
 .Pp
 .It Fl -unique Ns = Ns Ar pattern
 Don't merge input sections that match
@@ -903,6 +970,10 @@ How to handle undefined symbols.
 .It Fl -version-script Ns = Ns Ar file
 Read version script from
 .Ar file .
+If
+.Ar file
+does not exist in the current directory, it is searched from library search paths \
+for the sake of compatibility with GNU ld.
 .Pp
 .It Fl -warn-common
 .It Fl -no-warn-common
@@ -1049,7 +1120,7 @@ disables the feature.
 .It Fl z Cm noseparate-code
 If one memory page contains multiple segments,
 the page protection bits are set in such a way that needed attributes \
-(writable or executable) are satisifed for all segments.
+(writable or executable) are satisfied for all segments.
 This usually happens at a boundary of two segments with two different \
 attributes.
 .Pp
@@ -1135,7 +1206,6 @@ Mark object to interpose all DSOs but executable.
 .It Fl -no-allow-shlib-undefined
 .It Fl -no-copy-dt-needed-entries
 .It Fl -no-fatal-warnings
-.It Fl -no-undefined-version
 .It Fl -nostdlib
 .It Fl -rpath-link Ns = Ns Ar dir
 .It Fl -sort-common
@@ -1157,7 +1227,7 @@ Ignored
 .Sh SEE ALSO
 .Xr gold 1 ,
 .Xr ld 1 ,
-.Xr elf 5
+.Xr elf 5 ,
 .Xr ld.so 8
 .
 .\"=============================================================================

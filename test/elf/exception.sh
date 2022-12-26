@@ -1,19 +1,8 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-t=out/test/elf/$MACHINE/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
 static=1
-echo 'int main() {}' | $CC -o /dev/null -xc - -static >& /dev/null || static=0
+test_cflags -static || static=0
 
 cat <<EOF > $t/a.cc
 int main() {
@@ -77,4 +66,13 @@ if [ $MACHINE = x86_64 -o $MACHINE = aarch64 ]; then
   $QEMU $t/exe10
 fi
 
-echo OK
+# riscv64-linux-gnu-strip crashes for some reason
+if [ $MACHINE != riscv32 ]; then
+  $CXX -B. -o $t/exe11 $t/b.o -pie
+  $STRIP $t/exe11
+  $QEMU $t/exe11
+
+  $CXX -B. -o $t/exe12 $t/c.o -no-pie
+  $STRIP $t/exe12
+  $QEMU $t/exe12
+fi
