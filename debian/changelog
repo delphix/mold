@@ -1,3 +1,9 @@
+mold (1.8.0+dfsg-1) unstable; urgency=medium
+
+  * New upstream release
+
+ -- Sylvestre Ledru <sylvestre@debian.org>  Mon, 26 Dec 2022 12:48:57 +0100
+
 mold (1.7.1+dfsg-1) unstable; urgency=medium
 
   * New upstream release
