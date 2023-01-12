@@ -163,11 +163,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
                    << lo << ", " << hi << ")";
     };
 
-#define S   sym.get_addr(ctx)
-#define A   rel.r_addend
-#define P   (get_addr() + rel.r_offset)
-#define G   (sym.get_got_idx(ctx) * sizeof(Word<E>))
-#define GOT ctx.got->shdr.sh_addr
+    u64 S = sym.get_addr(ctx);
+    u64 A = rel.r_addend;
+    u64 P = (get_addr() + rel.r_offset);
+    u64 G = (sym.get_got_idx(ctx) * sizeof(Word<E>));
+    u64 GOT = ctx.got->shdr.sh_addr;
 
     switch (rel.r_type) {
     case R_SPARC_64:
@@ -404,7 +404,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_SPARC_TLS_GD_CALL:
     case R_SPARC_TLS_LDM_CALL:
       if (ctx.arg.is_static)
-        *(ub32 *)loc |= bits(ctx.sparc_tls_get_addr->shdr.sh_addr + A - P, 31, 2);
+        *(ub32 *)loc |= bits(ctx.extra.tls_get_addr->shdr.sh_addr + A - P, 31, 2);
       else
         *(ub32 *)loc |= bits(ctx.tls_get_addr->get_addr(ctx) + A - P, 31, 2);
       break;
@@ -415,10 +415,10 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ub32 *)loc |= bits(ctx.got->get_tlsld_addr(ctx) + A - GOT, 9, 0);
       break;
     case R_SPARC_TLS_LDO_HIX22:
-      *(ub32 *)loc |= bits(S + A - ctx.tls_begin, 31, 10);
+      *(ub32 *)loc |= bits(S + A - ctx.dtp_addr, 31, 10);
       break;
     case R_SPARC_TLS_LDO_LOX10:
-      *(ub32 *)loc |= bits(S + A - ctx.tls_begin, 9, 0);
+      *(ub32 *)loc |= bits(S + A - ctx.dtp_addr, 9, 0);
       break;
     case R_SPARC_TLS_IE_HI22:
       *(ub32 *)loc |= bits(sym.get_gottp_addr(ctx) + A - GOT, 31, 10);
@@ -445,12 +445,6 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     default:
       unreachable();
     }
-
-#undef S
-#undef A
-#undef P
-#undef G
-#undef GOT
   }
 }
 
@@ -482,8 +476,8 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
     i64 frag_addend;
     std::tie(frag, frag_addend) = get_fragment(ctx, rel);
 
-#define S (frag ? frag->get_addr(ctx) : sym.get_addr(ctx))
-#define A (frag ? frag_addend : (i64)rel.r_addend)
+    u64 S = frag ? frag->get_addr(ctx) : sym.get_addr(ctx);
+    u64 A = frag ? frag_addend : (i64)rel.r_addend;
 
     switch (rel.r_type) {
     case R_SPARC_64:
@@ -501,17 +495,14 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       break;
     }
     case R_SPARC_TLS_DTPOFF32:
-      *(ub32 *)loc = S + A - ctx.tls_begin;
+      *(ub32 *)loc = S + A - ctx.dtp_addr;
       break;
     case R_SPARC_TLS_DTPOFF64:
-      *(ub64 *)loc = S + A - ctx.tls_begin;
+      *(ub64 *)loc = S + A - ctx.dtp_addr;
       break;
     default:
       Fatal(ctx) << *this << ": apply_reloc_nonalloc: " << rel;
     }
-
-#undef S
-#undef A
   }
 }
 

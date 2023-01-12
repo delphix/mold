@@ -115,14 +115,17 @@ void create_synthetic_sections(Context<E> &ctx) {
 
   if (ctx.arg.is_static) {
     if constexpr (is_s390x<E>)
-      ctx.s390x_tls_get_offset = push(new S390XTlsGetOffsetSection);
+      ctx.extra.tls_get_offset = push(new S390XTlsGetOffsetSection);
 
     if constexpr (is_sparc<E>)
-      ctx.sparc_tls_get_addr = push(new SparcTlsGetAddrSection);
+      ctx.extra.tls_get_addr = push(new SparcTlsGetAddrSection);
   }
 
-  if constexpr (std::is_same_v<E, PPC64V1>)
-    ctx.ppc64_opd = push(new PPC64OpdSection);
+  if constexpr (is_ppc64v1<E>)
+    ctx.extra.opd = push(new PPC64OpdSection);
+
+  if constexpr (is_alpha<E>)
+    ctx.extra.got = push(new AlphaGotSection);
 
   // If .dynamic exists, .dynsym and .dynstr must exist as well
   // since .dynamic refers them.
@@ -384,7 +387,7 @@ static u64 canonicalize_type(std::string_view name, u64 type) {
       return SHT_FINI_ARRAY;
   }
 
-  if constexpr (std::is_same_v<E, X86_64>)
+  if constexpr (is_x86_64<E>)
     if (type == SHT_X86_64_UNWIND)
       return SHT_PROGBITS;
   return type;
@@ -410,10 +413,19 @@ get_output_name(Context<E> &ctx, std::string_view name, u64 flags) {
   if (flags & SHF_MERGE)
     return name;
 
-  if (name.starts_with(".ARM.exidx"))
-    return ".ARM.exidx";
-  if (name.starts_with(".ARM.extab"))
-    return ".ARM.extab";
+  if constexpr (is_arm32<E>) {
+    if (name.starts_with(".ARM.exidx"))
+      return ".ARM.exidx";
+    if (name.starts_with(".ARM.extab"))
+      return ".ARM.extab";
+  }
+
+  if constexpr (is_alpha<E>) {
+    if (name.starts_with(".sdata."))
+      return ".sdata";
+    if (name.starts_with(".sbss."))
+      return ".sbss";
+  }
 
   if (ctx.arg.z_keep_text_section_prefix) {
     static std::string_view prefixes[] = {
@@ -583,17 +595,17 @@ void create_internal_file(Context<E> &ctx) {
 
   // Add --defsym symbols
   for (i64 i = 0; i < ctx.arg.defsyms.size(); i++) {
-    std::pair<Symbol<E> *, std::variant<Symbol<E> *, u64>> &defsym = ctx.arg.defsyms[i];
-    add(defsym.first);
+    Symbol<E> *sym = ctx.arg.defsyms[i].first;
+    std::variant<Symbol<E> *, u64> val = ctx.arg.defsyms[i].second;
+    add(sym);
 
-    if (std::holds_alternative<Symbol<E> *>(defsym.second)) {
+    if (Symbol<E> **ref = std::get_if<Symbol<E> *>(&val)) {
       // Add an undefined symbol to keep a reference to the defsym target.
       // This prevents elimination by e.g. LTO or gc-sections.
       // The undefined symbol will never make to the final object file; we
       // double-check that the defsym target is not undefined in
       // fix_synthetic_symbols.
-      auto sym = std::get<Symbol<E> *>(defsym.second);
-      add_undef(sym);
+      add_undef(*ref);
     }
   }
 
@@ -669,9 +681,9 @@ void add_synthetic_symbols(Context<E> &ctx) {
   ctx.__executable_start = add("__executable_start");
 
   ctx.__rel_iplt_start =
-    add(is_rela<E> ? "__rela_iplt_start" : "__rel_iplt_start");
+    add(E::is_rela ? "__rela_iplt_start" : "__rel_iplt_start");
   ctx.__rel_iplt_end =
-    add(is_rela<E> ? "__rela_iplt_end" : "__rel_iplt_end");
+    add(E::is_rela ? "__rela_iplt_end" : "__rel_iplt_end");
 
   if (ctx.arg.eh_frame_hdr)
     ctx.__GNU_EH_FRAME_HDR = add("__GNU_EH_FRAME_HDR");
@@ -692,13 +704,16 @@ void add_synthetic_symbols(Context<E> &ctx) {
     if (!ctx.arg.shared)
       ctx.__global_pointer = add("__global_pointer$");
 
-  if constexpr (std::is_same_v<E, ARM32>) {
+  if constexpr (is_arm32<E>) {
     ctx.__exidx_start = add("__exidx_start");
     ctx.__exidx_end = add("__exidx_end");
   }
 
-  if constexpr (is_ppc<E>)
-    ctx.TOC = add(".TOC.");
+  if constexpr (is_ppc64<E>)
+    ctx.extra.TOC = add(".TOC.");
+
+  if constexpr (is_ppc32<E>)
+    ctx.extra._SDA_BASE_ = add("_SDA_BASE_");
 
   for (Chunk<E> *chunk : ctx.chunks) {
     if (std::optional<std::string> name = get_start_stop_name(ctx, *chunk)) {
@@ -736,7 +751,7 @@ void add_synthetic_symbols(Context<E> &ctx) {
     if (target) {
       ElfSym<E> &esym = obj.elf_syms[i + 1];
       esym.st_type = target->esym().st_type;
-      if constexpr (requires { esym.ppc_local_entry; })
+      if constexpr (is_ppc64v2<E>)
         esym.ppc_local_entry = target->esym().ppc_local_entry;
     }
 
@@ -947,12 +962,6 @@ template <typename E>
 void check_symbol_types(Context<E> &ctx) {
   Timer t(ctx, "check_symbol_types");
 
-  auto normalize_type = [](u32 type) {
-    if (type == STT_GNU_IFUNC)
-      return STT_FUNC;
-    return type;
-  };
-
   auto check = [&](InputFile<E> *file) {
     for (i64 i = file->first_global; i < file->elf_syms.size(); i++) {
       const ElfSym<E> &esym = file->elf_syms[i];
@@ -961,16 +970,20 @@ void check_symbol_types(Context<E> &ctx) {
       if (!sym.file)
         continue;
 
-      u32 their_type = normalize_type(sym.esym().st_type);
-      u32 our_type = normalize_type(esym.st_type);
+      u32 x = sym.esym().st_type;
+      if (x == STT_GNU_IFUNC)
+        x = STT_FUNC;
 
-      if (their_type != STT_NOTYPE && our_type != STT_NOTYPE &&
-          their_type != our_type)
+      u32 y = esym.st_type;
+      if (y == STT_GNU_IFUNC)
+        y = STT_FUNC;
+
+      if (x != STT_NOTYPE && y != STT_NOTYPE && x != y)
         Warn(ctx) << "symbol type mismatch: " << sym << '\n'
                   << ">>> defined in " << *sym.file << " as "
-                  << stt_to_string(sym.esym().st_type) << '\n'
+                  << stt_to_string<E>(sym.esym().st_type) << '\n'
                   << ">>> defined in " << *file << " as "
-                  << stt_to_string(esym.st_type);
+                  << stt_to_string<E>(esym.st_type);
     }
   };
 
@@ -1306,15 +1319,18 @@ void scan_relocations(Context<E> &ctx) {
       }
     }
 
-    if constexpr (std::is_same_v<E, PPC64V1>)
-      if (sym->flags & NEEDS_OPD)
-        ctx.ppc64_opd->add_symbol(ctx, sym);
+    if constexpr (is_ppc64v1<E>)
+      if (sym->flags & NEEDS_PPC_OPD)
+        ctx.extra.opd->add_symbol(ctx, sym);
 
     sym->flags = 0;
   }
 
   if (ctx.needs_tlsld)
     ctx.got->add_tlsld(ctx);
+
+  if constexpr (is_alpha<E>)
+    ctx.extra.got->finalize();
 
   if (ctx.has_textrel && ctx.arg.warn_textrel)
     Warn(ctx) << "creating a DT_TEXTREL in an output file";
@@ -1351,18 +1367,18 @@ void copy_chunks(Context<E> &ctx) {
   // sections first. This is because REL-type relocation sections (as
   // opposed to RELA-type) stores relocation addends to target sections.
   tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
-    if (chunk->shdr.sh_type != (is_rela<E> ? SHT_RELA : SHT_REL))
+    if (chunk->shdr.sh_type != (E::is_rela ? SHT_RELA : SHT_REL))
       copy(*chunk);
   });
 
   tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
-    if (chunk->shdr.sh_type == (is_rela<E> ? SHT_RELA : SHT_REL))
+    if (chunk->shdr.sh_type == (E::is_rela ? SHT_RELA : SHT_REL))
       copy(*chunk);
   });
 
   report_undef_errors(ctx);
 
-  if constexpr (std::is_same_v<E, ARM32>)
+  if constexpr (is_arm32<E>)
     fixup_arm_exidx_section(ctx);
 }
 
@@ -1616,6 +1632,7 @@ void clear_padding(Context<E> &ctx) {
 //   <writable RELRO data>
 //   .got
 //   .toc
+//   .alpha_got
 //   <writable RELRO bss>
 //   .relro_padding
 //   <writable non-RELRO data>
@@ -1695,12 +1712,14 @@ void sort_output_sections_regular(Context<E> &ctx) {
     if (chunk->shdr.sh_type == SHT_NOTE)
       return -chunk->shdr.sh_addralign;
 
-    if (chunk == ctx.relro_padding)
-      return INT_MAX;
-    if (chunk->name == ".toc")
-      return 2;
     if (chunk == ctx.got)
       return 1;
+    if (chunk->name == ".toc")
+      return 2;
+    if (chunk->name == ".alpha_got")
+      return 3;
+    if (chunk == ctx.relro_padding)
+      return INT_MAX;
     return 0;
   };
 
@@ -2144,9 +2163,9 @@ i64 set_osec_offsets(Context<E> &ctx) {
 
 template <typename E>
 static i64 get_num_irelative_relocs(Context<E> &ctx) {
-  return std::count_if(
-    ctx.got->got_syms.begin(), ctx.got->got_syms.end(),
-    [](Symbol<E> *sym) { return sym->is_ifunc(); });
+  i64 n = std::count_if(ctx.got->got_syms.begin(), ctx.got->got_syms.end(),
+                        [](Symbol<E> *sym) { return sym->is_ifunc(); });
+  return n + ctx.num_ifunc_dynrels;
 }
 
 template <typename E>
@@ -2302,14 +2321,14 @@ void fix_synthetic_symbols(Context<E> &ctx) {
   }
 
   // PPC64's ".TOC." symbol.
-  if (ctx.TOC) {
+  if constexpr (is_ppc64<E>) {
     if (Chunk<E> *chunk = find(".got")) {
-      start(ctx.TOC, chunk, 0x8000);
+      start(ctx.extra.TOC, chunk, 0x8000);
     } else if (Chunk<E> *chunk = find(".toc")) {
-      start(ctx.TOC, chunk, 0x8000);
+      start(ctx.extra.TOC, chunk, 0x8000);
     } else {
-      ctx.TOC->set_output_section(sections[0]);
-      ctx.TOC->value = 0;
+      ctx.extra.TOC->set_output_section(sections[0]);
+      ctx.extra.TOC->value = 0;
     }
   }
 

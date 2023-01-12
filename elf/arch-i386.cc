@@ -40,6 +40,72 @@ namespace mold::elf {
 using E = I386;
 
 template <>
+i64 get_addend(u8 *loc, const ElfRel<E> &rel) {
+  switch (rel.r_type) {
+  case R_386_NONE:
+    return 0;
+  case R_386_8:
+  case R_386_PC8:
+    return *loc;
+  case R_386_16:
+  case R_386_PC16:
+    return *(ul16 *)loc;
+  case R_386_32:
+  case R_386_PC32:
+  case R_386_GOT32:
+  case R_386_GOT32X:
+  case R_386_PLT32:
+  case R_386_GOTOFF:
+  case R_386_GOTPC:
+  case R_386_TLS_LDM:
+  case R_386_TLS_GOTIE:
+  case R_386_TLS_LE:
+  case R_386_TLS_IE:
+  case R_386_TLS_GD:
+  case R_386_TLS_LDO_32:
+  case R_386_SIZE32:
+  case R_386_TLS_GOTDESC:
+    return *(ul32 *)loc;
+  }
+  unreachable();
+}
+
+template <>
+void write_addend(u8 *loc, i64 val, const ElfRel<E> &rel) {
+  switch (rel.r_type) {
+  case R_386_NONE:
+    break;
+  case R_386_8:
+  case R_386_PC8:
+    *loc = val;
+    break;
+  case R_386_16:
+  case R_386_PC16:
+    *(ul16 *)loc = val;
+    break;
+  case R_386_32:
+  case R_386_PC32:
+  case R_386_GOT32:
+  case R_386_GOT32X:
+  case R_386_PLT32:
+  case R_386_GOTOFF:
+  case R_386_GOTPC:
+  case R_386_TLS_LDM:
+  case R_386_TLS_GOTIE:
+  case R_386_TLS_LE:
+  case R_386_TLS_IE:
+  case R_386_TLS_GD:
+  case R_386_TLS_LDO_32:
+  case R_386_SIZE32:
+  case R_386_TLS_GOTDESC:
+    *(ul32 *)loc = val;
+    break;
+  default:
+    unreachable();
+  }
+}
+
+template <>
 void write_plt_header(Context<E> &ctx, u8 *buf) {
   if (ctx.arg.pic) {
     static const u8 insn[] = {
@@ -130,41 +196,6 @@ void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
   }
 }
 
-template <>
-void write_addend(u8 *loc, i64 val, const ElfRel<E> &rel) {
-  switch (rel.r_type) {
-  case R_386_NONE:
-    break;
-  case R_386_8:
-  case R_386_PC8:
-    *loc = val;
-    break;
-  case R_386_16:
-  case R_386_PC16:
-    *(ul16 *)loc = val;
-    break;
-  case R_386_32:
-  case R_386_PC32:
-  case R_386_GOT32:
-  case R_386_GOT32X:
-  case R_386_PLT32:
-  case R_386_GOTOFF:
-  case R_386_GOTPC:
-  case R_386_TLS_LDM:
-  case R_386_TLS_GOTIE:
-  case R_386_TLS_LE:
-  case R_386_TLS_IE:
-  case R_386_TLS_GD:
-  case R_386_TLS_LDO_32:
-  case R_386_SIZE32:
-  case R_386_TLS_GOTDESC:
-    *(ul32 *)loc = val;
-    break;
-  default:
-    unreachable();
-  }
-}
-
 static u32 relax_got32x(u8 *loc) {
   // mov imm(%reg1), %reg2 -> lea imm(%reg1), %reg2
   if (loc[0] == 0x8b)
@@ -196,11 +227,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
                    << lo << ", " << hi << ")";
     };
 
-#define S   sym.get_addr(ctx)
-#define A   get_addend(*this, rel)
-#define P   (get_addr() + rel.r_offset)
-#define G   (sym.get_got_idx(ctx) * sizeof(Word<E>))
-#define GOT ctx.got->shdr.sh_addr
+    u64 S = sym.get_addr(ctx);
+    u64 A = get_addend(*this, rel);
+    u64 P = get_addr() + rel.r_offset;
+    u64 G = sym.get_got_idx(ctx) * sizeof(Word<E>);
+    u64 GOT = ctx.got->shdr.sh_addr;
 
     switch (rel.r_type) {
     case R_386_8: {
@@ -332,7 +363,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       }
       break;
     case R_386_TLS_LDO_32:
-      *(ul32 *)loc = S + A - ctx.tls_begin;
+      *(ul32 *)loc = S + A - ctx.dtp_addr;
       break;
     case R_386_SIZE32:
       *(ul32 *)loc = sym.esym().st_size + A;
@@ -358,12 +389,6 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     default:
       unreachable();
     }
-
-#undef S
-#undef A
-#undef P
-#undef G
-#undef GOT
   }
 }
 
@@ -395,10 +420,9 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
     i64 frag_addend;
     std::tie(frag, frag_addend) = get_fragment(ctx, rel);
 
-#define S (frag ? frag->get_addr(ctx) : sym.get_addr(ctx))
-#define A (frag ? frag_addend : get_addend(*this, rel))
-#define G   (sym.get_got_idx(ctx) * sizeof(Word<E>))
-#define GOT ctx.got->shdr.sh_addr
+    u64 S = frag ? frag->get_addr(ctx) : sym.get_addr(ctx);
+    u64 A = frag ? frag_addend : get_addend(*this, rel);
+    u64 GOT = ctx.got->shdr.sh_addr;
 
     switch (rel.r_type) {
     case R_386_8: {
@@ -444,7 +468,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       if (std::optional<u64> val = get_tombstone(sym, frag))
         *(ul32 *)loc = *val;
       else
-        *(ul32 *)loc = S + A - ctx.tls_begin;
+        *(ul32 *)loc = S + A - ctx.dtp_addr;
       break;
     case R_386_SIZE32:
       *(ul32 *)loc = sym.esym().st_size + A;
@@ -452,11 +476,6 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
     default:
       unreachable();
     }
-
-#undef S
-#undef A
-#undef G
-#undef GOT
   }
 }
 

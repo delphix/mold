@@ -30,7 +30,7 @@ InputFile<E>::InputFile(Context<E> &ctx, MappedFile<Context<E>> *mf)
   i64 num_sections = (ehdr.e_shnum == 0) ? sh_begin->sh_size : ehdr.e_shnum;
 
   if (mf->data + mf->size < (u8 *)(sh_begin + num_sections))
-    Fatal(ctx) << *this << ": e_shoff or e_shnum corrupted: "
+    Fatal(ctx) << mf->name << ": e_shoff or e_shnum corrupted: "
                << mf->size << " " << num_sections;
   elf_sections = {sh_begin, sh_begin + num_sections};
 
@@ -250,6 +250,10 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
 
       this->sections[i] = std::make_unique<InputSection<E>>(ctx, *this, name, i);
 
+      if constexpr (is_ppc32<E>)
+        if (name == ".got2")
+          ppc32_got2 = this->sections[i].get();
+
       // Save debug sections for --gdb-index.
       if (ctx.arg.gdb_index) {
         InputSection<E> *isec = this->sections[i].get();
@@ -295,7 +299,7 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
   // Attach relocation sections to their target sections.
   for (i64 i = 0; i < this->elf_sections.size(); i++) {
     const ElfShdr<E> &shdr = this->elf_sections[i];
-    if (shdr.sh_type != (is_rela<E> ? SHT_RELA : SHT_REL))
+    if (shdr.sh_type != (E::is_rela ? SHT_RELA : SHT_REL))
       continue;
 
     if (shdr.sh_info >= sections.size())
@@ -441,7 +445,7 @@ static Symbol<E> *insert_symbol(Context<E> &ctx, const ElfSym<E> &esym,
 
   Symbol<E> *sym = get_symbol(ctx, key, name);
 
-  if (esym.is_undef() && sym->wrap) {
+  if (esym.is_undef() && sym->is_wrapped) {
     key = save_string(ctx, "__wrap_" + std::string(key));
     name = save_string(ctx, "__wrap_" + std::string(name));
     return get_symbol(ctx, key, name);
@@ -960,7 +964,7 @@ ObjectFile<E>::mark_live_objects(Context<E> &ctx,
     else
       merge_visibility(ctx, sym, esym.st_visibility);
 
-    if (sym.traced)
+    if (sym.is_traced)
       print_trace_symbol(ctx, *this, esym, sym);
 
     if (esym.is_weak())
@@ -973,7 +977,7 @@ ObjectFile<E>::mark_live_objects(Context<E> &ctx,
     if (keep && fast_mark(sym.file->is_alive)) {
       feeder(sym.file);
 
-      if (sym.traced)
+      if (sym.is_traced)
         SyncOut(ctx) << "trace-symbol: " << *this << " keeps " << *sym.file
                      << " for " << sym;
     }
@@ -1055,7 +1059,7 @@ void ObjectFile<E>::claim_unresolved_symbols(Context<E> &ctx) {
     }
 
     auto claim = [&](bool is_imported) {
-      if (sym.traced)
+      if (sym.is_traced)
         SyncOut(ctx) << "trace-symbol: " << *this << ": unresolved"
                      << (esym.is_weak() ? " weak" : "")
                      << " symbol " << sym;
@@ -1491,14 +1495,14 @@ SharedFile<E>::mark_live_objects(Context<E> &ctx,
     const ElfSym<E> &esym = this->elf_syms[i];
     Symbol<E> &sym = *this->symbols[i];
 
-    if (sym.traced)
+    if (sym.is_traced)
       print_trace_symbol(ctx, *this, esym, sym);
 
     if (esym.is_undef() && sym.file && !sym.file->is_dso &&
         fast_mark(sym.file->is_alive)) {
       feeder(sym.file);
 
-      if (sym.traced)
+      if (sym.is_traced)
         SyncOut(ctx) << "trace-symbol: " << *this << " keeps " << *sym.file
                      << " for " << sym;
     }
