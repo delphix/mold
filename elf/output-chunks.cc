@@ -38,7 +38,7 @@ static u32 djb_hash(std::string_view name) {
 
 template <typename E>
 u64 get_eflags(Context<E> &ctx) {
-  if constexpr (std::is_same_v<E, ARM32>)
+  if constexpr (is_arm32<E>)
     return EF_ARM_EABI_VER5;
 
   if constexpr (is_riscv<E>) {
@@ -55,7 +55,7 @@ u64 get_eflags(Context<E> &ctx) {
     return ret;
   }
 
-  if constexpr (std::is_same_v<E, PPC64V2>)
+  if constexpr (is_ppc64v2<E>)
     return 2;
   return 0;
 }
@@ -160,7 +160,7 @@ i64 to_phdr_flags(Context<E> &ctx, Chunk<E> *chunk) {
   if (!write && !ctx.arg.rosegment)
     exec = true;
 
-  return PF_R | (write ? PF_W : 0) | (exec ? PF_X : 0);
+  return PF_R | (write ? PF_W : PF_NONE) | (exec ? PF_X : PF_NONE);
 }
 
 // PT_GNU_RELRO segment is a security mechanism to make more pages
@@ -188,7 +188,8 @@ bool is_relro(Context<E> &ctx, Chunk<E> *chunk) {
            chunk == ctx.got || chunk == ctx.dynamic ||
            chunk == ctx.relro_padding ||
            (ctx.arg.z_now && ctx.gotplt && chunk == ctx.gotplt) ||
-           chunk->name == ".toc" || chunk->name.ends_with(".rel.ro");
+           chunk->name == ".alpha_got" || chunk->name == ".toc" ||
+           chunk->name.ends_with(".rel.ro");
   return false;
 }
 
@@ -207,7 +208,7 @@ static void init_thread_pointers(Context<E> &ctx, ElfPhdr<E> phdr) {
   // and %a0/%a1 on s390x) refers past the end of all TLVs for historical
   // reasons. TLVs are accessed with negative offsets from TP.
   //
-  // On ARM, the runtime appends two words at the beginning of TLV
+  // On ARM and SH4, the runtime appends two words at the beginning of TLV
   // template image when copying TLVs to per-thread area, so we need
   // to offset it.
   //
@@ -224,7 +225,7 @@ static void init_thread_pointers(Context<E> &ctx, ElfPhdr<E> phdr) {
   // load/store instruction.
   if constexpr (is_x86<E> || is_sparc<E> || is_s390x<E>) {
     ctx.tp_addr = align_to(phdr.p_vaddr + phdr.p_memsz, phdr.p_align);
-  } else if constexpr (is_arm<E>) {
+  } else if constexpr (is_arm<E> || is_sh4<E> || is_alpha<E>) {
     ctx.tp_addr = align_down(phdr.p_vaddr - sizeof(Word<E>) * 2, phdr.p_align);
   } else if constexpr (is_ppc<E> || is_m68k<E>) {
     ctx.tp_addr = phdr.p_vaddr + 0x7000;
@@ -410,7 +411,7 @@ static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
   }
 
   // Add PT_ARM_EDXIDX
-  if constexpr (std::is_same_v<E, ARM32>) {
+  if constexpr (is_arm32<E>) {
     for (Chunk<E> *chunk : ctx.chunks) {
       if (chunk->shdr.sh_type == SHT_ARM_EXIDX) {
         define(PT_ARM_EXIDX, PF_R, 4, chunk);
@@ -500,9 +501,14 @@ void RelDynSection<E>::update_shdr(Context<E> &ctx) {
   offset += ctx.copyrel->symbols.size() * sizeof(ElfRel<E>);
   offset += ctx.copyrel_relro->symbols.size() * sizeof(ElfRel<E>);
 
-  if constexpr (std::is_same_v<E, PPC64V1>)
+  if constexpr (is_ppc64v1<E>)
     if (ctx.arg.pic)
-      offset += ctx.ppc64_opd->symbols.size() * sizeof(ElfRel<E>) * 2;
+      offset += ctx.extra.opd->symbols.size() * sizeof(ElfRel<E>) * 2;
+
+  if constexpr (is_alpha<E>) {
+    ctx.extra.got->reldyn_offset = offset;
+    offset += ctx.extra.got->get_reldyn_size(ctx) * sizeof(ElfRel<E>);
+  }
 
   for (ObjectFile<E> *file : ctx.objs) {
     file->reldyn_offset = offset;
@@ -523,13 +529,13 @@ void RelDynSection<E>::copy_buf(Context<E> &ctx) {
   for (Symbol<E> *sym : ctx.copyrel_relro->symbols)
     *rel++ = ElfRel<E>(sym->get_addr(ctx), E::R_COPY, sym->get_dynsym_idx(ctx), 0);
 
-  if constexpr (std::is_same_v<E, PPC64V1>) {
+  if constexpr (is_ppc64v1<E>) {
     if (ctx.arg.pic) {
-      for (Symbol<E> *sym : ctx.ppc64_opd->symbols) {
+      for (Symbol<E> *sym : ctx.extra.opd->symbols) {
         u64 addr = sym->get_opd_addr(ctx);
         *rel++ = ElfRel<E>(addr, E::R_RELATIVE, 0,
                            sym->get_addr(ctx, NO_PLT | NO_OPD));
-        *rel++ = ElfRel<E>(addr + 8, E::R_RELATIVE, 0, ctx.TOC->value);
+        *rel++ = ElfRel<E>(addr + 8, E::R_RELATIVE, 0, ctx.extra.TOC->value);
       }
     }
   }
@@ -543,11 +549,12 @@ void RelDynSection<E>::sort(Context<E> &ctx) {
   ElfRel<E> *end = (ElfRel<E> *)((u8 *)begin + this->shdr.sh_size);
 
   auto get_rank = [](u32 r_type) {
-    switch (r_type) {
-    case E::R_RELATIVE: return 0;
-    case E::R_IRELATIVE: return 2;
-    default: return 1;
-    }
+    if (r_type == E::R_RELATIVE)
+      return 0;
+    if constexpr (supports_ifunc<E>)
+      if (r_type == E::R_IRELATIVE)
+        return 2;
+    return 1;
   };
 
   // This is the reason why we sort dynamic relocations. Quote from
@@ -784,9 +791,9 @@ static std::vector<Word<E>> create_dynamic_section(Context<E> &ctx) {
     define(DT_FILTER, ctx.dynstr->find_string(str));
 
   if (ctx.reldyn->shdr.sh_size) {
-    define(is_rela<E> ? DT_RELA : DT_REL, ctx.reldyn->shdr.sh_addr);
-    define(is_rela<E> ? DT_RELASZ : DT_RELSZ, ctx.reldyn->shdr.sh_size);
-    define(is_rela<E> ? DT_RELAENT : DT_RELENT, sizeof(ElfRel<E>));
+    define(E::is_rela ? DT_RELA : DT_REL, ctx.reldyn->shdr.sh_addr);
+    define(E::is_rela ? DT_RELASZ : DT_RELSZ, ctx.reldyn->shdr.sh_size);
+    define(E::is_rela ? DT_RELAENT : DT_RELENT, sizeof(ElfRel<E>));
   }
 
   if (ctx.relrdyn) {
@@ -798,12 +805,15 @@ static std::vector<Word<E>> create_dynamic_section(Context<E> &ctx) {
   if (ctx.relplt->shdr.sh_size) {
     define(DT_JMPREL, ctx.relplt->shdr.sh_addr);
     define(DT_PLTRELSZ, ctx.relplt->shdr.sh_size);
-    define(DT_PLTREL, is_rela<E> ? DT_RELA : DT_REL);
+    define(DT_PLTREL, E::is_rela ? DT_RELA : DT_REL);
   }
 
   if constexpr (is_sparc<E>) {
     if (ctx.plt->shdr.sh_size)
       define(DT_PLTGOT, ctx.plt->shdr.sh_addr);
+  } else if constexpr (is_ppc32<E>) {
+    if (ctx.gotplt->shdr.sh_size)
+      define(DT_PLTGOT, ctx.gotplt->shdr.sh_addr + GotPltSection<E>::HDR_SIZE);
   } else {
     if (ctx.gotplt->shdr.sh_size)
       define(DT_PLTGOT, ctx.gotplt->shdr.sh_addr);
@@ -911,7 +921,10 @@ static std::vector<Word<E>> create_dynamic_section(Context<E> &ctx) {
   if (flags1)
     define(DT_FLAGS_1, flags1);
 
-  if constexpr (is_ppc<E>) {
+  if constexpr (is_ppc32<E>)
+    define(DT_PPC_GOT, ctx.gotplt->shdr.sh_addr);
+
+  if constexpr (is_ppc64<E>) {
     // PPC64_GLINK is defined by the psABI to refer 32 bytes before
     // the first PLT entry. I don't know why it's 32 bytes off, but
     // it's what it is.
@@ -1077,13 +1090,13 @@ void OutputSection<E>::compute_symtab_size(Context<E> &ctx) {
     this->strtab_size = 0;
     this->num_local_symtab = 0;
 
-    if constexpr (std::is_same_v<E, ARM32>)
+    if constexpr (is_arm32<E>)
       this->strtab_size = 9; // for "$t", "$a" and "$d" symbols
 
     for (std::unique_ptr<RangeExtensionThunk<E>> &thunk : thunks) {
       // For ARM32, we emit additional symbol "$t", "$a" and "$d" for
       // each thunk to mark the beginning of ARM code.
-      if constexpr (std::is_same_v<E, ARM32>)
+      if constexpr (is_arm32<E>)
         this->num_local_symtab += thunk->symbols.size() * 4;
       else
         this->num_local_symtab += thunk->symbols.size();
@@ -1109,7 +1122,7 @@ void OutputSection<E>::populate_symtab(Context<E> &ctx) {
     u8 *strtab_base = ctx.buf + ctx.strtab->shdr.sh_offset;
     u8 *strtab = strtab_base + this->strtab_offset;
 
-    if constexpr (std::is_same_v<E, ARM32>) {
+    if constexpr (is_arm32<E>) {
       // ARM uses these symbols to mark the begining of Thumb code, ARM
       // code and data, respectively. Our thunk contains all of them.
       strtab += write_string(strtab, "$t");
@@ -1136,7 +1149,7 @@ void OutputSection<E>::populate_symtab(Context<E> &ctx) {
         strtab += write_string(strtab, "$thunk");
 
         // Emit "$t", "$a" and "$d" if ARM32.
-        if constexpr (std::is_same_v<E, ARM32>) {
+        if constexpr (is_arm32<E>) {
           write_esym(this->strtab_offset, 0);
           write_esym(this->strtab_offset + 3, 4);
           write_esym(this->strtab_offset + 6, 16);
@@ -1233,9 +1246,11 @@ static std::vector<GotEntry<E>> get_got_entries(Context<E> &ctx) {
     }
 
     // IFUNC always needs to be fixed up by the dynamic linker.
-    if (sym->is_ifunc()) {
-      entries.push_back({idx, sym->get_addr(ctx, NO_PLT), E::R_IRELATIVE});
-      continue;
+    if constexpr (supports_ifunc<E>) {
+      if (sym->is_ifunc()) {
+        entries.push_back({idx, sym->get_addr(ctx, NO_PLT), E::R_IRELATIVE});
+        continue;
+      }
     }
 
     // If we know an address at link-time, fill that GOT entry now.
@@ -1318,7 +1333,7 @@ void GotSection<E>::copy_buf(Context<E> &ctx) {
   memset(buf, 0, this->shdr.sh_size);
 
   // s390x psABI requires GOT[0] to be set to the link-time value of _DYNAMIC.
-  if constexpr (std::is_same_v<E, S390X>)
+  if constexpr (is_s390x<E>)
     if (ctx.dynamic)
       buf[0] = ctx.dynamic->shdr.sh_addr;
 
@@ -1326,7 +1341,7 @@ void GotSection<E>::copy_buf(Context<E> &ctx) {
   // path for -static-pie wrongly assumed that GOT[0] refers _DYNAMIC.
   //
   // https://sourceware.org/git/?p=glibc.git;a=commitdiff;h=43d06ed218fc8be5
-  if constexpr (std::is_same_v<E, ARM64>)
+  if constexpr (is_arm64<E>)
     if (ctx.dynamic && ctx.arg.is_static && ctx.arg.pie)
       buf[0] = ctx.dynamic->shdr.sh_addr;
 
@@ -1442,7 +1457,7 @@ void GotPltSection<E>::copy_buf(Context<E> &ctx) {
   // On PPC64, it's dynamic loader responsibility to fill the .got.plt
   // section. Dynamic loader finds the address of the first PLT entry by
   // DT_PPC64_GLINK and assumes that each PLT entry is 4 bytes long.
-  if constexpr (!is_ppc<E>) {
+  if constexpr (!is_ppc64<E>) {
     Word<E> *buf = (Word<E> *)(ctx.buf + this->shdr.sh_offset);
 
     // The first slot of .got.plt points to _DYNAMIC, as requested by
@@ -1619,17 +1634,20 @@ ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym, u32 st_name,
   else
     esym.st_bind = sym.esym().st_bind;
 
-  if constexpr (requires { esym.ppc_local_entry; })
+  if constexpr (is_ppc64v2<E>)
     esym.ppc_local_entry = sym.esym().ppc_local_entry;
+
+  if constexpr (is_alpha<E>)
+    esym.alpha_st_other = sym.esym().alpha_st_other;
 
   auto get_st_shndx = [&](Symbol<E> &sym) -> u32 {
     if (SectionFragment<E> *frag = sym.get_frag())
       if (frag->is_alive)
         return frag->output_section.shndx;
 
-    if constexpr (std::is_same_v<E, PPC64V1>)
+    if constexpr (is_ppc64v1<E>)
       if (sym.has_opd(ctx))
-        return ctx.ppc64_opd->shndx;
+        return ctx.extra.opd->shndx;
 
     if (InputSection<E> *isec = sym.get_input_section()) {
       if (isec->is_alive)
@@ -2257,15 +2275,15 @@ void EhFrameRelocSection<E>::copy_buf(Context<E> &ctx) {
       InputSection<E> *target = sym.get_input_section();
       buf->r_sym = target->output_section->shndx;
 
-      if constexpr (is_rela<E>)
-        buf->r_addend = r.r_addend + target->offset;
+      if constexpr (E::is_rela)
+        buf->r_addend = get_addend(isec, r) + target->offset;
       else if (ctx.arg.relocatable)
         write_addend(ctx.buf + ctx.eh_frame->shdr.sh_offset + offset,
                      get_addend(isec, r) + target->offset, r);
     } else {
       buf->r_sym = sym.get_output_sym_idx(ctx);
-      if constexpr (is_rela<E>)
-        buf->r_addend = r.r_addend;
+      if constexpr (E::is_rela)
+        buf->r_addend = get_addend(isec, r);
     }
 
     buf->r_offset = ctx.eh_frame->shdr.sh_addr + offset;
@@ -2876,13 +2894,13 @@ void GdbIndexSection<E>::copy_buf(Context<E> &ctx) {
   const i64 shard_size = map.nbuckets / map.NUM_SHARDS;
 
   tbb::parallel_for((i64)0, (i64)map.NUM_SHARDS, [&](i64 i) {
-    U32<E> *attrs = (U32<E> *)buf;
+    u32 *attrs = (u32 *)buf;
 
     for (i64 j = shard_size * i; j < shard_size * (i + 1); j++) {
       if (map.has_key(j)) {
         MapEntry &ent = map.values[j];
         u32 idx = (ent.owner.load()->attrs_offset + ent.attr_offset) / 4;
-        U32<E> *start = attrs + idx + 1;
+        u32 *start = attrs + idx + 1;
         std::sort(start, start + attrs[idx]);
       }
     }
@@ -3028,7 +3046,7 @@ void CompressedSection<E>::copy_buf(Context<E> &ctx) {
 template <typename E>
 RelocSection<E>::RelocSection(Context<E> &ctx, OutputSection<E> &osec)
   : output_section(osec) {
-  if constexpr (is_rela<E>) {
+  if constexpr (E::is_rela) {
     this->name = save_string(ctx, ".rela" + std::string(osec.name));
     this->shdr.sh_type = SHT_RELA;
   } else {
@@ -3087,7 +3105,7 @@ void RelocSection<E>::copy_buf(Context<E> &ctx) {
         addend = get_addend(isec, rel) + target->offset;
       }
 
-      if constexpr (is_rela<E>) {
+      if constexpr (E::is_rela) {
         out.r_addend = addend;
       } else if (ctx.arg.relocatable) {
         u8 *base = ctx.buf + isec.output_section->shdr.sh_offset + isec.offset;
@@ -3096,9 +3114,14 @@ void RelocSection<E>::copy_buf(Context<E> &ctx) {
     } else {
       if (sym.sym_idx)
         out.r_sym = sym.get_output_sym_idx(ctx);
-      if constexpr (is_rela<E>)
-        out.r_addend = rel.r_addend;
+
+      if constexpr (E::is_rela)
+        out.r_addend = get_addend(isec, rel);
     }
+
+    if constexpr (is_alpha<E>)
+      if (rel.r_type == R_ALPHA_GPDISP || rel.r_type == R_ALPHA_LITUSE)
+        out.r_addend = rel.r_addend;
   };
 
   tbb::parallel_for((i64)0, (i64)output_section.members.size(), [&](i64 i) {

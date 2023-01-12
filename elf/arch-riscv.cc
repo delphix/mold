@@ -309,11 +309,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
                    << lo << ", " << hi << ")";
     };
 
-#define S   sym.get_addr(ctx)
-#define A   rel.r_addend
-#define P   (get_addr() + r_offset)
-#define G   (sym.get_got_idx(ctx) * sizeof(Word<E>))
-#define GOT ctx.got->shdr.sh_addr
+    u64 S = sym.get_addr(ctx);
+    u64 A = rel.r_addend;
+    u64 P = get_addr() + r_offset;
+    u64 G = sym.get_got_idx(ctx) * sizeof(Word<E>);
+    u64 GOT = ctx.got->shdr.sh_addr;
 
     switch (rel.r_type) {
     case R_RISCV_32:
@@ -383,17 +383,14 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         *(ul32 *)loc = S + A - P;
       }
       break;
-    case R_RISCV_HI20: {
-      i64 val = S + A;
+    case R_RISCV_HI20:
+      assert(removed_bytes == 0 || removed_bytes == 4);
       if (removed_bytes == 0) {
+        i64 val = S + A;
         check(val, -(1LL << 31), 1LL << 31);
         write_utype(loc, val);
-      } else {
-        assert(removed_bytes == 4);
-        assert(sign_extend(val, 11) == val);
       }
       break;
-    }
     case R_RISCV_LO12_I:
     case R_RISCV_LO12_S: {
       i64 val = S + A;
@@ -509,12 +506,6 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     default:
       unreachable();
     }
-
-#undef S
-#undef A
-#undef P
-#undef G
-#undef GOT
   }
 
   // Handle PC-relative LO12 relocations. In the above loop, pcrel HI20
@@ -575,8 +566,8 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
     i64 frag_addend;
     std::tie(frag, frag_addend) = get_fragment(ctx, rel);
 
-#define S (frag ? frag->get_addr(ctx) : sym.get_addr(ctx))
-#define A (frag ? frag_addend : (i64)rel.r_addend)
+    u64 S = frag ? frag->get_addr(ctx) : sym.get_addr(ctx);
+    u64 A = frag ? frag_addend : (i64)rel.r_addend;
 
     switch (rel.r_type) {
     case R_RISCV_32:
@@ -632,9 +623,6 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
                  << rel;
       break;
     }
-
-#undef S
-#undef A
   }
 }
 
@@ -854,15 +842,13 @@ static void shrink_section(Context<E> &ctx, InputSection<E> &isec, bool use_rvc)
       }
       break;
     }
-    case R_RISCV_HI20: {
+    case R_RISCV_HI20:
       // If the upper 20 bits are all zero, we can remove LUI.
       // The corresponding instructions referred by LO12_I/LO12_S
       // relocations will use the zero register instead.
-      i64 val = sym.get_addr(ctx);
-      if (sign_extend(val, 11) == val)
+      if (bits(sym.get_addr(ctx), 31, 12) == 0)
         delta += 4;
       break;
-    }
     case R_RISCV_TPREL_HI20:
     case R_RISCV_TPREL_ADD: {
       // These relocations are used to materialize the upper 20 bits of
