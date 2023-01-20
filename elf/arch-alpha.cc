@@ -170,9 +170,10 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
+    const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
     u8 *loc = base + rel.r_offset;
 
-    if (!sym.file) {
+    if (!is_resolved(sym, esym)) {
       record_undef_error(ctx, rel);
       continue;
     }
@@ -217,8 +218,9 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
+    const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
 
-    if (!sym.file) {
+    if (!is_resolved(sym, esym)) {
       record_undef_error(ctx, rel);
       continue;
     }
@@ -231,29 +233,30 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       scan_dyn_absrel(ctx, sym, rel);
       break;
     case R_ALPHA_LITERAL:
-      if (rel.r_addend) {
-        sym.flags.fetch_or(NEEDS_ALPHA_GOT, std::memory_order_relaxed);
+      if (rel.r_addend)
         ctx.extra.got->add_symbol(sym, rel.r_addend);
-      } else {
-        sym.flags.fetch_or(NEEDS_GOT, std::memory_order_relaxed);
-      }
+      else
+        sym.flags |= NEEDS_GOT;
       break;
     case R_ALPHA_SREL32:
       scan_pcrel(ctx, sym, rel);
       break;
     case R_ALPHA_BRSGP:
       if (sym.is_imported)
-        sym.flags.fetch_or(NEEDS_PLT, std::memory_order_relaxed);
+        sym.flags |= NEEDS_PLT;
       break;
     case R_ALPHA_TLSGD:
-      sym.flags.fetch_or(NEEDS_TLSGD, std::memory_order_relaxed);
+      sym.flags |= NEEDS_TLSGD;
       break;
     case R_ALPHA_TLSLDM:
-      ctx.needs_tlsld.store(true, std::memory_order_relaxed);
+      ctx.needs_tlsld = true;
       break;
     case R_ALPHA_GOTTPREL:
+      sym.flags |= NEEDS_GOTTP;
+      break;
     case R_ALPHA_TPRELHI:
-      sym.flags.fetch_or(NEEDS_GOTTP, std::memory_order_relaxed);
+    case R_ALPHA_TPRELLO:
+      check_tlsle(ctx, sym, rel);
       break;
     case R_ALPHA_GPREL32:
     case R_ALPHA_LITUSE:
@@ -263,7 +266,6 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_ALPHA_GPRELLOW:
     case R_ALPHA_DTPRELHI:
     case R_ALPHA_DTPRELLO:
-    case R_ALPHA_TPRELLO:
       break;
     default:
       Fatal(ctx) << *this << ": unknown relocation: " << rel;
@@ -273,16 +275,15 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 
 // An R_ALPHA_LITERAL relocation may request the linker to create a GOT
 // entry for an external symbol with a non-zero addend. This is an unusual
-// request which we cannot find in any other targets.
+// request which is not found in any other targets.
 //
-// Referring an external symbol with a non-zero addend is a bad practice.
-// To see why, assume that we have two R_ALPHA_LITERAL relocs to symbol X
-// with addend 8 and 16. To satisfy that request, we need to create not
-// only one but two GOT entries for symbol X with different addends.
+// Referring an external symbol with a non-zero addend is a bad practice
+// because we need to create as many dynamic relocations as the number of
+// distinctive addends for the same symbol.
 //
 // We don't want to mess up the implementation of the common GOT section
 // for Alpha. So we create another GOT-like section, .alpha_got. Any GOT
-// entry for an R_ALPHA_LITERAL reloc with a non-zero addends is created
+// entry for an R_ALPHA_LITERAL reloc with a non-zero addend is created
 // not in .got but in .alpha_got.
 //
 // Since .alpha_got entries are accessed relative to GP, .alpha_got
@@ -304,9 +305,9 @@ u64 AlphaGotSection::get_addr(Symbol<E> &sym, i64 addend) {
   return this->shdr.sh_addr + (it - entries.begin()) * sizeof(Word<E>);
 }
 
-i64 AlphaGotSection::get_reldyn_size(Context<E> &ctx) {
+i64 AlphaGotSection::get_reldyn_size(Context<E> &ctx) const {
   i64 n = 0;
-  for (Entry &e : entries)
+  for (const Entry &e : entries)
     if (e.sym->is_imported || (ctx.arg.pic && !e.sym->is_absolute()))
       n++;
   return n;
@@ -319,9 +320,8 @@ void AlphaGotSection::finalize() {
 }
 
 void AlphaGotSection::copy_buf(Context<E> &ctx) {
-  ElfRel<E> *dynrel = nullptr;
-  if (ctx.reldyn)
-    dynrel = (ElfRel<E> *)(ctx.buf + ctx.reldyn->shdr.sh_offset + reldyn_offset);
+  ElfRel<E> *dynrel = (ElfRel<E> *)(ctx.buf + ctx.reldyn->shdr.sh_offset +
+                                    reldyn_offset);
 
   for (i64 i = 0; i < entries.size(); i++) {
     Entry &e = entries[i];

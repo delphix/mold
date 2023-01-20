@@ -57,7 +57,10 @@ InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file,
   // early for REL-type ELF types to read relocation addends from
   // section contents. For RELA-type, we don't need to do this because
   // addends are in relocations.
-  if constexpr (!E::is_rela)
+  //
+  // SH-4 stores addends to sections despite being RELA, which is a
+  // special (and buggy) case.
+  if constexpr (!E::is_rela || is_sh4<E>)
     uncompress(ctx);
 }
 
@@ -307,6 +310,15 @@ void InputSection<E>::scan_toc_rel(Context<E> &ctx, Symbol<E> &sym,
 }
 
 template <typename E>
+void InputSection<E>::check_tlsle(Context<E> &ctx, Symbol<E> &sym,
+                                  const ElfRel<E> &rel) {
+  if (ctx.arg.shared)
+    Error(ctx) << *this << ": relocation " << rel << " against `" << sym
+               << "` can not be used when making a shared object;"
+               << " recompile with -fPIC";
+}
+
+template <typename E>
 static void apply_absrel(Context<E> &ctx, InputSection<E> &isec,
                          Symbol<E> &sym, const ElfRel<E> &rel, u8 *loc,
                          u64 S, i64 A, u64 P, ElfRel<E> *&dynrel,
@@ -406,7 +418,7 @@ void InputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
 
 // Get the name of a function containin a given offset.
 template <typename E>
-std::string_view InputSection<E>::get_func_name(Context<E> &ctx, i64 offset) {
+std::string_view InputSection<E>::get_func_name(Context<E> &ctx, i64 offset) const {
   for (const ElfSym<E> &esym : file.elf_syms) {
     if (esym.st_shndx == shndx && esym.st_type == STT_FUNC &&
         esym.st_value <= offset && offset < esym.st_value + esym.st_size) {
@@ -440,40 +452,9 @@ void InputSection<E>::record_undef_error(Context<E> &ctx, const ElfRel<E> &rel) 
   acc->second.push_back(ss.str());
 }
 
-// Report all undefined symbols, grouped by symbol.
-template <typename E>
-void report_undef_errors(Context<E> &ctx) {
-  constexpr i64 max_errors = 3;
-
-  for (auto &pair : ctx.undef_errors) {
-    std::string_view sym_name = pair.first;
-    std::span<std::string> errors = pair.second;
-
-    if (ctx.arg.demangle)
-      sym_name = demangle(sym_name);
-
-    std::stringstream ss;
-    ss << "undefined symbol: " << sym_name << "\n";
-
-    for (i64 i = 0; i < errors.size() && i < max_errors; i++)
-      ss << errors[i];
-
-    if (errors.size() > max_errors)
-      ss << ">>> referenced " << (errors.size() - max_errors) << " more times\n";
-
-    if (ctx.arg.unresolved_symbols == UNRESOLVED_ERROR)
-      Error(ctx) << ss.str();
-    else if (ctx.arg.unresolved_symbols == UNRESOLVED_WARN)
-      Warn(ctx) << ss.str();
-  }
-
-  ctx.checkpoint();
-}
-
 using E = MOLD_TARGET;
 
 template struct CieRecord<E>;
 template class InputSection<E>;
-template void report_undef_errors(Context<E> &);
 
 } // namespace mold::elf

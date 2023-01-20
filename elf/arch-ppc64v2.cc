@@ -51,7 +51,7 @@
 // confusing. Since the runtime only cares about segments, we should be
 // able to name sections whatever we want.
 //
-// https://openpowerfoundation.org/specifications/64bitelfabi/
+// https://github.com/rui314/psabi/blob/main/ppc64v2.pdf
 
 #include "mold.h"
 
@@ -59,15 +59,11 @@ namespace mold::elf {
 
 using E = PPC64V2;
 
-static u64 lo(u64 x)       { return x & 0xffff; }
-static u64 hi(u64 x)       { return x >> 16; }
-static u64 ha(u64 x)       { return (x + 0x8000) >> 16; }
-static u64 high(u64 x)     { return (x >> 16) & 0xffff; }
-static u64 higha(u64 x)    { return ((x + 0x8000) >> 16) & 0xffff; }
-static u64 higher(u64 x)   { return (x >> 32) & 0xffff; }
-static u64 highera(u64 x)  { return ((x + 0x8000) >> 32) & 0xffff; }
-static u64 highest(u64 x)  { return x >> 48; }
-static u64 highesta(u64 x) { return (x + 0x8000) >> 48; }
+static u64 lo(u64 x)    { return x & 0xffff; }
+static u64 hi(u64 x)    { return x >> 16; }
+static u64 ha(u64 x)    { return (x + 0x8000) >> 16; }
+static u64 high(u64 x)  { return (x >> 16) & 0xffff; }
+static u64 higha(u64 x) { return ((x + 0x8000) >> 16) & 0xffff; }
 
 // .plt is used only for lazy symbol resolution on PPC64. All PLT
 // calls are made via range extension thunks even if they are within
@@ -288,9 +284,10 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
+    const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
     u8 *loc = base + rel.r_offset;
 
-    if (!sym.file) {
+    if (!is_resolved(sym, esym)) {
       record_undef_error(ctx, rel);
       continue;
     }
@@ -346,14 +343,15 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
+    const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
 
-    if (!sym.file) {
+    if (!is_resolved(sym, esym)) {
       record_undef_error(ctx, rel);
       continue;
     }
 
     if (sym.is_ifunc())
-      sym.flags.fetch_or(NEEDS_GOT | NEEDS_PLT, std::memory_order_relaxed);
+      sym.flags |= NEEDS_GOT | NEEDS_PLT;
 
     switch (rel.r_type) {
     case R_PPC64_ADDR64:
@@ -363,20 +361,24 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
         scan_dyn_absrel(ctx, sym, rel);
       break;
     case R_PPC64_GOT_TPREL16_HA:
-      sym.flags.fetch_or(NEEDS_GOTTP, std::memory_order_relaxed);
+      sym.flags |= NEEDS_GOTTP;
       break;
     case R_PPC64_REL24:
       if (sym.is_imported)
-        sym.flags.fetch_or(NEEDS_PLT, std::memory_order_relaxed);
+        sym.flags |= NEEDS_PLT;
       break;
     case R_PPC64_PLT16_HA:
-      sym.flags.fetch_or(NEEDS_GOT, std::memory_order_relaxed);
+      sym.flags |= NEEDS_GOT;
       break;
     case R_PPC64_GOT_TLSGD16_HA:
-      sym.flags.fetch_or(NEEDS_TLSGD, std::memory_order_relaxed);
+      sym.flags |= NEEDS_TLSGD;
       break;
     case R_PPC64_GOT_TLSLD16_HA:
-      ctx.needs_tlsld.store(true, std::memory_order_relaxed);
+      ctx.needs_tlsld = true;
+      break;
+    case R_PPC64_TPREL16_HA:
+    case R_PPC64_TPREL16_LO:
+      check_tlsle(ctx, sym, rel);
       break;
     case R_PPC64_REL64:
     case R_PPC64_TOC16_HA:
@@ -390,8 +392,6 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_PPC64_PLT16_LO_DS:
     case R_PPC64_PLTSEQ:
     case R_PPC64_PLTCALL:
-    case R_PPC64_TPREL16_HA:
-    case R_PPC64_TPREL16_LO:
     case R_PPC64_GOT_TPREL16_LO_DS:
     case R_PPC64_GOT_TLSGD16_LO:
     case R_PPC64_GOT_TLSLD16_LO:
