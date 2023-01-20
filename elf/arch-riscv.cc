@@ -326,18 +326,14 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       assert(E::is_64);
       apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, dynrel);
       break;
-    case R_RISCV_BRANCH: {
-      i64 val = S + A - P;
-      check(val, -(1 << 12), 1 << 12);
-      write_btype(loc, val);
+    case R_RISCV_BRANCH:
+      check(S + A - P, -(1 << 12), 1 << 12);
+      write_btype(loc, S + A - P);
       break;
-    }
-    case R_RISCV_JAL: {
-      i64 val = S + A - P;
-      check(val, -(1 << 20), 1 << 20);
-      write_jtype(loc, val);
+    case R_RISCV_JAL:
+      check(S + A - P, -(1 << 20), 1 << 20);
+      write_jtype(loc, S + A - P);
       break;
-    }
     case R_RISCV_CALL:
     case R_RISCV_CALL_PLT: {
       u32 rd = get_rd(*(ul32 *)(contents.data() + rel.r_offset + 4));
@@ -383,35 +379,40 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         *(ul32 *)loc = S + A - P;
       }
       break;
+    case R_RISCV_PCREL_LO12_I:
+    case R_RISCV_PCREL_LO12_S:
+      // These relocations are handled in the next loop.
+      break;
     case R_RISCV_HI20:
       assert(removed_bytes == 0 || removed_bytes == 4);
       if (removed_bytes == 0) {
-        i64 val = S + A;
-        check(val, -(1LL << 31), 1LL << 31);
-        write_utype(loc, val);
+        check(S + A, -(1LL << 31), 1LL << 31);
+        write_utype(loc, S + A);
       }
       break;
     case R_RISCV_LO12_I:
-    case R_RISCV_LO12_S: {
-      i64 val = S + A;
+    case R_RISCV_LO12_S:
       if (rel.r_type == R_RISCV_LO12_I)
-        write_itype(loc, val);
+        write_itype(loc, S + A);
       else
-        write_stype(loc, val);
+        write_stype(loc, S + A);
 
       // Rewrite `lw t1, 0(t0)` with `lw t1, 0(x0)` if the address is
       // accessible relative to the zero register. If the upper 20 bits
       // are all zero, the corresponding LUI might have been removed.
-      if (sign_extend(val, 11) == val)
+      if (bits(S + A, 31, 12) == 0)
         set_rs1(loc, 0);
       break;
-    }
     case R_RISCV_TPREL_HI20:
       assert(removed_bytes == 0 || removed_bytes == 4);
       if (removed_bytes == 0)
         write_utype(loc, S + A - ctx.tp_addr);
       break;
     case R_RISCV_TPREL_ADD:
+      // This relocation just annotates an ADD instruction that can be
+      // removed when a TPREL is relaxed. No value is needed to be
+      // written.
+      assert(removed_bytes == 0 || removed_bytes == 4);
       break;
     case R_RISCV_TPREL_LO12_I:
     case R_RISCV_TPREL_LO12_S: {
@@ -469,18 +470,14 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         *(ul16 *)(loc + i) = 0x0001;      // c.nop
       break;
     }
-    case R_RISCV_RVC_BRANCH: {
-      i64 val = S + A - P;
-      check(val, -(1 << 8), 1 << 8);
-      write_cbtype(loc, val);
+    case R_RISCV_RVC_BRANCH:
+      check(S + A - P, -(1 << 8), 1 << 8);
+      write_cbtype(loc, S + A - P);
       break;
-    }
-    case R_RISCV_RVC_JUMP: {
-      i64 val = S + A - P;
-      check(val, -(1 << 11), 1 << 11);
-      write_cjtype(loc, val);
+    case R_RISCV_RVC_JUMP:
+      check(S + A - P, -(1 << 11), 1 << 11);
+      write_cjtype(loc, S + A - P);
       break;
-    }
     case R_RISCV_SUB6:
       *loc = (*loc & 0b1100'0000) | ((*loc - (S + A)) & 0b0011'1111);
       break;
@@ -498,10 +495,6 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       break;
     case R_RISCV_32_PCREL:
       *(U32<E> *)loc = S + A - P;
-      break;
-    case R_RISCV_PCREL_LO12_I:
-    case R_RISCV_PCREL_LO12_S:
-      // These relocations are handled in the next loop.
       break;
     default:
       unreachable();
@@ -555,9 +548,10 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
+    const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
     u8 *loc = base + rel.r_offset;
 
-    if (!sym.file) {
+    if (!is_resolved(sym, esym)) {
       record_undef_error(ctx, rel);
       continue;
     }
@@ -634,8 +628,7 @@ void InputSection<E>::copy_contents_riscv(Context<E> &ctx, u8 *buf) {
     return;
   }
 
-  // Memory-allocated sections may be relaxed, so copy each segment
-  // individually.
+  // A relaxed section is copied piece-wise.
   std::span<const ElfRel<E>> rels = get_rels(ctx);
   i64 pos = 0;
 
@@ -668,14 +661,15 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
+    const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
 
-    if (!sym.file) {
+    if (!is_resolved(sym, esym)) {
       record_undef_error(ctx, rel);
       continue;
     }
 
     if (sym.is_ifunc())
-      sym.flags.fetch_or(NEEDS_GOT | NEEDS_PLT, std::memory_order_relaxed);
+      sym.flags |= NEEDS_GOT | NEEDS_PLT;
 
     switch (rel.r_type) {
     case R_RISCV_32:
@@ -695,20 +689,25 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_RISCV_CALL:
     case R_RISCV_CALL_PLT:
       if (sym.is_imported)
-        sym.flags.fetch_or(NEEDS_PLT, std::memory_order_relaxed);
+        sym.flags |= NEEDS_PLT;
       break;
     case R_RISCV_GOT_HI20:
-      sym.flags.fetch_or(NEEDS_GOT, std::memory_order_relaxed);
+      sym.flags |= NEEDS_GOT;
       break;
     case R_RISCV_TLS_GOT_HI20:
-      ctx.has_gottp_rel.store(true, std::memory_order_relaxed);
-      sym.flags.fetch_or(NEEDS_GOTTP, std::memory_order_relaxed);
+      sym.flags |= NEEDS_GOTTP;
       break;
     case R_RISCV_TLS_GD_HI20:
-      sym.flags.fetch_or(NEEDS_TLSGD, std::memory_order_relaxed);
+      sym.flags |= NEEDS_TLSGD;
       break;
     case R_RISCV_32_PCREL:
       scan_pcrel(ctx, sym, rel);
+      break;
+    case R_RISCV_TPREL_HI20:
+    case R_RISCV_TPREL_LO12_I:
+    case R_RISCV_TPREL_LO12_S:
+    case R_RISCV_TPREL_ADD:
+      check_tlsle(ctx, sym, rel);
       break;
     case R_RISCV_BRANCH:
     case R_RISCV_JAL:
@@ -717,10 +716,6 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_RISCV_PCREL_LO12_S:
     case R_RISCV_LO12_I:
     case R_RISCV_LO12_S:
-    case R_RISCV_TPREL_HI20:
-    case R_RISCV_TPREL_LO12_I:
-    case R_RISCV_TPREL_LO12_S:
-    case R_RISCV_TPREL_ADD:
     case R_RISCV_ADD8:
     case R_RISCV_ADD16:
     case R_RISCV_ADD32:
@@ -851,20 +846,21 @@ static void shrink_section(Context<E> &ctx, InputSection<E> &isec, bool use_rvc)
       break;
     case R_RISCV_TPREL_HI20:
     case R_RISCV_TPREL_ADD: {
-      // These relocations are used to materialize the upper 20 bits of
-      // an address relative to the thread pointer as follows:
+      // These relocations are used to add a high 20-bit value to the
+      // thread pointer. The following two instructions materializes
+      // TP + HI20(foo) in %r5, for example.
       //
       //  lui  a5,%tprel_hi(foo)         # R_RISCV_TPREL_HI20 (symbol)
       //  add  a5,a5,tp,%tprel_add(foo)  # R_RISCV_TPREL_ADD (symbol)
       //
-      // Then thread-local variable `foo` is accessed with a 12-bit offset
-      // like this:
+      // Then thread-local variable `foo` is accessed with a low 12-bit
+      // offset like this:
       //
       //  sw   t0,%tprel_lo(foo)(a5)     # R_RISCV_TPREL_LO12_S (symbol)
       //
-      // However, if the offset is ±2 KiB, we don't need to materialize
-      // the upper 20 bits in a register. We can instead access the
-      // thread-local variable directly with TP like this:
+      // However, if the variable is at TP ±2 KiB, TP + HI20(foo) is the
+      // same as TP, so we can instead access the thread-local variable
+      // directly using TP like this:
       //
       //  sw   t0,%tprel_lo(foo)(tp)
       //

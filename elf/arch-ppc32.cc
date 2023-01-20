@@ -30,7 +30,7 @@
 // 0x10000 (or 65536) bytes.
 //
 // Since each object file has its own .got2, %r30 refers to different
-// places in a merged .got2 for two functions that are came from different
+// places in a merged .got2 for two functions that came from different
 // input files. Therefore, %r30 makes sense only within a single function.
 //
 // Technically, we can reuse a %r30 value in our PLT if we create a PLT
@@ -38,7 +38,7 @@
 // doesn't seems to be worth its complexity. Our PLT simply doesn't rely
 // on a %r30 value.
 //
-// https://github.com/rui314/mold/wiki/ppc32-psabi.pdf
+// https://github.com/rui314/psabi/blob/main/ppc32.pdf
 
 #include "mold.h"
 
@@ -46,15 +46,11 @@ namespace mold::elf {
 
 using E = PPC32;
 
-static u64 lo(u64 x)       { return x & 0xffff; }
-static u64 hi(u64 x)       { return x >> 16; }
-static u64 ha(u64 x)       { return (x + 0x8000) >> 16; }
-static u64 high(u64 x)     { return (x >> 16) & 0xffff; }
-static u64 higha(u64 x)    { return ((x + 0x8000) >> 16) & 0xffff; }
-static u64 higher(u64 x)   { return (x >> 32) & 0xffff; }
-static u64 highera(u64 x)  { return ((x + 0x8000) >> 32) & 0xffff; }
-static u64 highest(u64 x)  { return x >> 48; }
-static u64 highesta(u64 x) { return (x + 0x8000) >> 48; }
+static u64 lo(u64 x)    { return x & 0xffff; }
+static u64 hi(u64 x)    { return x >> 16; }
+static u64 ha(u64 x)    { return (x + 0x8000) >> 16; }
+static u64 high(u64 x)  { return (x >> 16) & 0xffff; }
+static u64 higha(u64 x) { return ((x + 0x8000) >> 16) & 0xffff; }
 
 template <>
 void write_plt_header(Context<E> &ctx, u8 *buf) {
@@ -157,9 +153,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     dynrel = (ElfRel<E> *)(ctx.buf + ctx.reldyn->shdr.sh_offset +
                            file.reldyn_offset + this->reldyn_offset);
 
-  u64 got2 = 0;
-  if (file.ppc32_got2)
-    got2 = file.ppc32_got2->output_section->shdr.sh_addr + file.ppc32_got2->offset;
+  u64 GOT2 = file.ppc32_got2 ? file.ppc32_got2->get_addr() : 0;
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
@@ -201,16 +195,16 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ub32 *)loc |= bits(S + A, 31, 2) << 2;
       break;
     case R_PPC_PLT16_LO:
-      *(ub16 *)loc = lo(G + GOT - got2 - A);
+      *(ub16 *)loc = lo(G + GOT - A - GOT2);
       break;
     case R_PPC_PLT16_HI:
-      *(ub16 *)loc = hi(G + GOT - got2 - A);
+      *(ub16 *)loc = hi(G + GOT - A - GOT2);
       break;
     case R_PPC_PLT16_HA:
-      *(ub16 *)loc = ha(G + GOT - got2 - A);
+      *(ub16 *)loc = ha(G + GOT - A - GOT2);
       break;
     case R_PPC_PLT32:
-      *(ub32 *)loc = G + GOT - got2 - A;
+      *(ub32 *)loc = G + GOT - A - GOT2;
       break;
     case R_PPC_REL14:
       *(ub32 *)loc |= bits(S + A - P, 15, 2) << 2;
@@ -303,9 +297,10 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
+    const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
     u8 *loc = base + rel.r_offset;
 
-    if (!sym.file) {
+    if (!is_resolved(sym, esym)) {
       record_undef_error(ctx, rel);
       continue;
     }
@@ -345,14 +340,15 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
+    const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
 
-    if (!sym.file) {
+    if (!is_resolved(sym, esym)) {
       record_undef_error(ctx, rel);
       continue;
     }
 
     if (sym.is_ifunc())
-      sym.flags.fetch_or(NEEDS_GOT | NEEDS_PLT, std::memory_order_relaxed);
+      sym.flags |= NEEDS_GOT | NEEDS_PLT;
 
     switch (rel.r_type) {
     case R_PPC_ADDR32:
@@ -385,30 +381,32 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_PPC_PLT16_HI:
     case R_PPC_PLT16_HA:
     case R_PPC_PLT32:
-      sym.flags.fetch_or(NEEDS_GOT, std::memory_order_relaxed);
+      sym.flags |= NEEDS_GOT;
       break;
     case R_PPC_REL24:
     case R_PPC_PLTREL24:
     case R_PPC_PLTREL32:
       if (sym.is_imported)
-        sym.flags.fetch_or(NEEDS_PLT, std::memory_order_relaxed);
+        sym.flags |= NEEDS_PLT;
       break;
     case R_PPC_GOT_TLSGD16:
-      sym.flags.fetch_or(NEEDS_TLSGD, std::memory_order_relaxed);
+      sym.flags |= NEEDS_TLSGD;
       break;
     case R_PPC_GOT_TLSLD16:
-      ctx.needs_tlsld.store(true, std::memory_order_relaxed);
+      ctx.needs_tlsld = true;
       break;
     case R_PPC_GOT_TPREL16:
-      sym.flags.fetch_or(NEEDS_GOTTP, std::memory_order_relaxed);
+      sym.flags |= NEEDS_GOTTP;
+      break;
+    case R_PPC_TPREL16_LO:
+    case R_PPC_TPREL16_HI:
+    case R_PPC_TPREL16_HA:
+      check_tlsle(ctx, sym, rel);
       break;
     case R_PPC_LOCAL24PC:
     case R_PPC_TLS:
     case R_PPC_TLSGD:
     case R_PPC_TLSLD:
-    case R_PPC_TPREL16_LO:
-    case R_PPC_TPREL16_HI:
-    case R_PPC_TPREL16_HA:
     case R_PPC_DTPREL16_LO:
     case R_PPC_DTPREL16_HI:
     case R_PPC_DTPREL16_HA:

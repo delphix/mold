@@ -42,8 +42,6 @@ using E = ARM32;
 template <>
 i64 get_addend(u8 *loc, const ElfRel<E> &rel) {
   switch (rel.r_type) {
-  case R_ARM_NONE:
-    return 0;
   case R_ARM_ABS32:
   case R_ARM_REL32:
   case R_ARM_TARGET1:
@@ -78,7 +76,7 @@ i64 get_addend(u8 *loc, const ElfRel<E> &rel) {
   case R_ARM_JUMP24:
   case R_ARM_PLT32:
   case R_ARM_TLS_CALL:
-    return sign_extend(*(ul32 *)loc & 0x00ff'ffff, 23) << 2;
+    return sign_extend(*(ul32 *)loc, 23) << 2;
   case R_ARM_MOVW_PREL_NC:
   case R_ARM_MOVW_ABS_NC:
   case R_ARM_MOVT_PREL:
@@ -101,7 +99,7 @@ i64 get_addend(u8 *loc, const ElfRel<E> &rel) {
     return sign_extend(val, 15);
   }
   default:
-    unreachable();
+    return 0;
   }
 }
 
@@ -251,7 +249,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
   std::span<std::unique_ptr<RangeExtensionThunk<E>>> thunks =
     output_section->thunks;
 
-  auto get_trampoline_addr = [&](u64 addr) {
+  auto get_tls_trampoline_addr = [&](u64 addr) {
     for (;;) {
       assert(!thunks.empty());
       i64 disp = output_section->shdr.sh_addr + thunks[0]->offset - addr;
@@ -295,9 +293,6 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul32 *)loc = S + A - P;
       break;
     case R_ARM_THM_CALL: {
-      // THM_CALL relocation refers either BL or BLX instruction.
-      // They are different in only one bit. We need to use BL if
-      // the jump target is Thumb. Otherwise, use BLX.
       if (sym.is_remaining_undef_weak()) {
         // On ARM, calling an weak undefined symbol jumps to the
         // next instruction.
@@ -305,6 +300,9 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         break;
       }
 
+      // THM_CALL relocation refers either BL or BLX instruction.
+      // They are different in only one bit. We need to use BL if
+      // the jump target is Thumb. Otherwise, use BLX.
       i64 val = S + A - P;
       if (is_jump_reachable(val)) {
         if (T) {
@@ -334,6 +332,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul32 *)loc = G + A;
       break;
     case R_ARM_CALL: {
+      if (sym.is_remaining_undef_weak()) {
+        *(ul32 *)loc = 0xe320'f000; // NOP
+        break;
+      }
+
       // Just like THM_CALL, ARM_CALL relocation refers either BL or
       // BLX instruction. We may need to rewrite BL → BLX or BLX → BL.
       bool is_bl = ((*(ul32 *)loc & 0xff00'0000) == 0xeb00'0000);
@@ -341,46 +344,46 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       if (!is_bl && !is_blx)
         Fatal(ctx) << *this << ": R_ARM_CALL refers neither BL nor BLX";
 
-      if (sym.is_remaining_undef_weak()) {
-        // On ARM, calling an weak undefined symbol jumps to the
-        // next instruction.
-        *(ul32 *)loc = 0xe320'f000; // NOP
-        break;
-      }
-
       u64 val = S + A - P;
       if (is_jump_reachable(val)) {
-        if (T)
-          *(ul32 *)loc = 0xfa00'0000 | (bit(val, 1) << 24) | bits(val, 25, 2);
-        else
-          *(ul32 *)loc = 0xeb00'0000 | bits(val, 25, 2);
+        if (T) {
+          *(ul32 *)loc = 0xfa00'0000; // BLX
+          *(ul32 *)loc |= (bit(val, 1) << 24) | bits(val, 25, 2);
+        } else {
+          *(ul32 *)loc = 0xeb00'0000; // BL
+          *(ul32 *)loc |= bits(val, 25, 2);
+        }
       } else {
-        *(ul32 *)loc = 0xeb00'0000 | bits(get_arm_thunk_addr() + A - P, 25, 2);
+        *(ul32 *)loc = 0xeb00'0000; // BL
+        *(ul32 *)loc |= bits(get_arm_thunk_addr() + A - P, 25, 2);
       }
       break;
     }
     case R_ARM_JUMP24:
-    case R_ARM_PLT32:
+    case R_ARM_PLT32: {
       if (sym.is_remaining_undef_weak()) {
         *(ul32 *)loc = 0xe320'f000; // NOP
-      } else {
-        // Unlike BL and BLX, we can't rewrite B to BX because BX doesn't
-        // takes an immediate; it takes only a register. So if mode switch
-        // is required, we jump to a linker-synthesized thunk which constructs
-        // a branch destination in a register and branches to that address.
-        u64 val = S + A - P;
-        if (!is_jump_reachable(val) || T)
-          val = get_arm_thunk_addr() + A - P;
-        *(ul32 *)loc = (*(ul32 *)loc & 0xff00'0000) | bits(val, 25, 2);
+        break;
       }
-      break;
-    case R_ARM_THM_JUMP11: {
-      assert(T);
-      i64 val = S + A - P;
-      check(val, -(1 << 11), 1 << 11);
-      *(ul16 *)loc = (*(ul16 *)loc & 0xf800) | bits(val, 11, 1);
+
+      // These relocs refers a B (unconditional branch) instruction.
+      // Unlike BL or BLX, we can't rewrite B to BX in place when the
+      // processor mode switch is required because BX doesn't takes an
+      // immediate; it takes only a register. So if mode switch is
+      // required, we jump to a linker-synthesized thunk which does the
+      // job with a longer code sequence.
+      u64 val = S + A - P;
+      if (!is_jump_reachable(val) || T)
+        val = get_arm_thunk_addr() + A - P;
+      *(ul32 *)loc = (*(ul32 *)loc & 0xff00'0000) | bits(val, 25, 2);
       break;
     }
+    case R_ARM_THM_JUMP11:
+      assert(T);
+      check(S + A - P, -(1 << 11), 1 << 11);
+      *(ul16 *)loc &= 0xf800;
+      *(ul16 *)loc |= bits(S + A - P, 11, 1);
+      break;
     case R_ARM_THM_JUMP19: {
       i64 val = S + A - P;
       check(val, -(1 << 19), 1 << 19);
@@ -399,18 +402,20 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul16 *)(loc + 2) |= (J2 << 13) | (J1 << 11) | imm11;
       break;
     }
-    case R_ARM_THM_JUMP24:
+    case R_ARM_THM_JUMP24: {
       if (sym.is_remaining_undef_weak()) {
-        *(ul32 *)loc = 0x8000'f3af; // NOP.W
-      } else {
-        // Just like R_ARM_JUMP24, we need to jump to a thunk if we need to
-        // switch processor mode.
-        u64 val = S + A - P;
-        if (!is_jump_reachable(val) || !T)
-          val = get_thumb_thunk_addr() + A - P;
-        write_thm_b_imm(loc, val);
+        *(ul32 *)loc = 0x8000'f3af; // NOP
+        break;
       }
+
+      // Just like R_ARM_JUMP24, we need to jump to a thunk if we need to
+      // switch processor mode.
+      u64 val = S + A - P;
+      if (!is_jump_reachable(val) || !T)
+        val = get_thumb_thunk_addr() + A - P;
+      write_thm_b_imm(loc, val);
       break;
+    }
     case R_ARM_MOVW_PREL_NC:
       write_mov_imm(loc, ((S + A) | T) - P);
       break;
@@ -420,12 +425,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_ARM_THM_MOVW_PREL_NC:
       write_thm_mov_imm(loc, ((S + A) | T) - P);
       break;
-    case R_ARM_PREL31: {
-      i64 val = S + A - P;
-      check(val, -(1LL << 30), 1LL << 30);
-      *(ul32 *)loc = (*(ul32 *)loc & 0x8000'0000) | (val & 0x7fff'ffff);
+    case R_ARM_PREL31:
+      check(S + A - P, -(1LL << 30), 1LL << 30);
+      *(ul32 *)loc &= 0x8000'0000;
+      *(ul32 *)loc |= (S + A - P) & 0x7fff'ffff;
       break;
-    }
     case R_ARM_THM_MOVW_ABS_NC:
       write_thm_mov_imm(loc, (S + A) | T);
       break;
@@ -470,7 +474,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_ARM_TLS_CALL:
       if (sym.has_tlsdesc(ctx)) {
         // BL <tls_trampoline>
-        *(ul32 *)loc = 0xeb00'0000 | bits(get_trampoline_addr(P + 8), 25, 2);
+        *(ul32 *)loc = 0xeb00'0000 | bits(get_tls_trampoline_addr(P + 8), 25, 2);
       } else {
         // BL -> NOP
         *(ul32 *)loc = 0xe320'f000;
@@ -478,7 +482,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       break;
     case R_ARM_THM_TLS_CALL:
       if (sym.has_tlsdesc(ctx)) {
-        u64 val = align_to(get_trampoline_addr(P + 4), 4);
+        u64 val = align_to(get_tls_trampoline_addr(P + 4), 4);
         write_thm_b_imm(loc, val);
         *(ul16 *)(loc + 2) &= ~0x1000; // rewrite BL with BLX
       } else {
@@ -502,9 +506,10 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
+    const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
     u8 *loc = base + rel.r_offset;
 
-    if (!sym.file) {
+    if (!is_resolved(sym, esym)) {
       record_undef_error(ctx, rel);
       continue;
     }
@@ -551,14 +556,15 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
+    const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
 
-    if (!sym.file) {
+    if (!is_resolved(sym, esym)) {
       record_undef_error(ctx, rel);
       continue;
     }
 
     if (sym.is_ifunc())
-      sym.flags.fetch_or(NEEDS_GOT | NEEDS_PLT, std::memory_order_relaxed);
+      sym.flags |= NEEDS_GOT | NEEDS_PLT;
 
     switch (rel.r_type) {
     case R_ARM_ABS32:
@@ -573,12 +579,12 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_ARM_PLT32:
     case R_ARM_THM_JUMP24:
       if (sym.is_imported)
-        sym.flags.fetch_or(NEEDS_PLT, std::memory_order_relaxed);
+        sym.flags |= NEEDS_PLT;
       break;
     case R_ARM_GOT_PREL:
     case R_ARM_GOT_BREL:
     case R_ARM_TARGET2:
-      sym.flags.fetch_or(NEEDS_GOT, std::memory_order_relaxed);
+      sym.flags |= NEEDS_GOT;
       break;
     case R_ARM_MOVT_PREL:
     case R_ARM_THM_MOVT_PREL:
@@ -586,17 +592,20 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       scan_pcrel(ctx, sym, rel);
       break;
     case R_ARM_TLS_GD32:
-      sym.flags.fetch_or(NEEDS_TLSGD, std::memory_order_relaxed);
+      sym.flags |= NEEDS_TLSGD;
       break;
     case R_ARM_TLS_LDM32:
-      ctx.needs_tlsld.store(true, std::memory_order_relaxed);
+      ctx.needs_tlsld = true;
       break;
     case R_ARM_TLS_IE32:
-      sym.flags.fetch_or(NEEDS_GOTTP, std::memory_order_relaxed);
+      sym.flags |= NEEDS_GOTTP;
       break;
     case R_ARM_TLS_GOTDESC:
       if (!relax_tlsdesc(ctx, sym))
-        sym.flags.fetch_or(NEEDS_TLSDESC, std::memory_order_relaxed);
+        sym.flags |= NEEDS_TLSDESC;
+      break;
+    case R_ARM_TLS_LE32:
+      check_tlsle(ctx, sym, rel);
       break;
     case R_ARM_REL32:
     case R_ARM_BASE_PREL:
@@ -608,7 +617,6 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_ARM_THM_MOVW_PREL_NC:
     case R_ARM_THM_MOVW_ABS_NC:
     case R_ARM_TLS_LDO32:
-    case R_ARM_TLS_LE32:
     case R_ARM_TLS_CALL:
     case R_ARM_THM_TLS_CALL:
     case R_ARM_V4BX:
@@ -669,7 +677,13 @@ void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
 // likely that it's due to some historical reason.
 //
 // This function sorts .ARM.exidx records.
-static void sort_exidx(Context<E> &ctx, OutputSection<E> &osec) {
+void fixup_arm_exidx_section(Context<E> &ctx) {
+  Timer t(ctx, "fixup_arm_exidx_section");
+
+  OutputSection<E> *osec = find_section(ctx, SHT_ARM_EXIDX);
+  if (!osec)
+    return;
+
   // .ARM.exidx records consists of a signed 31-bit relative address
   // and a 32-bit value. The relative address indicates the start
   // address of a function that the record covers. The value is one of
@@ -689,11 +703,11 @@ static void sort_exidx(Context<E> &ctx, OutputSection<E> &osec) {
     ul32 val;
   };
 
-  if (osec.shdr.sh_size % sizeof(Entry))
+  if (osec->shdr.sh_size % sizeof(Entry))
     Fatal(ctx) << "invalid .ARM.exidx section size";
 
-  Entry *ent = (Entry *)(ctx.buf + osec.shdr.sh_offset);
-  i64 num_entries = osec.shdr.sh_size / sizeof(Entry);
+  Entry *ent = (Entry *)(ctx.buf + osec->shdr.sh_offset);
+  i64 num_entries = osec->shdr.sh_size / sizeof(Entry);
 
   // Entry's addresses are relative to themselves. In order to sort
   // records by addresses, we first translate them so that the addresses
@@ -720,38 +734,12 @@ static void sort_exidx(Context<E> &ctx, OutputSection<E> &osec) {
     if (is_relative(ent[i].val))
       ent[i].val = 0x7fff'ffff & (ent[i].val - offset);
   });
-}
-
-void fixup_arm_exidx_section(Context<E> &ctx) {
-  Timer t(ctx, "fixup_arm_exidx_section");
-
-  auto find_exidx = [&]() -> OutputSection<E> * {
-    for (Chunk<E> *chunk : ctx.chunks)
-      if (OutputSection<E> *osec = chunk->to_osec())
-        if (osec->shdr.sh_type == SHT_ARM_EXIDX)
-          return osec;
-    return nullptr;
-  };
-
-  OutputSection<E> *exidx = find_exidx();
-  if (!exidx)
-    return;
-
-  // Sort .ARM.exidx contents
-  sort_exidx(ctx, *exidx);
 
   // .ARM.exidx's sh_link should be set to the .text section index.
   // Runtime doesn't care about it, but the binutils's strip command does.
   if (ctx.shdr) {
-    auto find_text = [&]() -> Chunk<E> * {
-      for (Chunk<E> *chunk : ctx.chunks)
-        if (chunk->name == ".text")
-          return chunk;
-      return nullptr;
-    };
-
-    if (Chunk<E> *text = find_text()) {
-      exidx->shdr.sh_link = text->shndx;
+    if (Chunk<E> *text = find_section(ctx, ".text")) {
+      osec->shdr.sh_link = text->shndx;
       ctx.shdr->copy_buf(ctx);
     }
   }
