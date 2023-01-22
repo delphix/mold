@@ -1,6 +1,7 @@
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
 
 #include "mold.h"
+#include "config.h"
 
 #include <filesystem>
 #include <signal.h>
@@ -66,13 +67,11 @@ static std::string find_dso(Context<E> &ctx, std::filesystem::path self) {
   if (std::filesystem::is_regular_file(path, ec) && !ec)
     return path;
 
-#ifdef LIBDIR
-  // If not found, search $(LIBDIR)/mold, which is /usr/local/lib/mold
+  // If not found, search $(MOLD_LIBDIR)/mold, which is /usr/local/lib/mold
   // by default.
-  path = LIBDIR "/mold/mold-wrapper.so";
+  path = MOLD_LIBDIR "/mold/mold-wrapper.so";
   if (std::filesystem::is_regular_file(path, ec) && !ec)
     return path;
-#endif
 
   // Look for ../lib/mold/mold-wrapper.so
   path = self.parent_path() / "../lib/mold/mold-wrapper.so";
@@ -91,7 +90,7 @@ void process_run_subcommand(Context<E> &ctx, int argc, char **argv) {
     Fatal(ctx) << "-run: argument missing";
 
   // Get the mold-wrapper.so path
-  std::string self = std::filesystem::read_symlink("/proc/self/exe");
+  std::string self = get_self_path();
   std::string dso_path = find_dso(ctx, self);
 
   // Set environment variables

@@ -1,19 +1,8 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-t=out/test/elf/$MACHINE/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
 echo 'int main() {}' | $GCC -flto -o /dev/null -xc - >& /dev/null \
-  || { echo skipped; exit; }
+  || skip
 
 cat <<EOF | $GCC -flto -c -o $t/a.o -xc -
 #include <stdio.h>
@@ -22,7 +11,27 @@ int main() {
 }
 EOF
 
-$GCC -B. -o $t/exe -flto $t/a.o
-$QEMU $t/exe | grep -q 'Hello world'
+$GCC -B. -o $t/exe1 -flto $t/a.o
+$QEMU $t/exe1 | grep -q 'Hello world'
 
-echo OK
+# Test that LTO is used for FAT LTO objects
+cat <<EOF | $GCC -flto -ffat-lto-objects -c -o $t/b.o -xc -
+#include <stdio.h>
+int main() {
+  printf("Hello world\n");
+}
+EOF
+
+$GCC -B. -o $t/exe2 $t/b.o --verbose 2>&1 | grep -q -- -fwpa
+
+# Test FAT objects if -fno-use-linker-plugin is used
+
+cat <<EOF | $GCC -flto -fno-use-linker-plugin -c -o $t/c.o -xc -
+#include <stdio.h>
+int main() {
+  printf("Hello world\n");
+}
+EOF
+
+$GCC -B. -o $t/exe3 -flto -fno-use-linker-plugin $t/c.o
+$QEMU $t/exe3 | grep -q 'Hello world'

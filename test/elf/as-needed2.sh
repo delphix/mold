@@ -1,16 +1,5 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-t=out/test/elf/$MACHINE/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
 cat <<EOF | $CC -shared -fPIC -o $t/a.so -xc -
 int foo() { return 3; }
@@ -20,10 +9,12 @@ cat <<EOF | $CC -shared -fPIC -o $t/b.so -xc -
 int bar() { return 3; }
 EOF
 
-cat <<EOF | $CC -shared -fPIC -o $t/c.so -xc -
+cat <<EOF | $CC -fPIC -c -o $t/c.o -xc -
 int foo();
 int baz() { return foo(); }
 EOF
+
+$CC -shared -o $t/c.so $t/c.o $t/a.so
 
 cat <<EOF | $CC -c -o $t/d.o -xc -
 #include <stdio.h>
@@ -33,12 +24,10 @@ int main() {
 }
 EOF
 
-$CC -B. -o $t/exe $t/d.o -Wl,--as-needed \
-  $t/c.so $t/b.so $t/a.so
+$CC -B. -o $t/exe $t/d.o -Wl,--as-needed $t/c.so $t/b.so $t/a.so
+$QEMU $t/exe | grep -q '^3$'
 
 readelf --dynamic $t/exe > $t/log
-grep -q /a.so $t/log
-grep -q /c.so $t/log
+! grep -q /a.so $t/log || false
+grep -q /c.so $t/log || false
 ! grep -q /b.so $t/log || false
-
-echo OK

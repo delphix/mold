@@ -1,16 +1,9 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-t=out/test/elf/$MACHINE/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
+
+# ARM assembler has a differnet grammar than the others.
+# Concretely speaking, ARM as uses "@" as a start of a comment.
+[ $MACHINE = arm ] && skip
 
 cat <<'EOF' | $CC -c -o $t/a.o -x assembler -
 .globl val1, val2, val3, val4, val5
@@ -55,5 +48,3 @@ readelf -p .rodata.str $t/exe | grep -q world
 readelf -p .rodata.str $t/exe | grep -q foobar
 readelf -p .rodata.cst $t/exe | grep -q abcdefgh
 readelf -p .rodatabar $t/exe | grep -q bar
-
-echo OK

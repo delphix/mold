@@ -47,7 +47,7 @@
 // functions. `onload` calls callbacks to notify about the pointers to
 // other functions the linker plugin provides. I don't know why `onload`
 // can't just return a list of functions or why the linker plugin can't
-// define not only `onload` but other functions, but that's how it works.
+// define not only `onload` but other functions, but that's what it is.
 //
 // Here is the steps to use the linker plugin:
 //
@@ -248,14 +248,14 @@ get_input_section_name(const PluginSection section,
 static PluginStatus
 get_input_section_contents(const PluginSection section,
                            const char **section_contents,
-		           size_t *len) {
+                           size_t *len) {
   LOG << "get_input_section_contents\n";
   return LDPS_OK;
 }
 
 static PluginStatus
 update_section_order(const PluginSection *section_list,
-		     int num_sections) {
+                     int num_sections) {
   LOG << "update_section_order\n";
   return LDPS_OK;
 }
@@ -270,8 +270,8 @@ get_symbols_v1(const void *handle, int nsyms, PluginSymbol *psyms) {
   unreachable();
 }
 
-// get_symbols teaches the LTO plugin as to how we resolved symbols.
-// The plugin uses the symbol resolution info to optimizes the program.
+// get_symbols teaches the LTO plugin as to how we have resolved symbols.
+// The plugin uses the symbol resolution info to optimize the program.
 //
 // For example, if a definition in an IR file is not referenced by
 // non-IR objects at all, the plugin may choose to completely inline
@@ -308,7 +308,8 @@ get_symbols(const void *handle, int nsyms, PluginSymbol *psyms, bool is_v2) {
 
     if (sym.file->is_dso)
       return LDPR_RESOLVED_DYN;
-    if (((ObjectFile<E> *)sym.file)->is_lto_obj)
+
+    if (((ObjectFile<E> *)sym.file)->is_lto_obj && !sym.is_wrapped)
       return esym.is_undef() ? LDPR_RESOLVED_IR : LDPR_PREEMPTED_IR;
     return esym.is_undef() ? LDPR_RESOLVED_EXEC : LDPR_PREEMPTED_REG;
   };
@@ -351,10 +352,10 @@ static void restart_process(Context<E> &ctx) {
   args.push_back("--:lto-pass2");
   args.push_back(nullptr);
 
-  std::string self = std::filesystem::read_symlink("/proc/self/exe");
-
   std::cout << std::flush;
   std::cerr << std::flush;
+
+  std::string self = get_self_path();
   execv(self.c_str(), (char * const *)args.data());
   std::cerr << "execv failed: " << errno_string() << "\n";
   _exit(1);
@@ -381,10 +382,10 @@ static PluginStatus allow_unique_segment_for_sections() {
 
 static PluginStatus
 unique_segment_for_sections(const char *segment_name,
-			    uint64_t flags,
-			    uint64_t align,
-			    const PluginSection *section_list,
-			    int num_sections) {
+                            uint64_t flags,
+                            uint64_t align,
+                            const PluginSection *section_list,
+                            int num_sections) {
   LOG << "unique_segment_for_sections\n";
   return LDPS_OK;
 }
@@ -508,7 +509,8 @@ static void load_plugin(Context<E> &ctx) {
 
 template <typename E>
 static ElfSym<E> to_elf_sym(PluginSymbol &psym) {
-  ElfSym<E> esym = {};
+  ElfSym<E> esym;
+  memset(&esym, 0, sizeof(esym));
 
   switch (psym.def) {
   case LDPK_DEF:
@@ -569,7 +571,7 @@ static bool is_llvm(Context<E> &ctx) {
 // Returns true if a given linker plugin supports the get_symbols_v3 API.
 // Any version of LLVM and GCC 12 or newer support it.
 template <typename E>
-static bool suppots_v3_api(Context<E> &ctx) {
+static bool supports_v3_api(Context<E> &ctx) {
   return is_gcc_linker_api_v1 || is_llvm(ctx);
 }
 
@@ -646,7 +648,7 @@ ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   }
 
   obj->elf_syms = *esyms;
-  obj->symvers.resize(esyms->size());
+  obj->has_symver.resize(esyms->size());
   plugin_symbols.clear();
   return obj;
 }
@@ -656,7 +658,7 @@ template <typename E>
 std::vector<ObjectFile<E> *> do_lto(Context<E> &ctx) {
   Timer t(ctx, "do_lto");
 
-  if (!ctx.arg.lto_pass2 && !suppots_v3_api(ctx))
+  if (!ctx.arg.lto_pass2 && !supports_v3_api(ctx))
     restart_process(ctx);
 
   assert(phase == 1);
@@ -677,6 +679,18 @@ std::vector<ObjectFile<E> *> do_lto(Context<E> &ctx) {
       }
     }
   });
+
+  // Symbols specified by the --wrap option needs to be visible from
+  // regular object files.
+  for (std::string_view name : ctx.arg.wrap) {
+    get_symbol(ctx, name)->referenced_by_regular_obj = true;
+
+    std::string_view x = save_string(ctx, "__wrap_" + std::string(name));
+    std::string_view y = save_string(ctx, "__real_" + std::string(name));
+
+    get_symbol(ctx, x)->referenced_by_regular_obj = true;
+    get_symbol(ctx, y)->referenced_by_regular_obj = true;
+  }
 
   // all_symbols_read_hook() calls add_input_file() and add_input_library()
   LOG << "all symbols read\n";

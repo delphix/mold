@@ -1,33 +1,14 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-t=out/test/elf/$MACHINE/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
-if [ $MACHINE = x86_64 ]; then
-  mtls=-mtls-dialect=gnu
-elif [ $MACHINE = aarch64 ]; then
-  mtls=-mtls-dialect=trad
-elif [[ $MACHINE != riscv* ]] && [[ $MACHINE != sparc64 ]]; then
-  echo skipped
-  exit
-fi
-
-cat <<EOF | $GCC $mtls -fPIC -c -o $t/a.o -xc -
+cat <<EOF | $GCC -fPIC -c -o $t/a.o -xc -
 #include <stdio.h>
 
-static _Thread_local int x1 = 1;
-static _Thread_local int x2;
-extern _Thread_local int x3;
-extern _Thread_local int x4;
+__attribute__((tls_model("global-dynamic"))) static _Thread_local int x1 = 1;
+__attribute__((tls_model("global-dynamic"))) static _Thread_local int x2;
+__attribute__((tls_model("global-dynamic"))) extern _Thread_local int x3;
+__attribute__((tls_model("global-dynamic"))) extern _Thread_local int x4;
+
 int get_x5();
 int get_x6();
 
@@ -39,16 +20,16 @@ int main() {
 }
 EOF
 
-cat <<EOF | $GCC $mtls -fPIC -c -o $t/b.o -xc -
-_Thread_local int x3 = 3;
-static _Thread_local int x5 = 5;
+cat <<EOF | $GCC -fPIC -c -o $t/b.o -xc -
+__attribute__((tls_model("global-dynamic"))) _Thread_local int x3 = 3;
+__attribute__((tls_model("global-dynamic"))) static _Thread_local int x5 = 5;
 int get_x5() { return x5; }
 EOF
 
 
-cat <<EOF | $GCC $mtls -fPIC -c -o $t/c.o -xc -
-_Thread_local int x4 = 4;
-static _Thread_local int x6 = 6;
+cat <<EOF | $GCC -fPIC -c -o $t/c.o -xc -
+__attribute__((tls_model("global-dynamic"))) _Thread_local int x4 = 4;
+__attribute__((tls_model("global-dynamic"))) static _Thread_local int x6 = 6;
 int get_x6() { return x6; }
 EOF
 
@@ -61,9 +42,10 @@ $QEMU $t/exe1 | grep -q '1 2 3 4 5 6'
 $CC -B. -o $t/exe2 $t/a.o $t/d.so $t/e.so -Wl,-no-relax
 $QEMU $t/exe2 | grep -q '1 2 3 4 5 6'
 
-if echo 'int main() {}' | $CC -o /dev/null -xc - -static >& /dev/null; then
+if test_cflags -static; then
   $CC -B. -o $t/exe3 $t/a.o $t/b.o $t/c.o -static
   $QEMU $t/exe3 | grep -q '1 2 3 4 5 6'
-fi
 
-echo OK
+  $CC -B. -o $t/exe4 $t/a.o $t/b.o $t/c.o -static -Wl,-no-relax
+  $QEMU $t/exe4 | grep -q '1 2 3 4 5 6'
+fi
