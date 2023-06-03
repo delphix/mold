@@ -12,7 +12,7 @@
 // access instructions and therefore can support position-independent
 // code without too much hassle.
 //
-// https://github.com/rui314/mold/wiki/m68k-psabi.pdf
+// https://github.com/rui314/psabi/blob/main/m68k.pdf
 
 #include "mold.h"
 
@@ -61,6 +61,8 @@ void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
   u8 *loc = ctx.buf + this->shdr.sh_offset + offset;
 
   switch (rel.r_type) {
+  case R_NONE:
+    break;
   case R_68K_32:
     *(ub32 *)loc = val;
     break;
@@ -116,11 +118,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *loc = val;
     };
 
-#define S   sym.get_addr(ctx)
-#define A   rel.r_addend
-#define P   (get_addr() + rel.r_offset)
-#define G   (sym.get_got_idx(ctx) * sizeof(Word<E>))
-#define GOT ctx.got->shdr.sh_addr
+    u64 S = sym.get_addr(ctx);
+    u64 A = rel.r_addend;
+    u64 P = get_addr() + rel.r_offset;
+    u64 G = sym.get_got_idx(ctx) * sizeof(Word<E>);
+    u64 GOT = ctx.got->shdr.sh_addr;
 
     switch (rel.r_type) {
     case R_68K_32:
@@ -181,13 +183,13 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       write8(ctx.got->get_tlsld_addr(ctx) + A - GOT);
       break;
     case R_68K_TLS_LDO32:
-      *(ub32 *)loc = S + A - ctx.tls_begin - E::tls_dtp_offset;
+      *(ub32 *)loc = S + A - ctx.dtp_addr;
       break;
     case R_68K_TLS_LDO16:
-      write16s(S + A - ctx.tls_begin - E::tls_dtp_offset);
+      write16s(S + A - ctx.dtp_addr);
       break;
     case R_68K_TLS_LDO8:
-      write8s(S + A - ctx.tls_begin - E::tls_dtp_offset);
+      write8s(S + A - ctx.dtp_addr);
       break;
     case R_68K_TLS_IE32:
       *(ub32 *)loc = sym.get_gottp_addr(ctx) + A - GOT;
@@ -210,12 +212,6 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     default:
       unreachable();
     }
-
-#undef S
-#undef A
-#undef P
-#undef G
-#undef GOT
   }
 }
 
@@ -225,23 +221,18 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_NONE)
+    if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
     u8 *loc = base + rel.r_offset;
 
-    if (!sym.file) {
-      record_undef_error(ctx, rel);
-      continue;
-    }
-
     SectionFragment<E> *frag;
     i64 frag_addend;
     std::tie(frag, frag_addend) = get_fragment(ctx, rel);
 
-#define S (frag ? frag->get_addr(ctx) : sym.get_addr(ctx))
-#define A (frag ? frag_addend : (i64)rel.r_addend)
+    u64 S = frag ? frag->get_addr(ctx) : sym.get_addr(ctx);
+    u64 A = frag ? frag_addend : (i64)rel.r_addend;
 
     switch (rel.r_type) {
     case R_68K_32:
@@ -254,9 +245,6 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       Fatal(ctx) << *this << ": invalid relocation for non-allocated sections: "
                  << rel;
     }
-
-#undef S
-#undef A
   }
 }
 
@@ -269,31 +257,26 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_NONE)
+    if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
-
-    if (!sym.file) {
-      record_undef_error(ctx, rel);
-      continue;
-    }
 
     if (sym.is_ifunc())
       Error(ctx) << sym << ": GNU ifunc symbol is not supported on m68k";
 
     switch (rel.r_type) {
     case R_68K_32:
-      scan_rel(ctx, sym, rel, dyn_absrel_table);
+      scan_dyn_absrel(ctx, sym, rel);
       break;
     case R_68K_16:
     case R_68K_8:
-      scan_rel(ctx, sym, rel, absrel_table);
+      scan_absrel(ctx, sym, rel);
       break;
     case R_68K_PC32:
     case R_68K_PC16:
     case R_68K_PC8:
-      scan_rel(ctx, sym, rel, pcrel_table);
+      scan_pcrel(ctx, sym, rel);
       break;
     case R_68K_GOTPCREL32:
     case R_68K_GOTPCREL16:
@@ -324,15 +307,17 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_68K_TLS_IE8:
       sym.flags |= NEEDS_GOTTP;
       break;
-    case R_68K_TLS_LDO32:
-    case R_68K_TLS_LDO16:
-    case R_68K_TLS_LDO8:
     case R_68K_TLS_LE32:
     case R_68K_TLS_LE16:
     case R_68K_TLS_LE8:
+      check_tlsle(ctx, sym, rel);
+      break;
+    case R_68K_TLS_LDO32:
+    case R_68K_TLS_LDO16:
+    case R_68K_TLS_LDO8:
       break;
     default:
-      Fatal(ctx) << *this << ": unknown relocation: " << rel;
+      Error(ctx) << *this << ": unknown relocation: " << rel;
     }
   }
 }

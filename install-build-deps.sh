@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/bin/sh
 set -e
-source /etc/os-release
+. /etc/os-release
 
 set -x
 
@@ -11,12 +11,12 @@ set -x
 
 case "$ID-$VERSION_ID" in
 ubuntu-20.* | pop-20.*)
-  [ "$1" = update ] && apt-get update
+  apt-get update
   apt-get install -y cmake libssl-dev zlib1g-dev gcc g++ g++-10
   apt-get install -y file
   ;;
 ubuntu-* | pop-* | linuxmint-* | debian-* | raspbian-*)
-  [ "$1" = update ] && apt-get update
+  apt-get update
   apt-get install -y cmake libssl-dev zlib1g-dev gcc g++
   apt-get install -y file
   ;;
@@ -33,12 +33,17 @@ opensuse-tumbleweed-*)
   zypper install -y glibc-devel-static tar diffutils util-linux
   ;;
 gentoo-*)
-  [ "$1" = update ] && emerge-webrsync
+  emerge-webrsync
   emerge dev-util/cmake sys-libs/zlib
   ;;
 arch-*)
-  [ "$1" = update ] && pacman -Sy
+  pacman -Sy
   pacman -S --needed --noconfirm base-devel zlib openssl cmake util-linux
+  ;;
+void-*)
+  xbps-install -Sy xbps
+  xbps-install -Sy bash make cmake openssl-devel zlib-devel gcc
+  xbps-install -Sy tar diffutils util-linux
   ;;
 *)
   echo "Error: don't know anything about build dependencies on $ID-$VERSION_ID"

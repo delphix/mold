@@ -1,5 +1,5 @@
 #include "mold.h"
-#include "../cmdline.h"
+#include "../common/cmdline.h"
 
 #include <regex>
 #include <sstream>
@@ -16,7 +16,7 @@
 
 namespace mold::elf {
 
-static const char helpmsg[] = R"(
+inline const char helpmsg[] = R"(
 Options:
   --help                      Report usage information
   -v, --version               Report version information
@@ -98,14 +98,14 @@ Options:
   --gc-sections               Remove unreferenced sections
     --no-gc-sections
   --gdb-index                 Create .gdb_index for faster gdb startup
-  --hash-style [sysv,gnu,both]
+  --hash-style [sysv,gnu,both,none]
                               Set hash style
   --icf=[all,safe,none]       Fold identical code
     --no-icf
   --ignore-data-address-equality
                               Allow merging non-executable sections with --icf
   --image-base ADDR           Set the base address to a given value
-  --init SYMBOL               Call SYMBOl at load-time
+  --init SYMBOL               Call SYMBOL at load-time
   --no-undefined              Report undefined symbols (even with --shared)
   --noinhibit-exec            Create an output file even if errors occur
   --oformat=binary            Omit ELF, section and program headers
@@ -149,6 +149,8 @@ Options:
   --threads                   Use multiple threads (default)
     --no-threads
   --trace                     Print name of each input file
+  --undefined-version         Do not report version scripts that refer undefined symbols
+    --no-undefined-version    Report version scripts that refer undefined symbols (default)
   --unique PATTERN            Don't merge input sections that match a given pattern
   --unresolved-symbols [report-all,ignore-all,ignore-in-object-files,ignore-in-shared-libs]
                               How to handle unresolved symbols
@@ -184,6 +186,7 @@ Options:
   -z now                      Disable lazy function resolution
   -z origin                   Mark object requiring immediate $ORIGIN processing at runtime
   -z pack-relative-relocs     Alias for --pack-dyn-relocs=relr
+    -z nopack-relative-relocs
   -z separate-loadable-segments
                               Separate all loadable segments to different pages
     -z separate-code          Separate code and data into different pages
@@ -194,8 +197,8 @@ Options:
     -z notext
     -z textoff
 
-mold: supported targets: elf32-i386 elf64-x86-64 elf32-littlearm elf64-littleaarch64 elf32-littleriscv elf32-bigriscv elf64-littleriscv elf64-bigriscv elf64-powerpc elf64-powerpc elf64-powerpcle elf64-s390 elf64-sparc elf32-m68k
-mold: supported emulations: elf_i386 elf_x86_64 armelf_linux_eabi aarch64linux aarch64elf elf32lriscv elf32briscv elf64lriscv elf64briscv elf64ppc elf64lppc elf64_s390 elf64_sparc m68kelf)";
+mold: supported targets: elf32-i386 elf64-x86-64 elf32-littlearm elf64-littleaarch64 elf32-littleriscv elf32-bigriscv elf64-littleriscv elf64-bigriscv elf32-powerpc elf64-powerpc elf64-powerpc elf64-powerpcle elf64-s390 elf64-sparc elf32-m68k elf32-sh-linux elf64-alpha
+mold: supported emulations: elf_i386 elf_x86_64 armelf_linux_eabi aarch64linux aarch64elf elf32lriscv elf32briscv elf64lriscv elf64briscv elf32ppc elf32ppclinux elf64ppc elf64lppc elf64_s390 elf64_sparc m68kelf shlelf_linux elf64alpha)";
 
 static std::vector<std::string> add_dashes(std::string name) {
   // Single-letter option
@@ -402,6 +405,15 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   bool warn_shared_textrel = false;
   std::optional<SeparateCodeKind> z_separate_code;
   std::optional<bool> z_relro;
+  std::unordered_set<std::string_view> rpaths;
+
+  auto add_rpath = [&](std::string_view arg) {
+    if (rpaths.insert(arg).second) {
+      if (!ctx.arg.rpaths.empty())
+        ctx.arg.rpaths += ':';
+      ctx.arg.rpaths += arg;
+    }
+  };
 
   // RISC-V object files contains lots of local symbols, so by default
   // we discard them. This is compatible with GNU ld.
@@ -507,36 +519,42 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
                    << "\n  Supported emulations:\n   elf_x86_64\n   elf_i386\n"
                    << "   aarch64linux\n   armelf_linux_eabi\n   elf64lriscv\n"
                    << "   elf64briscv\n   elf32lriscv\n   elf32briscv\n"
-                   << "   elf64ppc\n   elf64lppc\n   elf64_s390\n   elf64_sparc\n"
-                   << "   m68kelf";
+                   << "   elf32ppc\n   elf64ppc\n   elf64lppc\n   elf64_s390\n"
+                   << "   elf64_sparc\n   m68kelf\n   shlelf_linux\n   elf64alpha";
       version_shown = true;
     } else if (read_arg("m")) {
       if (arg == "elf_x86_64") {
-        ctx.arg.emulation = MachineType::X86_64;
+        ctx.arg.emulation = X86_64::target_name;
       } else if (arg == "elf_i386") {
-        ctx.arg.emulation = MachineType::I386;
+        ctx.arg.emulation = I386::target_name;
       } else if (arg == "aarch64linux") {
-        ctx.arg.emulation = MachineType::ARM64;
+        ctx.arg.emulation = ARM64::target_name;
       } else if (arg == "armelf_linux_eabi") {
-        ctx.arg.emulation = MachineType::ARM32;
+        ctx.arg.emulation = ARM32::target_name;
       } else if (arg == "elf64lriscv") {
-        ctx.arg.emulation = MachineType::RV64LE;
+        ctx.arg.emulation = RV64LE::target_name;
       } else if (arg == "elf64briscv") {
-        ctx.arg.emulation = MachineType::RV64BE;
+        ctx.arg.emulation = RV64BE::target_name;
       } else if (arg == "elf32lriscv") {
-        ctx.arg.emulation = MachineType::RV32LE;
+        ctx.arg.emulation = RV32LE::target_name;
       } else if (arg == "elf32briscv") {
-        ctx.arg.emulation = MachineType::RV32BE;
+        ctx.arg.emulation = RV32BE::target_name;
+      } else if (arg == "elf32ppc" || arg == "elf32ppclinux") {
+        ctx.arg.emulation = PPC32::target_name;
       } else if (arg == "elf64ppc") {
-        ctx.arg.emulation = MachineType::PPC64V1;
+        ctx.arg.emulation = PPC64V1::target_name;
       } else if (arg == "elf64lppc") {
-        ctx.arg.emulation = MachineType::PPC64V2;
+        ctx.arg.emulation = PPC64V2::target_name;
       } else if (arg == "elf64_s390") {
-        ctx.arg.emulation = MachineType::S390X;
+        ctx.arg.emulation = S390X::target_name;
       } else if (arg == "elf64_sparc") {
-        ctx.arg.emulation = MachineType::SPARC64;
+        ctx.arg.emulation = SPARC64::target_name;
       } else if (arg == "m68kelf") {
-        ctx.arg.emulation = MachineType::M68K;
+        ctx.arg.emulation = M68K::target_name;
+      } else if (arg == "shlelf_linux") {
+        ctx.arg.emulation = SH4::target_name;
+      } else if (arg == "elf64alpha") {
+        ctx.arg.emulation = ALPHA::target_name;
       } else {
         Fatal(ctx) << "unknown -m argument: " << arg;
       }
@@ -557,15 +575,14 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       append(ctx.arg.exclude_libs, split_by_comma_or_colon(arg));
     } else if (read_flag("q") || read_flag("emit-relocs")) {
       ctx.arg.emit_relocs = true;
+      ctx.arg.discard_locals = false;
     } else if (read_arg("e") || read_arg("entry")) {
       ctx.arg.entry = arg;
     } else if (read_arg("Map")) {
       ctx.arg.Map = arg;
       ctx.arg.print_map = true;
     } else if (read_flag("print-dependencies")) {
-      ctx.arg.print_dependencies = 1;
-    } else if (read_flag("print-dependencies=full")) {
-      ctx.arg.print_dependencies = 2;
+      ctx.arg.print_dependencies = true;
     } else if (read_flag("print-map") || read_flag("M")) {
       ctx.arg.print_map = true;
     } else if (read_flag("Bstatic") || read_flag("dn") || read_flag("static")) {
@@ -651,6 +668,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       } else if (arg == "both") {
         ctx.arg.hash_style_sysv = true;
         ctx.arg.hash_style_gnu = true;
+      } else if (arg == "none") {
+        ctx.arg.hash_style_sysv = false;
+        ctx.arg.hash_style_gnu = false;
       } else {
         Fatal(ctx) << "invalid --hash-style argument: " << arg;
       }
@@ -685,6 +705,10 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.gdb_index = false;
     } else if (read_flag("r") || read_flag("relocatable")) {
       ctx.arg.relocatable = true;
+      ctx.arg.emit_relocs = true;
+      ctx.arg.discard_locals = false;
+    } else if (read_flag("relocatable-merge-sections")) {
+      ctx.arg.relocatable_merge_sections = true;
     } else if (read_flag("perf")) {
       ctx.arg.perf = true;
     } else if (read_flag("pack-dyn-relocs=relr")) {
@@ -787,6 +811,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.page_size = parse_number(ctx, "-z max-page-size", arg);
       if (!has_single_bit(ctx.page_size))
         Fatal(ctx) << "-z max-page-size " << arg << ": value must be a power of 2";
+    } else if (read_z_arg("start-stop-visibility")) {
+      if (arg != "hidden")
+        Fatal(ctx) << "-z start-stop-visibility: unsupported visibility: " << arg;
     } else if (read_z_flag("noexecstack")) {
       ctx.arg.z_execstack = false;
     } else if (read_z_flag("relro")) {
@@ -795,7 +822,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       z_relro = false;
     } else if (read_z_flag("defs")) {
       ctx.arg.z_defs = true;
-    } else if (read_z_flag("nodefs")) {
+    } else if (read_z_flag("undefs")) {
       ctx.arg.z_defs = false;
     } else if (read_z_flag("nodlopen")) {
       ctx.arg.z_dlopen = false;
@@ -830,12 +857,18 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.z_nodefaultlib = true;
     } else if (read_z_flag("pack-relative-relocs")) {
       ctx.arg.pack_dyn_relocs_relr = true;
+    } else if (read_z_flag("nopack-relative-relocs")) {
+      ctx.arg.pack_dyn_relocs_relr = false;
     } else if (read_z_flag("separate-loadable-segments")) {
       z_separate_code = SEPARATE_LOADABLE_SEGMENTS;
     } else if (read_z_flag("separate-code")) {
       z_separate_code = SEPARATE_CODE;
     } else if (read_z_flag("noseparate-code")) {
       z_separate_code = NOSEPARATE_CODE;
+    } else if (read_z_flag("dynamic-undefined-weak")) {
+      ctx.arg.z_dynamic_undefined_weak = true;
+    } else if (read_z_flag("nodynamic-undefined-weak")) {
+      ctx.arg.z_dynamic_undefined_weak = false;
     } else if (read_flag("no-undefined")) {
       ctx.arg.z_defs = true;
     } else if (read_flag("fatal-warnings")) {
@@ -967,17 +1000,16 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("error-unresolved-symbols")) {
       ctx.arg.unresolved_symbols = UNRESOLVED_ERROR;
     } else if (read_arg("rpath")) {
-      if (!ctx.arg.rpaths.empty())
-        ctx.arg.rpaths += ":";
-      ctx.arg.rpaths += arg;
+      add_rpath(arg);
     } else if (read_arg("R")) {
       if (is_file(arg))
         Fatal(ctx) << "-R" << arg
                    << ": -R as an alias for --just-symbols is not supported";
-
-      if (!ctx.arg.rpaths.empty())
-        ctx.arg.rpaths += ":";
-      ctx.arg.rpaths += arg;
+      add_rpath(arg);
+    } else if (read_flag("undefined-version")) {
+      ctx.arg.undefined_version = true;
+    } else if (read_flag("no-undefined-version")) {
+      ctx.arg.undefined_version = false;
     } else if (read_flag("build-id")) {
       ctx.arg.build_id.kind = BuildId::HASH;
       ctx.arg.build_id.hash_size = 20;
@@ -1034,7 +1066,6 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("no-add-needed")) {
     } else if (read_flag("no-call-graph-profile-sort")) {
     } else if (read_flag("no-copy-dt-needed-entries")) {
-    } else if (read_flag("no-undefined-version")) {
     } else if (read_arg("sort-section")) {
     } else if (read_flag("sort-common")) {
     } else if (read_flag("dc")) {
@@ -1047,11 +1078,13 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("warn-constructors")) {
     } else if (read_flag("warn-execstack")) {
     } else if (read_flag("no-warn-execstack")) {
+    } else if (read_flag("secure-plt")) {
     } else if (read_arg("rpath-link")) {
     } else if (read_z_flag("combreloc")) {
     } else if (read_z_flag("nocombreloc")) {
     } else if (read_z_arg("common-page-size")) {
     } else if (read_flag("no-keep-memory")) {
+    } else if (read_arg("max-cache-size")) {
     } else if (read_arg("version-script")) {
       // --version-script, --dynamic-list and --export-dynamic-symbol[-list]
       // are treated as positional arguments even if they are actually not
@@ -1150,9 +1183,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       Fatal(ctx) << "-auxiliary may not be used without -shared";
   }
 
-  if (!ctx.arg.apply_dynamic_relocs && !is_rela<E>)
+  if (!ctx.arg.apply_dynamic_relocs && !E::is_rela)
     Fatal(ctx) << "--no-apply-dynamic-relocs may not be used on "
-               << E::machine_type;
+               << E::target_name;
 
   if (is_sparc<E> && ctx.arg.apply_dynamic_relocs)
     Fatal(ctx) << "--apply-dynamic-relocs may not be used on SPARC64";

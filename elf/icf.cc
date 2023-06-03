@@ -65,7 +65,7 @@
 // conditions.
 
 #include "mold.h"
-#include "../sha.h"
+#include "../common/sha.h"
 
 #include <array>
 #include <cstdio>
@@ -89,16 +89,6 @@ template<> struct hash<Digest> {
 }
 
 namespace mold::elf {
-
-class BitVector {
-public:
-  BitVector(u32 size) : vec((size + 7) / 8) {}
-  bool get(u32 idx) const { return vec[idx / 8] & (1 << (idx % 8)); }
-  void set(u32 idx) { vec[idx / 8] |= 1 << (idx % 8); }
-
-private:
-  std::vector<u8> vec;
-};
 
 template <typename E>
 static void uniquify_cies(Context<E> &ctx) {
@@ -161,10 +151,6 @@ static bool is_leaf(Context<E> &ctx, InputSection<E> &isec) {
       return false;
 
   return true;
-}
-
-static u64 combine_hash(u64 a, u64 b) {
-  return a ^ (b + 0x9e3779b9 + (a << 6) + (a >> 2));
 }
 
 template <typename E>
@@ -300,7 +286,7 @@ static Digest compute_digest(Context<E> &ctx, InputSection<E> &isec) {
       hash_symbol(*isec.file.symbols[rel.r_sym]);
       hash(rel.r_type);
       hash(rel.r_offset - fde.input_offset);
-      hash(isec.file.cies[fde.cie_idx].input_section.get_addend(rel));
+      hash(get_addend(isec.file.cies[fde.cie_idx].input_section, rel));
     }
   }
 
@@ -308,7 +294,7 @@ static Digest compute_digest(Context<E> &ctx, InputSection<E> &isec) {
     const ElfRel<E> &rel = isec.get_rels(ctx)[i];
     hash(rel.r_offset);
     hash(rel.r_type);
-    hash(isec.get_addend(rel));
+    hash(get_addend(isec, rel));
     hash_symbol(*isec.file.symbols[rel.r_sym]);
   }
 
@@ -401,14 +387,12 @@ static void gather_edges(Context<E> &ctx,
     InputSection<E> &isec = *sections[i];
     i64 idx = edge_indices[i];
 
-    for (i64 j = 0; j < isec.get_rels(ctx).size(); j++) {
-      const ElfRel<E> &rel = isec.get_rels(ctx)[j];
+    for (ElfRel<E> &rel : isec.get_rels(ctx)) {
       Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
-      if (!sym.get_frag())
-        if (InputSection<E> *isec = sym.get_input_section())
-          if (isec->icf_eligible)
-            edges[idx++] = isec->icf_idx;
-    }
+      if (InputSection<E> *isec = sym.get_input_section())
+        if (isec->icf_eligible)
+          edges[idx++] = isec->icf_idx;
+  }
   });
 }
 

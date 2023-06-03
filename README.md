@@ -1,5 +1,13 @@
 # mold: A Modern Linker
 
+[![CI](https://github.com/rui314/mold/actions/workflows/ci.yml/badge.svg)](https://github.com/rui314/mold/actions/workflows/ci.yml)
+[![build result](https://build.opensuse.org/projects/home:marxin:mold/packages/mold/badge.svg?type=default)](https://build.opensuse.org/package/show/home:marxin:mold/mold)
+
+<i>This is a repo of a free, AGPL-licensed version of the linker.
+If you are looking for a commercial, non-AGPL version of the same linker,
+please visit the
+[repo of the sold linker](https://github.com/bluewhalesystems/sold).</i>
+
 mold is a faster drop-in replacement for existing Unix linkers.
 It is several times faster than the LLVM lld linker, the second-fastest
 open-source linker which I originally created a few years ago.
@@ -23,8 +31,11 @@ machine. Feel free to [file a bug](https://github.com/rui314/mold/issues)
 if you find mold is not faster than other linkers.
 
 mold supports x86-64, i386, ARM64, ARM32, 64-bit/32-bit little/big-endian
-RISC-V, 64-bit big-endian PowerPC ELFv1, 64-bit little-endian PowerPC ELFv2,
-s390x, SPARC64 and m68k.
+RISC-V, 32-bit PowerPC, 64-bit big-endian PowerPC ELFv1, 64-bit
+little-endian PowerPC ELFv2, s390x, SPARC64, m68k, SH-4 and DEC Alpha.
+
+mold/macOS is commercial software. For mold/macOS, please visit
+https://github.com/bluewhalesystems/sold.
 
 ## Why does the speed of linking matter?
 
@@ -64,7 +75,7 @@ necessary packages. You may want to run it as root.
 git clone https://github.com/rui314/mold.git
 mkdir mold/build
 cd mold/build
-git checkout v1.7.1
+git checkout v1.11.0
 ../install-build-deps.sh
 cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=c++ ..
 cmake --build . -j $(nproc)
@@ -114,7 +125,7 @@ following flags to use `mold` instead of `/usr/bin/ld`:
   `ld` is actually a symlink to `mold`. So, all you need is to pass
   `-B/usr/libexec/mold` (or `-B/usr/local/libexec/mold`) to GCC.
 
-If you haven't installed `mold` to any `$PATH`, you can still pass
+If you haven't installed `ld.mold` to any `$PATH`, you can still pass
 `-fuse-ld=/absolute/path/to/mold` to clang to use mold. GCC does not
 take an absolute path as an argument for `-fuse-ld` though.
 
@@ -132,7 +143,7 @@ rustflags = ["-C", "link-arg=-fuse-ld=/path/to/mold"]
 
 where `/path/to/mold` is an absolute path to `mold` exectuable. In the
 above example, we use `clang` as a linker driver as it can always take
-the `-fuse-ldd` option. If your GCC is recent enough to recognize the
+the `-fuse-ld` option. If your GCC is recent enough to recognize the
 option, you may be able to remove the `linker = "clang"` line.
 
 ```toml
@@ -143,18 +154,22 @@ rustflags = ["-C", "link-arg=-fuse-ld=/path/to/mold"]
 If you want to use mold for all projects, put the above snippet to
 `~/.cargo/config.toml`.
 
-If you are using macOS, you can modify `config.toml` in a similar manner.
-Here is an example with `mold` installed via [Homebrew](https://brew.sh).
+</details>
 
-```toml
-[target.x86_64-apple-darwin]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+<details><summary>If you are using Nim</summary>
 
-[target.aarch64-apple-darwin]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+Create `config.nims` in your project directory with the following:
+
+```nim
+when findExe("mold").len > 0 and defined(linux):
+  switch("passL", "-fuse-ld=mold")
 ```
+
+where `mold` must be included in the PATH environment variable. In this example
+The above example uses `gcc` as the linker driver.
+Use the `fuse-ld` option. If your GCC is recent enough to recognize this option.
+
+If you want to use mold for all projects, put the above snippet to `~/.config/config.nims`.
 
 </details>
 
@@ -174,20 +189,6 @@ Internally, mold invokes a given command with `LD_PRELOAD` environment
 variable set to its companion shared object file. The shared object
 file intercepts all function calls to `exec(3)`-family functions to
 replace `argv[0]` with `mold` if it is `ld`, `ld.gold` or `ld.lld`.
-
-</details>
-
-<details><summary>On macOS</summary>
-
-mold/macOS is available as an alpha version. It can be used to build not
-only macOS apps but also iOS apps because their binary formats are the same.
-
-The command name of mold/macOS is `ld64.mold`. If you build mold on macOS,
-it still produces `mold` and `ld.mold`, but these executables are useful
-only for cross compilation (i.e. building Linux apps on macOS.)
-
-If you find any issue with mold/macOS, please file it to
-<a href=https://github.com/rui314/mold/issues>our GitHub Issues</a>.
 
 </details>
 
@@ -221,9 +222,9 @@ If `mold` is in `.comment`, the file is created by mold.
 <details><summary>Online manual</summary>
 
 Since mold is a drop-in replacement, you should be able to use it
-without reading its manual. But just in case you need it, it's available
-online at <a href=https://rui314.github.io/mold.html>here</a>.
-You can also read the same manual by `man mold`.
+without reading its manual. But just in case you need it,
+[mold's man page](docs/mold.md) is also available. You can read the
+same manual by `man mold`.
 
 </details>
 
@@ -262,10 +263,10 @@ mostly a single-person open-source project, and just like other
 open-source projects, we are not legally obligated to keep maintaining
 it. A legally-binding commercial license contract addresses the
 concern. By purchasing a license, you are guaranteed that mold will be
-maintained for you. Please [contact us](mailto:contact@bluewhale.systems)
-for a commercial license inquiry.
+maintained for you. Please visit [our website](https://bluewhale.systems)
+for the details of the commercial license.
 
-## Acknowledgement
+## Sponsors
 
 We accept donations via [GitHub Sponsors](https://github.com/sponsors/rui314)
 and [OpenCollective](https://opencollective.com/mold-linker).
@@ -273,7 +274,18 @@ We thank you to everybody who sponsors our project. In particular,
 we'd like to acknowledge the following people and organizations who
 have sponsored $128/month or more:
 
-- [300baud](https://github.com/300baud)
-- [Mercury](https://github.com/MercuryTechnologies)
-- [Wei Wu](https://github.com/lazyparser)
+### Corporate sponsors
+
+<a href="https://mercury.com/"><img src="docs/mercury-logo.png" align=center height=120 width=400 alt=Mercury></a>
+<a href="https://cybozu-global.com/"><img src="docs/cyboze-logo.png" align=center height=120 width=133 alt=Cybozu></a>
+
+- [Uber](https://uber.com)
+- [G-Research](https://www.gresearch.co.uk)
 - [Signal Slot Inc.](https://github.com/signal-slot)
+
+### Individual sponsors
+
+- [300baud](https://github.com/300baud)
+- [Johan Andersson](https://github.com/repi)
+- [Wei Wu](https://github.com/lazyparser)
+- [kyle-elliott](https://github.com/kyle-elliott)
