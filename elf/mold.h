@@ -63,10 +63,6 @@ struct SectionFragment {
   SectionFragment(MergedSection<E> *sec, bool is_alive)
     : output_section(*sec), is_alive(is_alive) {}
 
-  SectionFragment(const SectionFragment &other)
-    : output_section(other.output_section), offset(other.offset),
-      p2align(other.p2align.load()), is_alive(other.is_alive.load()) {}
-
   u64 get_addr(Context<E> &ctx) const;
 
   MergedSection<E> &output_section;
@@ -106,8 +102,8 @@ class RangeExtensionThunk {};
 template <typename E> requires needs_thunk<E>
 class RangeExtensionThunk<E> {
 public:
-  RangeExtensionThunk(OutputSection<E> &osec, i64 offset)
-    : output_section(osec), offset(offset) {}
+  RangeExtensionThunk(OutputSection<E> &osec, i64 thunk_idx, i64 offset)
+    : output_section(osec), thunk_idx(thunk_idx), offset(offset) {}
 
   i64 size() const { return E::thunk_hdr_size + symbols.size() * E::thunk_size; }
   void copy_buf(Context<E> &ctx);
@@ -120,6 +116,7 @@ public:
   static constexpr i64 alignment = 4;
 
   OutputSection<E> &output_section;
+  i64 thunk_idx;
   i64 offset;
   std::mutex mu;
   std::vector<Symbol<E> *> symbols;
@@ -203,20 +200,6 @@ template <typename E>
 struct FdeRecord {
   FdeRecord(u32 input_offset, u32 rel_idx)
     : input_offset(input_offset), rel_idx(rel_idx) {}
-
-  FdeRecord(const FdeRecord &other)
-    : input_offset(other.input_offset), output_offset(other.output_offset),
-      rel_idx(other.rel_idx), cie_idx(other.cie_idx),
-      is_alive(other.is_alive.load()) {}
-
-  FdeRecord &operator=(const FdeRecord<E> &other) {
-    input_offset = other.input_offset;
-    output_offset = other.output_offset;
-    rel_idx = other.rel_idx;
-    cie_idx = other.cie_idx;
-    is_alive = other.is_alive.load();
-    return *this;
-  }
 
   i64 size(ObjectFile<E> &file) const;
   std::string_view get_contents(ObjectFile<E> &file) const;
@@ -1416,6 +1399,7 @@ template <typename E> void apply_exclude_libs(Context<E> &);
 template <typename E> void create_synthetic_sections(Context<E> &);
 template <typename E> void set_file_priority(Context<E> &);
 template <typename E> void resolve_symbols(Context<E> &);
+template <typename E> void kill_eh_frame_sections(Context<E> &);
 template <typename E> void resolve_section_pieces(Context<E> &);
 template <typename E> void convert_common_symbols(Context<E> &);
 template <typename E> void compute_merged_section_sizes(Context<E> &);
@@ -1601,6 +1585,7 @@ template <> struct ContextExtras<PPC64V1> {
 
 template <> struct ContextExtras<PPC64V2> {
   Symbol<PPC64V2> *TOC = nullptr;
+  Atomic<bool> is_power10 = false;
 };
 
 template <> struct ContextExtras<SPARC64> {
@@ -1639,11 +1624,11 @@ struct Context {
     bool Bsymbolic = false;
     bool Bsymbolic_functions = false;
     bool allow_multiple_definition = false;
+    bool apply_dynamic_relocs = true;
     bool color_diagnostics = false;
     bool default_symver = false;
     bool demangle = true;
     bool discard_all = false;
-    bool apply_dynamic_relocs = true;
     bool discard_locals = false;
     bool eh_frame_hdr = true;
     bool emit_relocs = false;
@@ -1683,6 +1668,7 @@ struct Context {
     bool stats = false;
     bool strip_all = false;
     bool strip_debug = false;
+    bool suppress_warnings = false;
     bool trace = false;
     bool undefined_version = false;
     bool warn_common = false;
@@ -2004,7 +1990,6 @@ public:
   i64 get_output_sym_idx(Context<E> &ctx) const;
   const ElfSym<E> &esym() const;
   void add_aux(Context<E> &ctx);
-  void clear();
 
   // A symbol is owned by a file. If two or more files define the
   // same symbol, the one with the strongest definition owns the symbol.
@@ -2487,15 +2472,32 @@ u64 Symbol<E>::get_addr(Context<E> &ctx, i64 flags) const {
       return isec->leader->get_addr() + value;
 
     if (isec->name() == ".eh_frame") {
-      // .eh_frame contents are parsed and reconstructed by the linker,
-      // so pointing to a specific location in a source .eh_frame
-      // section doesn't make much sense. However, CRT files contain
-      // symbols pointing to the very beginning and ending of the section.
-      if (name() == "__EH_FRAME_BEGIN__" || name() == "__EH_FRAME_LIST__" ||
-          name() == ".eh_frame_seg" || esym().st_type == STT_SECTION)
-        return ctx.eh_frame->shdr.sh_addr;
+      auto test = [this](const char *pattern) {
+      if (name() == pattern)
+        return true;
 
-      if (name() == "__FRAME_END__" || name() == "__EH_FRAME_LIST_END__")
+      // If LTO was enabled when building GCC and its CRT itself, then GCC
+      // will be able to move around the .eh_frame marker symbols. A suffix
+      // seems to be attached in such cases; we detect it here.
+      //
+      // This tests for `<pattern>.lto_priv.*`. It's a little convoluted
+      // but this is the best we can do without compile-time string
+      // concatenation.
+      if (name().starts_with(pattern) && name().substr(strlen(pattern)).starts_with(".lto_priv."))
+        return true;
+
+      return false;
+    };
+
+    // .eh_frame contents are parsed and reconstructed by the linker,
+    // so pointing to a specific location in a source .eh_frame
+    // section doesn't make much sense. However, CRT files contain
+    // symbols pointing to the very beginning and ending of the section.
+    if (test("__EH_FRAME_BEGIN__") || test("__EH_FRAME_LIST__") ||
+          test(".eh_frame_seg") || esym().st_type == STT_SECTION)
+    return ctx.eh_frame->shdr.sh_addr;
+
+      if (test("__FRAME_END__") || test("__EH_FRAME_LIST_END__"))
         return ctx.eh_frame->shdr.sh_addr + ctx.eh_frame->shdr.sh_size;
 
       // ARM object files contain "$d" local symbol at the beginning
@@ -2802,18 +2804,6 @@ inline void Symbol<E>::add_aux(Context<E> &ctx) {
     aux_idx = sz;
     ctx.symbol_aux.resize(sz + 1);
   }
-}
-
-template <typename E>
-inline void Symbol<E>::clear() {
-  file = nullptr;
-  origin = 0;
-  value = -1;
-  sym_idx = -1;
-  ver_idx = 0;
-  is_weak = false;
-  is_imported = false;
-  is_exported = false;
 }
 
 inline bool is_c_identifier(std::string_view s) {

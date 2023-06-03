@@ -1,3 +1,5 @@
+#if MOLD_ARM32 || MOLD_ARM64 || MOLD_PPC32 || MOLD_PPC64V1 || MOLD_PPC64V2
+
 // RISC instructions are usually up to 4 bytes long, so the immediates of
 // their branch instructions are naturally smaller than 32 bits.  This is
 // contrary to x86-64 on which branch instructions take 4 bytes immediates
@@ -70,12 +72,13 @@ static bool needs_thunk_rel(const ElfRel<E> &r) {
     return ty == R_AARCH64_JUMP26 || ty == R_AARCH64_CALL26;
   } else if constexpr (is_arm32<E>) {
     return ty == R_ARM_JUMP24 || ty == R_ARM_THM_JUMP24 ||
-           ty == R_ARM_CALL   || ty == R_ARM_THM_CALL;
+           ty == R_ARM_CALL   || ty == R_ARM_THM_CALL   ||
+           ty == R_ARM_PLT32;
   } else if constexpr (is_ppc32<E>) {
     return ty == R_PPC_REL24  || ty == R_PPC_PLTREL24 || ty == R_PPC_LOCAL24PC;
   } else {
     static_assert(is_ppc64<E>);
-    return ty == R_PPC64_REL24;
+    return ty == R_PPC64_REL24 || ty == R_PPC64_REL24_NOTOC;
   }
 }
 
@@ -105,7 +108,19 @@ static bool is_reachable(Context<E> &ctx, InputSection<E> &isec,
   if constexpr (is_arm32<E>) {
     bool is_thumb = sym.get_addr(ctx) & 1;
     if ((rel.r_type == R_ARM_THM_JUMP24 && !is_thumb) ||
-        (rel.r_type == R_ARM_JUMP24 && is_thumb))
+        (rel.r_type == R_ARM_JUMP24 && is_thumb) ||
+        (rel.r_type == R_ARM_PLT32 && is_thumb))
+      return false;
+  }
+
+  // PowerPC before Power9 lacks PC-relative load/store instructions.
+  // Functions compiled for Power9 or earlier assume that r2 points to
+  // GOT+0x8000, while those for Power10 uses r2 as a scratch register.
+  // We need to a thunk to reconstruct r2 for interworking.
+  if constexpr (is_ppc64v2<E>) {
+    if (rel.r_type == R_PPC64_REL24 && !sym.esym().preserves_r2())
+      return false;
+    if (rel.r_type == R_PPC64_REL24_NOTOC && sym.esym().uses_toc())
       return false;
   }
 
@@ -130,7 +145,7 @@ static void reset_thunk(RangeExtensionThunk<E> &thunk) {
 // Scan relocations to collect symbols that need thunks.
 template <typename E>
 static void scan_rels(Context<E> &ctx, InputSection<E> &isec,
-                      RangeExtensionThunk<E> &thunk, i64 thunk_idx) {
+                      RangeExtensionThunk<E> &thunk) {
   std::span<const ElfRel<E>> rels = isec.get_rels(ctx);
   std::vector<RangeExtensionRef> &range_extn = isec.extra.range_extn;
   range_extn.resize(rels.size());
@@ -159,7 +174,7 @@ static void scan_rels(Context<E> &ctx, InputSection<E> &isec,
 
     // Otherwise, add the symbol to the current thunk if it's not
     // added already.
-    range_extn[i].thunk_idx = thunk_idx;
+    range_extn[i].thunk_idx = thunk.thunk_idx;
     range_extn[i].sym_idx = -1;
 
     if (sym.flags.exchange(-1) == 0) {
@@ -188,29 +203,29 @@ void create_range_extension_thunks(Context<E> &ctx, OutputSection<E> &osec) {
   // We manage progress using four offsets which increase monotonically.
   // The locations they point to are always A <= B <= C <= D.
   //
-  //  ................................ <input sections> ............
-  //     A    B    C    D
-  //                   ^
-  //                   We insert a thunk for the current batch just before D
-  //          <--->      The current batch, which is smaller than batch_size
-  //     <-------->      smaller than max_distance
-  //          <--------> Smaller than max_distance
-  //     <-------------> Reachable from the current batch
-  //
   // A is the input section with the smallest address than can reach
   // anywhere from the current batch.
   //
   // D is the input section with the largest address such that the thunk
   // is reachable from the current batch if it's inserted right before D
   // but at least partially unreacahble if it's inserted after D.
+  //
+  //  ................................ <input sections> ............
+  //     A    B    C    D
+  //                    ^ We insert a thunk for the current batch just before D
+  //          <--->       The current batch, which is smaller than batch_size
+  //     <-------->       Smaller than max_distance
+  //          <-------->  Smaller than max_distance
+  //     <------------->  Reachable from the current batch
   i64 a = 0;
   i64 b = 0;
   i64 c = 0;
   i64 d = 0;
   i64 offset = 0;
+  i64 thunk_idx = 0;
 
   while (b < m.size()) {
-    // Move D foward as far as we can jump from B to anywhere in a thunk after D.
+    // Move D foward as far as we can jump from B to anywhere in a thunk at D.
     while (d < m.size() &&
            align_to(offset, 1 << m[d]->p2align) + m[d]->sh_size + max_thunk_size <
            m[b]->offset + max_distance<E>()) {
@@ -230,20 +245,24 @@ void create_range_extension_thunks(Context<E> &ctx, OutputSection<E> &osec) {
 
     // Move A forward so that A is reachable from C.
     i64 c_offset = (c == m.size()) ? offset : m[c]->offset;
-    while (a < osec.thunks.size() &&
-           osec.thunks[a]->offset + max_distance<E>() < c_offset)
-      reset_thunk(*osec.thunks[a++]);
+    while (a < m.size() && m[a]->offset + max_distance<E>() < c_offset)
+      a++;
+
+    // Erase references to out-of-range thunks.
+    while (thunk_idx < osec.thunks.size() &&
+           osec.thunks[thunk_idx]->offset < m[a]->offset)
+      reset_thunk(*osec.thunks[thunk_idx++]);
 
     // Create a thunk for input sections between B and C and place it at D.
     offset = align_to(offset, RangeExtensionThunk<E>::alignment);
-    RangeExtensionThunk<E> *thunk = new RangeExtensionThunk<E>(osec, offset);
-    i64 thunk_idx = osec.thunks.size();
+    RangeExtensionThunk<E> *thunk =
+      new RangeExtensionThunk<E>(osec, osec.thunks.size(), offset);
     osec.thunks.emplace_back(thunk);
 
     // Scan relocations between B and C to collect symbols that need thunks.
     tbb::parallel_for_each(m.begin() + b, m.begin() + c,
                            [&](InputSection<E> *isec) {
-      scan_rels(ctx, *isec, *thunk, thunk_idx);
+      scan_rels(ctx, *isec, *thunk);
     });
 
     // Now that we know the number of symbols in the thunk, we can compute
@@ -258,9 +277,10 @@ void create_range_extension_thunks(Context<E> &ctx, OutputSection<E> &osec) {
     });
 
     // Assign offsets within the thunk to the symbols.
-    for (i64 i = 0; Symbol<E> *sym : thunk->symbols) {
-      sym->extra.thunk_idx = thunk_idx;
-      sym->extra.thunk_sym_idx = i++;
+    for (i64 i = 0; i < thunk->symbols.size(); i++) {
+      Symbol<E> &sym = *thunk->symbols[i];
+      sym.extra.thunk_idx = thunk->thunk_idx;
+      sym.extra.thunk_sym_idx = i;
     }
 
     // Scan relocations again to fix symbol offsets in the last thunk.
@@ -271,7 +291,7 @@ void create_range_extension_thunks(Context<E> &ctx, OutputSection<E> &osec) {
       std::span<RangeExtensionRef> range_extn = isec->extra.range_extn;
 
       for (i64 i = 0; i < rels.size(); i++)
-        if (range_extn[i].thunk_idx == thunk_idx)
+        if (range_extn[i].thunk_idx == thunk->thunk_idx)
           range_extn[i].sym_idx = syms[rels[i].r_sym]->extra.thunk_sym_idx;
     });
 
@@ -279,18 +299,18 @@ void create_range_extension_thunks(Context<E> &ctx, OutputSection<E> &osec) {
     b = c;
   }
 
-  while (a < osec.thunks.size())
-    reset_thunk(*osec.thunks[a++]);
+  while (thunk_idx < osec.thunks.size())
+    reset_thunk(*osec.thunks[thunk_idx++]);
 
   osec.shdr.sh_size = offset;
 }
 
-#if MOLD_ARM32 || MOLD_ARM64 || MOLD_PPC32 || MOLD_PPC64V1 || MOLD_PPC64V2
 using E = MOLD_TARGET;
 
 static_assert(max_thunk_size / E::thunk_size < INT16_MAX);
 
 template void create_range_extension_thunks(Context<E> &, OutputSection<E> &);
-#endif
 
 } // namespace mold::elf
+
+#endif

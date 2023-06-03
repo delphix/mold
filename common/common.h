@@ -45,6 +45,18 @@
 // the compiler's optimizer what's true.
 #define ASSUME(x) do { if (!(x)) __builtin_unreachable(); } while (0)
 
+// This is an assert() that is enabled even in the release build.
+#define ASSERT(x)                                       \
+  do {                                                  \
+    if (!(x)) {                                         \
+      std::cerr << "Assertion failed: (" << #x          \
+                << "), function " << __FUNCTION__       \
+                << ", file " << __FILE__                \
+                << ", line " << __LINE__ << ".\n";      \
+      std::abort();                                     \
+    }                                                   \
+  } while (0)
+
 inline uint64_t hash_string(std::string_view str) {
   return XXH3_64bits(str.data(), str.size());
 }
@@ -94,24 +106,27 @@ static u64 combine_hash(u64 a, u64 b) {
 template <typename Context>
 class SyncOut {
 public:
-  SyncOut(Context &ctx, std::ostream &out = std::cout) : out(out) {
+  SyncOut(Context &ctx, std::ostream *out = &std::cout) : out(out) {
     opt_demangle = ctx.arg.demangle;
   }
 
   ~SyncOut() {
-    std::scoped_lock lock(mu);
-    out << ss.str() << "\n";
+    if (out) {
+      std::scoped_lock lock(mu);
+      *out << ss.str() << "\n";
+    }
   }
 
   template <class T> SyncOut &operator<<(T &&val) {
-    ss << std::forward<T>(val);
+    if (out)
+      ss << std::forward<T>(val);
     return *this;
   }
 
   static inline std::mutex mu;
 
 private:
-  std::ostream &out;
+  std::ostream *out;
   std::stringstream ss;
 };
 
@@ -125,7 +140,7 @@ static std::string add_color(Context &ctx, std::string msg) {
 template <typename Context>
 class Fatal {
 public:
-  Fatal(Context &ctx) : out(ctx, std::cerr) {
+  Fatal(Context &ctx) : out(ctx, &std::cerr) {
     out << add_color(ctx, "fatal");
   }
 
@@ -147,7 +162,7 @@ private:
 template <typename Context>
 class Error {
 public:
-  Error(Context &ctx) : out(ctx, std::cerr) {
+  Error(Context &ctx) : out(ctx, &std::cerr) {
     if (ctx.arg.noinhibit_exec) {
       out << add_color(ctx, "warning");
     } else {
@@ -168,7 +183,8 @@ private:
 template <typename Context>
 class Warn {
 public:
-  Warn(Context &ctx) : out(ctx, std::cerr) {
+  Warn(Context &ctx)
+    : out(ctx, ctx.arg.suppress_warnings ? nullptr : &std::cerr) {
     if (ctx.arg.fatal_warnings) {
       out << add_color(ctx, "error");
       ctx.has_error = true;
@@ -198,22 +214,24 @@ struct Atomic : std::atomic<T> {
 
   using std::atomic<T>::atomic;
 
+  Atomic(const Atomic<T> &other) { store(other.load()); }
+
+  Atomic<T> &operator=(const Atomic<T> &other) {
+    store(other.load());
+    return *this;
+  }
+
   void operator=(T val) { store(val); }
   operator T() const { return load(); }
 
-  void store(T val, std::memory_order order = relaxed) {
-    std::atomic<T>::store(val, order);
-  }
-
-  T load(std::memory_order order = relaxed) const {
-    return std::atomic<T>::load(order);
-  }
-
-  T exchange(T val, std::memory_order order = relaxed) {
-    return std::atomic<T>::exchange(val, order);
-  }
-
+  void store(T val) { std::atomic<T>::store(val, relaxed); }
+  T load() const { return std::atomic<T>::load(relaxed); }
+  T exchange(T val) { return std::atomic<T>::exchange(val, relaxed); }
   T operator|=(T val) { return std::atomic<T>::fetch_or(val, relaxed); }
+  T operator++() { return std::atomic<T>::fetch_add(1, relaxed) + 1; }
+  T operator--() { return std::atomic<T>::fetch_sub(1, relaxed) - 1; }
+  T operator++(int) { return std::atomic<T>::fetch_add(1, relaxed); }
+  T operator--(int) { return std::atomic<T>::fetch_sub(1, relaxed); }
 
   bool test_and_set() {
     // A relaxed load + branch (assuming miss) takes only around 20 cycles,
@@ -305,7 +323,12 @@ inline void append(std::vector<T> &vec1, std::vector<U> vec2) {
 
 template <typename T>
 inline std::vector<T> flatten(std::vector<std::vector<T>> &vec) {
+  i64 size = 0;
+  for (std::vector<T> &v : vec)
+    size += v.size();
+
   std::vector<T> ret;
+  ret.reserve(size);
   for (std::vector<T> &v : vec)
     append(ret, v);
   return ret;
@@ -832,7 +855,6 @@ public:
   std::string name;
   u8 *data = nullptr;
   i64 size = 0;
-  i64 mtime = 0;
   bool given_fullpath = true;
   MappedFile *parent = nullptr;
   MappedFile *thin_parent = nullptr;
@@ -866,15 +888,6 @@ MappedFile<Context> *MappedFile<Context>::open(Context &ctx, std::string path) {
 
   mf->name = path;
   mf->size = st.st_size;
-
-#ifdef _WIN32
-    mf->mtime = st.st_mtime;
-#elif defined(__APPLE__)
-    mf->mtime = (u64)st.st_mtimespec.tv_sec * 1'000'000'000 +
-                st.st_mtimespec.tv_nsec;
-#else
-    mf->mtime = (u64)st.st_mtim.tv_sec * 1'000'000'000 + st.st_mtim.tv_nsec;
-#endif
 
   if (st.st_size > 0) {
 #ifdef _WIN32

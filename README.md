@@ -75,7 +75,7 @@ necessary packages. You may want to run it as root.
 git clone https://github.com/rui314/mold.git
 mkdir mold/build
 cd mold/build
-git checkout v1.10.1
+git checkout v1.11.0
 ../install-build-deps.sh
 cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=c++ ..
 cmake --build . -j $(nproc)
@@ -154,19 +154,6 @@ rustflags = ["-C", "link-arg=-fuse-ld=/path/to/mold"]
 If you want to use mold for all projects, put the above snippet to
 `~/.cargo/config.toml`.
 
-If you are using macOS, you can modify `config.toml` in a similar manner.
-Here is an example with `mold` installed via [Homebrew](https://brew.sh).
-
-```toml
-[target.x86_64-apple-darwin]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
-
-[target.aarch64-apple-darwin]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
-```
-
 </details>
 
 <details><summary>If you are using Nim</summary>
@@ -183,13 +170,6 @@ The above example uses `gcc` as the linker driver.
 Use the `fuse-ld` option. If your GCC is recent enough to recognize this option.
 
 If you want to use mold for all projects, put the above snippet to `~/.config/config.nims`.
-
-If you are using macOS, you can modify config.nims in a similar manner. Here is an example with mold installed via Homebrew.
-
-```nim
-when findExe("ld64.mold").len > 0 and defined(macosx):
-  switch("passL", "-fuse-ld=ld64.mold")
-```
 
 </details>
 
@@ -209,20 +189,6 @@ Internally, mold invokes a given command with `LD_PRELOAD` environment
 variable set to its companion shared object file. The shared object
 file intercepts all function calls to `exec(3)`-family functions to
 replace `argv[0]` with `mold` if it is `ld`, `ld.gold` or `ld.lld`.
-
-</details>
-
-<details><summary>On macOS</summary>
-
-mold/macOS is available as an alpha version. It can be used to build not
-only macOS apps but also iOS apps because their binary formats are the same.
-
-The command name of mold/macOS is `ld64.mold`. If you build mold on macOS,
-it still produces `mold` and `ld.mold`, but these executables are useful
-only for cross compilation (i.e. building Linux apps on macOS.)
-
-If you find any issue with mold/macOS, please file it to
-<a href=https://github.com/rui314/mold/issues>our GitHub Issues</a>.
 
 </details>
 
@@ -256,9 +222,9 @@ If `mold` is in `.comment`, the file is created by mold.
 <details><summary>Online manual</summary>
 
 Since mold is a drop-in replacement, you should be able to use it
-without reading its manual. But just in case you need it, it's available
-online at <a href=https://rui314.github.io/mold.html>here</a>.
-You can also read the same manual by `man mold`.
+without reading its manual. But just in case you need it,
+[mold's man page](docs/mold.md) is also available. You can read the
+same manual by `man mold`.
 
 </details>
 
@@ -297,8 +263,8 @@ mostly a single-person open-source project, and just like other
 open-source projects, we are not legally obligated to keep maintaining
 it. A legally-binding commercial license contract addresses the
 concern. By purchasing a license, you are guaranteed that mold will be
-maintained for you. Please [contact us](mailto:contact@bluewhale.systems)
-for a commercial license inquiry.
+maintained for you. Please visit [our website](https://bluewhale.systems)
+for the details of the commercial license.
 
 ## Sponsors
 
@@ -311,8 +277,10 @@ have sponsored $128/month or more:
 ### Corporate sponsors
 
 <a href="https://mercury.com/"><img src="docs/mercury-logo.png" align=center height=120 width=400 alt=Mercury></a>
+<a href="https://cybozu-global.com/"><img src="docs/cyboze-logo.png" align=center height=120 width=133 alt=Cybozu></a>
 
 - [Uber](https://uber.com)
+- [G-Research](https://www.gresearch.co.uk)
 - [Signal Slot Inc.](https://github.com/signal-slot)
 
 ### Individual sponsors

@@ -422,25 +422,34 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul64 *)loc = G + GOTPLT + A - P;
       break;
     case R_X86_64_GOTPCRELX:
-      if (sym.has_got(ctx)) {
-        write32s(G + GOTPLT + A - P);
-      } else {
+      // We always want to relax GOTPCRELX relocs even if --no-relax
+      // was given because some static PIE runtime code depends on these
+      // relaxations.
+      if (!sym.is_imported && !sym.is_ifunc() && sym.is_relative()) {
         u32 insn = relax_gotpcrelx(loc - 2);
-        loc[-2] = insn >> 8;
-        loc[-1] = insn;
-        write32s(S + A - P);
+        i64 val = S + A - P;
+        if (insn && (i32)val == val) {
+          loc[-2] = insn >> 8;
+          loc[-1] = insn;
+          *(ul32 *)loc = val;
+          break;
+        }
       }
+      write32s(G + GOTPLT + A - P);
       break;
     case R_X86_64_REX_GOTPCRELX:
-      if (sym.has_got(ctx)) {
-        write32s(G + GOTPLT + A - P);
-      } else {
+      if (!sym.is_imported && !sym.is_ifunc() && sym.is_relative()) {
         u32 insn = relax_rex_gotpcrelx(loc - 3);
-        loc[-3] = insn >> 16;
-        loc[-2] = insn >> 8;
-        loc[-1] = insn;
-        write32s(S + A - P);
+        i64 val = S + A - P;
+        if (insn && (i32)val == val) {
+          loc[-3] = insn >> 16;
+          loc[-2] = insn >> 8;
+          loc[-1] = insn;
+          *(ul32 *)loc = val;
+          break;
+        }
       }
+      write32s(G + GOTPLT + A - P);
       break;
     case R_X86_64_TLSGD:
       if (sym.has_tlsgd(ctx)) {
@@ -597,6 +606,15 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       else
         *(ul64 *)loc = S + A - ctx.dtp_addr;
       break;
+    case R_X86_64_GOTOFF64:
+      *(ul64 *)loc = S + A - ctx.gotplt->shdr.sh_addr;
+      break;
+    case R_X86_64_GOTPC64:
+      // PC-relative relocation doesn't make sense for non-memory-allocated
+      // section, but GCC 6.3.0 seems to create this reloc for
+      // _GLOBAL_OFFSET_TABLE_.
+      *(ul64 *)loc = ctx.gotplt->shdr.sh_addr + A;
+      break;
     case R_X86_64_SIZE32:
       write32(sym.esym().st_size + A);
       break;
@@ -657,30 +675,10 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_X86_64_GOTPC64:
     case R_X86_64_GOTPCREL:
     case R_X86_64_GOTPCREL64:
+    case R_X86_64_GOTPCRELX:
+    case R_X86_64_REX_GOTPCRELX:
       sym.flags |= NEEDS_GOT;
       break;
-    case R_X86_64_GOTPCRELX: {
-      if (rel.r_addend != -4)
-        Fatal(ctx) << *this << ": bad r_addend for R_X86_64_GOTPCRELX";
-
-      // We always want to relax GOTX relocations because the static
-      // PIE relies on this relaxation.
-      bool do_relax = !sym.is_imported && sym.is_relative() &&
-                      relax_gotpcrelx(loc - 2);
-      if (!do_relax)
-        sym.flags |= NEEDS_GOT;
-      break;
-    }
-    case R_X86_64_REX_GOTPCRELX: {
-      if (rel.r_addend != -4)
-        Fatal(ctx) << *this << ": bad r_addend for R_X86_64_REX_GOTPCRELX";
-
-      bool do_relax = !sym.is_imported && sym.is_relative() &&
-                      relax_rex_gotpcrelx(loc - 3);
-      if (!do_relax)
-        sym.flags |= NEEDS_GOT;
-      break;
-    }
     case R_X86_64_PLT32:
     case R_X86_64_PLTOFF64:
       if (sym.is_imported)

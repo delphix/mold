@@ -26,11 +26,20 @@ jobs:
     - name: build and test
       run: |
         echo "/usr/lib/ccache:/usr/local/opt/ccache/libexec" >> $GITHUB_PATH
+        sudo apt-get install -y clang++-12
         mkdir build
         cd build
-        cmake -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ ${{ matrix.target }} ..
+        cmake -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++-12 ${{ matrix.target }} ..
         cmake --build . -j$(nproc)
         ctest . -j$(nproc)
+    - name: archive test results
+      uses: actions/upload-artifact@v3
+      if: failure()
+      with:
+        name: test-results-clang
+        path: |
+          build/out
+          build/Testing
 
   build-gcc:
     runs-on: ubuntu-20.04
@@ -75,9 +84,9 @@ jobs:
         ctest . -j$(nproc)
     - name: archive test results
       uses: actions/upload-artifact@v3
-      if: always()
+      if: failure()
       with:
-        name: test-results
+        name: test-results-gcc
         path: |
           build/out
           build/Testing

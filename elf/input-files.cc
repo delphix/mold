@@ -58,9 +58,18 @@ ElfShdr<E> *InputFile<E>::find_section(i64 type) {
 
 template <typename E>
 void InputFile<E>::clear_symbols() {
-  for (Symbol<E> *sym : get_global_syms())
-    if (__atomic_load_n(&sym->file, __ATOMIC_RELAXED) == this)
-      sym->clear();
+  for (Symbol<E> *sym : get_global_syms()) {
+    if (__atomic_load_n(&sym->file, __ATOMIC_ACQUIRE) == this) {
+      sym->origin = 0;
+      sym->value = -1;
+      sym->sym_idx = -1;
+      sym->ver_idx = 0;
+      sym->is_weak = false;
+      sym->is_imported = false;
+      sym->is_exported = false;
+      __atomic_store_n(&sym->file, nullptr, __ATOMIC_RELEASE);
+    }
+  }
 }
 
 // Find the source filename. It should be listed in symtab as STT_FILE.
@@ -315,7 +324,6 @@ void ObjectFile<E>::initialize_ehframe_sections(Context<E> &ctx) {
     std::unique_ptr<InputSection<E>> &isec = sections[i];
     if (isec && isec->is_alive && isec->name() == ".eh_frame") {
       read_ehframe(ctx, *isec);
-      isec->is_alive = false;
     }
   }
 }
@@ -570,7 +578,7 @@ static size_t find_null(std::string_view data, u64 entsize) {
 template <typename E>
 static std::unique_ptr<MergeableSection<E>>
 split_section(Context<E> &ctx, InputSection<E> &sec) {
-  if (!sec.is_alive || sec.sh_size == 0 || sec.relsec_idx != -1)
+  if (!sec.is_alive || sec.relsec_idx != -1)
     return nullptr;
 
   const ElfShdr<E> &shdr = sec.shdr();
@@ -581,6 +589,9 @@ split_section(Context<E> &ctx, InputSection<E> &sec) {
   rec->parent = MergedSection<E>::get_instance(ctx, sec.name(), shdr.sh_type,
                                                shdr.sh_flags);
   rec->p2align = sec.p2align;
+
+  if (sec.sh_size == 0)
+    return rec;
 
   // If thes section contents are compressed, uncompress them.
   sec.uncompress(ctx);
@@ -721,7 +732,7 @@ void ObjectFile<E>::resolve_section_pieces(Context<E> &ctx) {
       continue;
 
     std::unique_ptr<MergeableSection<E>> &m = mergeable_sections[get_shndx(esym)];
-    if (!m)
+    if (!m || m->fragments.empty())
       continue;
 
     SectionFragment<E> *frag;
@@ -938,8 +949,6 @@ void ObjectFile<E>::resolve_symbols(Context<E> &ctx) {
       sym.sym_idx = i;
       sym.ver_idx = ctx.default_version;
       sym.is_weak = esym.is_weak();
-      sym.is_imported = false;
-      sym.is_exported = false;
     }
   }
 }
@@ -1066,8 +1075,6 @@ void ObjectFile<E>::convert_common_symbols(Context<E> &ctx) {
     sym.sym_idx = i;
     sym.ver_idx = ctx.default_version;
     sym.is_weak = false;
-    sym.is_imported = false;
-    sym.is_exported = false;
 
     sections.push_back(std::move(isec));
   }
@@ -1347,8 +1354,6 @@ void SharedFile<E>::resolve_symbols(Context<E> &ctx) {
       sym.sym_idx = i;
       sym.ver_idx = versyms[i];
       sym.is_weak = false;
-      sym.is_imported = false;
-      sym.is_exported = false;
     }
   }
 }
@@ -1364,8 +1369,7 @@ SharedFile<E>::mark_live_objects(Context<E> &ctx,
     if (sym.is_traced)
       print_trace_symbol(ctx, *this, esym, sym);
 
-    if (esym.is_undef() && sym.file && !sym.file->is_dso &&
-        !sym.file->is_alive.test_and_set()) {
+    if (esym.is_undef() && sym.file && !sym.file->is_alive.test_and_set()) {
       feeder(sym.file);
 
       if (sym.is_traced)
