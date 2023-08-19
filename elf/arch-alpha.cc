@@ -62,8 +62,8 @@ template <>
 void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {}
 
 template <>
-void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
-                                    u64 offset, u64 val) {
+void EhFrameSection<E>::apply_eh_reloc(Context<E> &ctx, const ElfRel<E> &rel,
+                                       u64 offset, u64 val) {
   u8 *loc = ctx.buf + this->shdr.sh_offset + offset;
 
   switch (rel.r_type) {
@@ -103,7 +103,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 
     switch (rel.r_type) {
     case R_ALPHA_REFQUAD:
-      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, dynrel);
+      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, &dynrel);
       break;
     case R_ALPHA_GPREL32:
       *(ul32 *)loc = S + A - GP;
@@ -318,7 +318,7 @@ void AlphaGotSection::copy_buf(Context<E> &ctx) {
 
     if (e.sym->is_imported) {
       *buf = ctx.arg.apply_dynamic_relocs ? e.addend : 0;
-      *dynrel++ = ElfRel<E>(P, E::R_ABS, e.sym->get_dynsym_idx(ctx), e.addend);
+      *dynrel++ = ElfRel<E>(P, E::R_DYNAMIC, e.sym->get_dynsym_idx(ctx), e.addend);
     } else {
       *buf = e.sym->get_addr(ctx) + e.addend;
       if (ctx.arg.pic && !e.sym->is_absolute())

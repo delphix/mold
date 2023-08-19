@@ -102,8 +102,8 @@ void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
 }
 
 template <>
-void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
-                                    u64 offset, u64 val) {
+void EhFrameSection<E>::apply_eh_reloc(Context<E> &ctx, const ElfRel<E> &rel,
+                                       u64 offset, u64 val) {
   u8 *loc = ctx.buf + this->shdr.sh_offset + offset;
 
   switch (rel.r_type) {
@@ -173,7 +173,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 
     switch (rel.r_type) {
     case R_AARCH64_ABS64:
-      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, dynrel);
+      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, &dynrel);
       break;
     case R_AARCH64_LDST8_ABS_LO12_NC:
     case R_AARCH64_ADD_ABS_LO12_NC:
@@ -232,7 +232,8 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         i++;
       }
       break;
-    case R_AARCH64_ADR_PREL_PG_HI21: {
+    case R_AARCH64_ADR_PREL_PG_HI21:
+    case R_AARCH64_ADR_PREL_PG_HI21_NC: {
       // The ARM64 psABI defines that an `ADRP x0, foo` and `ADD x0, x0,
       // :lo12: foo` instruction pair to materialize a PC-relative address
       // in a register can be relaxed to `NOP` followed by `ADR x0, foo`
@@ -259,7 +260,8 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       }
 
       i64 val = page(S + A) - page(P);
-      check(val, -(1LL << 32), 1LL << 32);
+      if (rel.r_type == R_AARCH64_ADR_PREL_PG_HI21)
+        check(val, -(1LL << 32), 1LL << 32);
       write_adrp(loc, val);
       break;
     }
@@ -477,6 +479,9 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_AARCH64_ABS64:
       scan_dyn_absrel(ctx, sym, rel);
       break;
+    case R_AARCH64_MOVW_UABS_G3:
+      scan_absrel(ctx, sym, rel);
+      break;
     case R_AARCH64_ADR_GOT_PAGE:
       // An ADR_GOT_PAGE and GOT_LO12_NC relocation pair is used to load a
       // symbol's address from GOT. If the GOT value is a link-time
@@ -519,23 +524,17 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       sym.flags |= NEEDS_GOTTP;
       break;
     case R_AARCH64_ADR_PREL_PG_HI21:
+    case R_AARCH64_ADR_PREL_PG_HI21_NC:
       scan_pcrel(ctx, sym, rel);
       break;
     case R_AARCH64_TLSGD_ADR_PAGE21:
       sym.flags |= NEEDS_TLSGD;
       break;
-    case R_AARCH64_TLSDESC_ADR_PAGE21:
-    case R_AARCH64_TLSDESC_LD64_LO12:
-    case R_AARCH64_TLSDESC_ADD_LO12:
+    case R_AARCH64_TLSDESC_CALL:
       if (!relax_tlsdesc(ctx, sym))
         sym.flags |= NEEDS_TLSDESC;
       break;
-    case R_AARCH64_TLSLE_MOVW_TPREL_G0:
-    case R_AARCH64_TLSLE_MOVW_TPREL_G0_NC:
-    case R_AARCH64_TLSLE_MOVW_TPREL_G1:
-    case R_AARCH64_TLSLE_MOVW_TPREL_G1_NC:
     case R_AARCH64_TLSLE_MOVW_TPREL_G2:
-    case R_AARCH64_TLSLE_ADD_TPREL_HI12:
     case R_AARCH64_TLSLE_ADD_TPREL_LO12:
     case R_AARCH64_TLSLE_ADD_TPREL_LO12_NC:
       check_tlsle(ctx, sym, rel);
@@ -555,12 +554,18 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_AARCH64_MOVW_UABS_G1_NC:
     case R_AARCH64_MOVW_UABS_G2:
     case R_AARCH64_MOVW_UABS_G2_NC:
-    case R_AARCH64_MOVW_UABS_G3:
     case R_AARCH64_PREL16:
     case R_AARCH64_PREL32:
     case R_AARCH64_PREL64:
     case R_AARCH64_TLSGD_ADD_LO12_NC:
-    case R_AARCH64_TLSDESC_CALL:
+    case R_AARCH64_TLSLE_MOVW_TPREL_G0:
+    case R_AARCH64_TLSLE_MOVW_TPREL_G0_NC:
+    case R_AARCH64_TLSLE_MOVW_TPREL_G1:
+    case R_AARCH64_TLSLE_MOVW_TPREL_G1_NC:
+    case R_AARCH64_TLSLE_ADD_TPREL_HI12:
+    case R_AARCH64_TLSDESC_ADR_PAGE21:
+    case R_AARCH64_TLSDESC_LD64_LO12:
+    case R_AARCH64_TLSDESC_ADD_LO12:
       break;
     default:
       Error(ctx) << *this << ": unknown relocation: " << rel;
@@ -585,7 +590,7 @@ void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
     u64 P = output_section.shdr.sh_addr + offset + i * E::thunk_size;
 
     u8 *loc = buf + i * E::thunk_size;
-    memcpy(loc , data, sizeof(data));
+    memcpy(loc, data, sizeof(data));
     write_adrp(loc, page(S) - page(P));
     *(ul32 *)(loc + 4) |= bits(S, 11, 0) << 10;
   }

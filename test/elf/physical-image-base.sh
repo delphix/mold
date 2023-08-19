@@ -2,6 +2,10 @@
 . $(dirname $0)/common.inc
 
 [ $MACHINE = ppc64 ] && skip
+[[ $MACHINE = mips* ]] && skip
+
+# BusyBox's grep can't handle capture groups (e.g. \1, \2 ...)
+grep --version 2>&1 | grep BusyBox && skip
 
 cat <<EOF | $CC -o $t/a.o -c -xc -
 #include <stdio.h>

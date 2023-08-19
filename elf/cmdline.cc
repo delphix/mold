@@ -1,6 +1,7 @@
 #include "mold.h"
 #include "../common/cmdline.h"
 
+#include <random>
 #include <regex>
 #include <sstream>
 #include <sys/stat.h>
@@ -187,18 +188,21 @@ Options:
   -z origin                   Mark object requiring immediate $ORIGIN processing at runtime
   -z pack-relative-relocs     Alias for --pack-dyn-relocs=relr
     -z nopack-relative-relocs
+  -z sectionheader            Do not omit section header (default)
+    -z nosectionheader        Omit section header
   -z separate-loadable-segments
                               Separate all loadable segments to different pages
     -z separate-code          Separate code and data into different pages
     -z noseparate-code        Allow overlap in pages
+  -z stack-size=VALUE         Set size of stack segment
   -z relro                    Make some sections read-only after relocation (default)
     -z norelro
   -z text                     Report error if DT_TEXTREL is set
     -z notext
     -z textoff
 
-mold: supported targets: elf32-i386 elf64-x86-64 elf32-littlearm elf64-littleaarch64 elf32-littleriscv elf32-bigriscv elf64-littleriscv elf64-bigriscv elf32-powerpc elf64-powerpc elf64-powerpc elf64-powerpcle elf64-s390 elf64-sparc elf32-m68k elf32-sh-linux elf64-alpha
-mold: supported emulations: elf_i386 elf_x86_64 armelf_linux_eabi aarch64linux aarch64elf elf32lriscv elf32briscv elf64lriscv elf64briscv elf32ppc elf32ppclinux elf64ppc elf64lppc elf64_s390 elf64_sparc m68kelf shlelf_linux elf64alpha)";
+mold: supported targets: elf32-i386 elf64-x86-64 elf32-littlearm elf64-littleaarch64 elf32-littleriscv elf32-bigriscv elf64-littleriscv elf64-bigriscv elf32-powerpc elf64-powerpc elf64-powerpc elf64-powerpcle elf64-s390 elf64-sparc elf32-m68k elf32-sh-linux elf64-alpha elf64-loongarch elf32-loongarch
+mold: supported emulations: elf_i386 elf_x86_64 armelf_linux_eabi aarch64linux aarch64elf elf32lriscv elf32briscv elf64lriscv elf64briscv elf32ppc elf32ppclinux elf64ppc elf64lppc elf64_s390 elf64_sparc m68kelf shlelf_linux elf64alpha elf64loongarch elf32loongarch)";
 
 static std::vector<std::string> add_dashes(std::string name) {
   // Single-letter option
@@ -405,6 +409,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   bool warn_shared_textrel = false;
   std::optional<SeparateCodeKind> z_separate_code;
   std::optional<bool> z_relro;
+  std::optional<u64> shuffle_sections_seed;
   std::unordered_set<std::string_view> rpaths;
 
   auto add_rpath = [&](std::string_view arg) {
@@ -423,7 +428,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   // It looks like the SPARC's dynamic linker takes both RELA's r_addend
   // and the value at the relocated place. So we don't want to write
   // values to relocated places.
-  if (is_sparc<E>)
+  if constexpr (is_sparc<E>)
     ctx.arg.apply_dynamic_relocs = false;
 
   auto read_arg = [&](std::string name) {
@@ -520,8 +525,17 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
                    << "   aarch64linux\n   armelf_linux_eabi\n   elf64lriscv\n"
                    << "   elf64briscv\n   elf32lriscv\n   elf32briscv\n"
                    << "   elf32ppc\n   elf64ppc\n   elf64lppc\n   elf64_s390\n"
-                   << "   elf64_sparc\n   m68kelf\n   shlelf_linux\n   elf64alpha";
+                   << "   elf64_sparc\n   m68kelf\n   shlelf_linux\n"
+                   << "   elf64alpha\n   elf64ltsmip\n   elf64btsmip\n"
+                   << "   elf64loongarch\n   elf32loongarch";
       version_shown = true;
+    } else if (read_flag("mips32") || read_flag("mips32r2") ||
+               read_flag("mips32r3") || read_flag("mips32r4") ||
+               read_flag("mips32r5") || read_flag("mips32r6") ||
+               read_flag("mips64") || read_flag("mips64r2") ||
+               read_flag("mips64r3") || read_flag("mips64r4") ||
+               read_flag("mips64r5") || read_flag("mips64r6")) {
+      // Ignore useless MIPS-specific flags
     } else if (read_arg("m")) {
       if (arg == "elf_x86_64") {
         ctx.arg.emulation = X86_64::target_name;
@@ -555,6 +569,14 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
         ctx.arg.emulation = SH4::target_name;
       } else if (arg == "elf64alpha") {
         ctx.arg.emulation = ALPHA::target_name;
+      } else if (arg == "elf64ltsmip") {
+        ctx.arg.emulation = MIPS64LE::target_name;
+      } else if (arg == "elf64btsmip") {
+        ctx.arg.emulation = MIPS64BE::target_name;
+      } else if (arg == "elf64loongarch") {
+        ctx.arg.emulation = LOONGARCH64::target_name;
+      } else if (arg == "elf32loongarch") {
+        ctx.arg.emulation = LOONGARCH32::target_name;
       } else {
         Fatal(ctx) << "unknown -m argument: " << arg;
       }
@@ -623,7 +645,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.shuffle_sections = SHUFFLE_SECTIONS_SHUFFLE;
     } else if (read_eq("shuffle-sections")) {
       ctx.arg.shuffle_sections = SHUFFLE_SECTIONS_SHUFFLE;
-      ctx.arg.shuffle_sections_seed = parse_number(ctx, "shuffle-sections", arg);
+      shuffle_sections_seed = parse_number(ctx, "shuffle-sections", arg);
     } else if (read_flag("reverse-sections")) {
       ctx.arg.shuffle_sections = SHUFFLE_SECTIONS_REVERSE;
     } else if (read_flag("rosegment")) {
@@ -650,7 +672,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
         ctx.arg.unresolved_symbols = UNRESOLVED_IGNORE;
       else
         Fatal(ctx) << "unknown --unresolved-symbols argument: " << arg;
-    } else if (read_arg("u") || read_arg("undefined")) {
+    } else if (read_arg("undefined") || read_arg("u")) {
       ctx.arg.undefined.push_back(arg);
     } else if (read_arg("require-defined")) {
       ctx.arg.require_defined.push_back(arg);
@@ -692,7 +714,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("pie") || read_flag("pic-executable")) {
       ctx.arg.pic = true;
       ctx.arg.pie = true;
-    } else if (read_flag("no-pie") || read_flag("no-pic-executable")) {
+    } else if (read_flag("no-pie") || read_flag("no-pic-executable") ||
+               read_flag("nopie")) {
       ctx.arg.pic = false;
       ctx.arg.pie = false;
     } else if (read_flag("relax")) {
@@ -711,9 +734,11 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.relocatable_merge_sections = true;
     } else if (read_flag("perf")) {
       ctx.arg.perf = true;
-    } else if (read_flag("pack-dyn-relocs=relr")) {
+    } else if (read_flag("pack-dyn-relocs=relr") ||
+               read_z_flag("pack-relative-relocs")) {
       ctx.arg.pack_dyn_relocs_relr = true;
-    } else if (read_flag("pack-dyn-relocs=none")) {
+    } else if (read_flag("pack-dyn-relocs=none") ||
+               read_z_flag("nopack-relative-relocs")) {
       ctx.arg.pack_dyn_relocs_relr = false;
     } else if (read_arg("package-metadata")) {
       ctx.arg.package_metadata = arg;
@@ -855,20 +880,22 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.z_origin = true;
     } else if (read_z_flag("nodefaultlib")) {
       ctx.arg.z_nodefaultlib = true;
-    } else if (read_z_flag("pack-relative-relocs")) {
-      ctx.arg.pack_dyn_relocs_relr = true;
-    } else if (read_z_flag("nopack-relative-relocs")) {
-      ctx.arg.pack_dyn_relocs_relr = false;
     } else if (read_z_flag("separate-loadable-segments")) {
       z_separate_code = SEPARATE_LOADABLE_SEGMENTS;
     } else if (read_z_flag("separate-code")) {
       z_separate_code = SEPARATE_CODE;
     } else if (read_z_flag("noseparate-code")) {
       z_separate_code = NOSEPARATE_CODE;
+    } else if (read_z_arg("stack-size")) {
+      ctx.arg.z_stack_size = parse_number(ctx, "-z stack-size", arg);
     } else if (read_z_flag("dynamic-undefined-weak")) {
       ctx.arg.z_dynamic_undefined_weak = true;
     } else if (read_z_flag("nodynamic-undefined-weak")) {
       ctx.arg.z_dynamic_undefined_weak = false;
+    } else if (read_z_flag("sectionheader")) {
+      ctx.arg.z_sectionheader = true;
+    } else if (read_z_flag("nosectionheader")) {
+      ctx.arg.z_sectionheader = false;
     } else if (read_flag("no-undefined")) {
       ctx.arg.z_defs = true;
     } else if (read_flag("fatal-warnings")) {
@@ -994,7 +1021,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("strip-all") || read_flag("s")) {
       ctx.arg.strip_all = true;
     } else if (read_flag("strip-debug") || read_flag("S")) {
-      ctx.arg.strip_all = true;
+      ctx.arg.strip_debug = true;
     } else if (read_flag("warn-unresolved-symbols")) {
       ctx.arg.unresolved_symbols = UNRESOLVED_WARN;
     } else if (read_flag("error-unresolved-symbols")) {
@@ -1047,6 +1074,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_arg("filter") || read_arg("F")) {
       ctx.arg.filter.push_back(arg);
     } else if (read_arg("O")) {
+    } else if (read_flag("EB")) {
+    } else if (read_flag("EL")) {
     } else if (read_flag("O0")) {
     } else if (read_flag("O1")) {
     } else if (read_flag("O2")) {
@@ -1087,7 +1116,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_arg("max-cache-size")) {
     } else if (read_arg("version-script")) {
       // --version-script, --dynamic-list and --export-dynamic-symbol[-list]
-      // are treated as positional arguments even if they are actually not
+      // are treated as positional arguments even though they are actually not
       // positional. This is because linker scripts (a positional argument)
       // can also specify a version script, and it's better to consolidate
       // parsing in read_input_files. In particular, version scripts can
@@ -1124,10 +1153,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       Warn(ctx) << "unknown command line option: -z " << args[1];
       args = args.subspan(2);
     } else if (args[0] == "-dynamic") {
-      Fatal(ctx) << "unknown command line option: -dynamic;"
-                 << " -dynamic is a macOS linker's option. If you are trying"
-                 << " to build a binary for an Apple platform, you need to use"
-                 << " ld64.mold instead of mold or ld.mold.";
+      Fatal(ctx) << "unknown command line option: -dynamic; -dynamic is a "
+                 << "macOS linker's option. mold does not support macOS.";
     } else {
       if (args[0][0] == '-')
         Fatal(ctx) << "unknown command line option: " << args[0];
@@ -1164,6 +1191,14 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if (ctx.arg.relocatable)
     ctx.arg.is_static = true;
 
+  if (ctx.arg.shuffle_sections == SHUFFLE_SECTIONS_SHUFFLE) {
+    if (shuffle_sections_seed)
+      ctx.arg.shuffle_sections_seed = *shuffle_sections_seed;
+    else
+      ctx.arg.shuffle_sections_seed =
+        ((u64)std::random_device()() << 32) | std::random_device()();
+  }
+
   // --section-order implies `-z separate-loadable-segments`
   if (z_separate_code)
     ctx.arg.z_separate_code = *z_separate_code;
@@ -1183,12 +1218,14 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       Fatal(ctx) << "-auxiliary may not be used without -shared";
   }
 
-  if (!ctx.arg.apply_dynamic_relocs && !E::is_rela)
-    Fatal(ctx) << "--no-apply-dynamic-relocs may not be used on "
-               << E::target_name;
+  if constexpr (!E::is_rela || is_mips<E>)
+    if (!ctx.arg.apply_dynamic_relocs)
+      Fatal(ctx) << "--no-apply-dynamic-relocs may not be used on "
+                 << E::target_name;
 
-  if (is_sparc<E> && ctx.arg.apply_dynamic_relocs)
-    Fatal(ctx) << "--apply-dynamic-relocs may not be used on SPARC64";
+  if constexpr (is_sparc<E>)
+    if (ctx.arg.apply_dynamic_relocs)
+      Fatal(ctx) << "--apply-dynamic-relocs may not be used on SPARC64";
 
   if (!ctx.arg.section_start.empty() && !ctx.arg.section_order.empty())
     Fatal(ctx) << "--section-start may not be used with --section-order";

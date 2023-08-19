@@ -2,7 +2,7 @@
 // processors support two different instruction encodings: Thumb and
 // ARM (in a narrower sense). Thumb instructions are either 16 bits or
 // 32 bits, while ARM instructions are all 32 bits. Feature-wise,
-// thumb is a subset of ARM, so not all ARM instructions are
+// Thumb is a subset of ARM, so not all ARM instructions are
 // representable in Thumb.
 //
 // ARM processors originally supported only ARM instructions. Thumb
@@ -12,14 +12,16 @@
 // be switched using BX (branch and mode exchange)-family instructions.
 // We need to use that instructions to, for example, call a function
 // encoded in Thumb from a function encoded in ARM. Sometimes, the
-// linker even has to emit an interworking thunk code to switch mode.
+// linker even has to emit interworking thunk code to switch mode.
 //
 // ARM instructions are aligned to 4 byte boundaries. Thumb are to 2
-// byte boundaries.
+// byte boundaries. So the least significant bit of a function address
+// is always 0.
 //
-// You can distinguish Thumb functions from ARM functions by looking
-// at the least significant bit (LSB) of its "address". If LSB is 0,
-// it's ARM; otherwise, Thumb.
+// To distinguish Thumb functions from ARM fucntions, the LSB of a
+// function address is repurposed as a boolean flag. If the LSB is 0,
+// the function referred to by the address is encoded in ARM;
+// otherwise, Thumb.
 //
 // For example, if a symbol `foo` is of type STT_FUNC and has value
 // 0x2001, `foo` is a function using Thumb instructions whose address
@@ -229,8 +231,8 @@ void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
 // ARM does not use .eh_frame for exception handling. Instead, it uses
 // .ARM.exidx and .ARM.extab. So this function is empty.
 template <>
-void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
-                                    u64 offset, u64 val) {}
+void EhFrameSection<E>::apply_eh_reloc(Context<E> &ctx, const ElfRel<E> &rel,
+                                       u64 offset, u64 val) {}
 
 // ARM and Thumb branch instructions can jump within ±16 MiB.
 static bool is_jump_reachable(i64 val) {
@@ -246,17 +248,14 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     dynrel = (ElfRel<E> *)(ctx.buf + ctx.reldyn->shdr.sh_offset +
                            file.reldyn_offset + this->reldyn_offset);
 
-  std::span<std::unique_ptr<RangeExtensionThunk<E>>> thunks =
-    output_section->thunks;
-
-  auto get_tls_trampoline_addr = [&](u64 addr) {
-    for (;;) {
-      assert(!thunks.empty());
-      i64 disp = output_section->shdr.sh_addr + thunks[0]->offset - addr;
+  auto get_tls_trampoline_addr = [&, i = 0](u64 addr) mutable {
+    for (; i < output_section->thunks.size(); i++) {
+      i64 disp = output_section->shdr.sh_addr + output_section->thunks[i]->offset -
+                 addr;
       if (is_jump_reachable(disp))
         return disp;
-      thunks = thunks.subspan(1);
     }
+    unreachable();
   };
 
   for (i64 i = 0; i < rels.size(); i++) {
@@ -287,7 +286,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     switch (rel.r_type) {
     case R_ARM_ABS32:
     case R_ARM_TARGET1:
-      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, dynrel);
+      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, &dynrel);
       break;
     case R_ARM_REL32:
       *(ul32 *)loc = S + A - P;
@@ -639,13 +638,13 @@ void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
   // It has two entry points: +0 for Thumb and +4 for ARM.
   const u8 entry[] = {
     // .thumb
-    0xfc, 0x46,             //    mov  ip, pc
-    0x60, 0x47,             //    bx   ip  # jumps to the following `ldr` insn
+    0x78, 0x47,             //    bx   pc  # jumps to 1f
+    0xc0, 0x46,             //    nop
     // .arm
-    0x04, 0xc0, 0x9f, 0xe5, //    ldr  ip, 2f
-    0x0f, 0xc0, 0x8c, 0xe0, // 1: add  ip, ip, pc
+    0x04, 0xc0, 0x9f, 0xe5, // 1: ldr  ip, 3f
+    0x0f, 0xc0, 0x8c, 0xe0, // 2: add  ip, ip, pc
     0x1c, 0xff, 0x2f, 0xe1, //    bx   ip
-    0x00, 0x00, 0x00, 0x00, // 2: .word sym - 1b
+    0x00, 0x00, 0x00, 0x00, // 3: .word sym - 2b
   };
 
   static_assert(E::thunk_hdr_size == sizeof(hdr));

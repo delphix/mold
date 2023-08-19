@@ -140,6 +140,82 @@ ObjectFile<E>::read_note_gnu_property(Context<E> &ctx, const ElfShdr<E> &shdr) {
   }
 }
 
+static inline std::string_view read_string(std::string_view &str) {
+  i64 pos = str.find_first_of('\0');
+  std::string_view val = str.substr(0, pos);
+  str = str.substr(pos + 1);
+  return val;
+}
+
+// <format-version>
+// [ <section-length> "vendor-name" <file-tag> <size> <attribute>*]+ ]*
+template <typename E>
+static void read_riscv_attributes(Context<E> &ctx, ObjectFile<E> &file,
+                                  std::string_view data) {
+  const char *begin = data.data();
+  if (data.empty())
+    Fatal(ctx) << file << ": corrupted .riscv.attributes section";
+
+  if (u8 format_version = data[0]; format_version != 'A')
+    return;
+  data = data.substr(1);
+
+  while (!data.empty()) {
+    i64 sz = *(U32<E> *)data.data();
+    if (data.size() < sz)
+      Fatal(ctx) << file << ": corrupted .riscv.attributes section";
+
+    std::string_view p(data.data() + 4, sz - 4);
+    data = data.substr(sz);
+
+    if (!p.starts_with("riscv\0"sv))
+      continue;
+    p = p.substr(6);
+
+    if (!p.starts_with(ELF_TAG_FILE))
+      Fatal(ctx) << file << ": corrupted .riscv.attributes section";
+    p = p.substr(5); // skip the tag and the sub-sub-section size
+
+    while (!p.empty()) {
+      i64 tag = read_uleb(&p);
+
+      switch (tag) {
+      case ELF_TAG_RISCV_STACK_ALIGN:
+        file.extra.stack_align = read_uleb(&p);
+        break;
+      case ELF_TAG_RISCV_ARCH:
+        file.extra.arch = read_string(p);
+        break;
+      case ELF_TAG_RISCV_UNALIGNED_ACCESS:
+        file.extra.unaligned_access = read_uleb(&p);
+        break;
+      default:
+        break;
+      }
+    }
+  }
+}
+
+template <typename E>
+static u64 read_mips_gp0(Context<E> &ctx, InputSection<E> &isec) {
+  std::string_view data = isec.contents;
+  while (!data.empty()) {
+    if (data.size() < sizeof(MipsOptions<E>))
+      Fatal(ctx) << isec << ": corrupted .MIPS.options section";
+
+    MipsOptions<E> *opt = (MipsOptions<E> *)data.data();
+    if (opt->kind == ODK_REGINFO) {
+      if (data.size() < sizeof(MipsOptions<E>) + sizeof(MipsRegInfo<E>))
+        Fatal(ctx) << isec << ": corrupted .MIPS.options section";
+      MipsRegInfo<E> *info = (MipsRegInfo<E> *)(opt + 1);
+      return info->ri_gp_value;
+    }
+
+    data = data.substr(opt->size);
+  }
+  return 0;
+}
+
 template <typename E>
 void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
   // Read sections
@@ -149,6 +225,17 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
     if ((shdr.sh_flags & SHF_EXCLUDE) && !(shdr.sh_flags & SHF_ALLOC) &&
         shdr.sh_type != SHT_LLVM_ADDRSIG && !ctx.arg.relocatable)
       continue;
+
+    if constexpr (is_arm<E>)
+      if (shdr.sh_type == SHT_ARM_ATTRIBUTES)
+        continue;
+
+    if constexpr (is_riscv<E>) {
+      if (shdr.sh_type == SHT_RISCV_ATTRIBUTES) {
+        read_riscv_attributes(ctx, *this, this->get_string(ctx, shdr));
+        continue;
+      }
+    }
 
     switch (shdr.sh_type) {
     case SHT_GROUP: {
@@ -160,7 +247,7 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
       std::string_view signature;
       if (esym.st_type == STT_SECTION) {
         signature = this->shstrtab.data() +
-                    this->elf_sections[esym.st_shndx].sh_name;
+                    this->elf_sections[get_shndx(esym)].sh_name;
       } else {
         signature = this->symbol_strtab.data() + esym.st_name;
       }
@@ -186,15 +273,20 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
       comdat_groups.push_back({group, (u32)i, entries.subspan(1)});
       break;
     }
-    case SHT_SYMTAB_SHNDX:
-      symtab_shndx_sec = this->template get_data<U32<E>>(ctx, shdr);
+    case SHT_REL:
+      if constexpr (E::is_rela)
+        Fatal(ctx) << *this << ": REL-type relocation table is not supported"
+                   << " for this target";
+      break;
+    case SHT_RELA:
+      if constexpr (!E::is_rela)
+        Fatal(ctx) << *this <<": RELA-type relocation table is not supported"
+                   << " for this target";
       break;
     case SHT_SYMTAB:
+    case SHT_SYMTAB_SHNDX:
     case SHT_STRTAB:
-    case SHT_REL:
-    case SHT_RELA:
     case SHT_NULL:
-    case SHT_ARM_ATTRIBUTES:
       break;
     default: {
       std::string_view name = this->shstrtab.data() + shdr.sh_name;
@@ -203,8 +295,11 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
       // area in GNU linkers. We ignore that section because silently
       // making the stack area executable is too dangerous. Tell our
       // users about the difference if that matters.
+      //
+      // MIPS object files don't contain .note.GNU-stack for some reason,
+      // so ignore this error on MIPS.
       if (name == ".note.GNU-stack" && !ctx.arg.relocatable) {
-        if (shdr.sh_flags & SHF_EXECINSTR) {
+        if ((shdr.sh_flags & SHF_EXECINSTR) && !is_mips<E>) {
           if (!ctx.arg.z_execstack && !ctx.arg.z_execstack_if_needed)
             Warn(ctx) << *this << ": this file may cause a segmentation"
               " fault because it requires an executable stack. See"
@@ -240,12 +335,6 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
           is_debug_section(shdr, name))
         continue;
 
-      // Save .llvm_addrsig for --icf=safe.
-      if (shdr.sh_type == SHT_LLVM_ADDRSIG && !ctx.arg.relocatable) {
-        llvm_addrsig = std::make_unique<InputSection<E>>(ctx, *this, name, i);
-        continue;
-      }
-
       // If an output file doesn't have a section header (i.e.
       // --oformat=binary is given), we discard all non-memory-allocated
       // sections. This is because without a section header, we can't find
@@ -255,9 +344,25 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
 
       this->sections[i] = std::make_unique<InputSection<E>>(ctx, *this, name, i);
 
+      // Save .llvm_addrsig for --icf=safe.
+      if (shdr.sh_type == SHT_LLVM_ADDRSIG && !ctx.arg.relocatable) {
+        llvm_addrsig = std::move(this->sections[i]);
+        continue;
+      }
+
       if constexpr (is_ppc32<E>)
         if (name == ".got2")
-          ppc32_got2 = this->sections[i].get();
+          extra.got2 = this->sections[i].get();
+
+      if constexpr (is_mips<E>) {
+        if (name == ".MIPS.abiflags") {
+          extra.abi_flags = std::move(this->sections[i]);
+          continue;
+        }
+
+        if (name == ".MIPS.options")
+          extra.gp0 = read_mips_gp0(ctx, *this->sections[i]);
+      }
 
       // Save debug sections for --gdb-index.
       if (ctx.arg.gdb_index) {
@@ -530,7 +635,7 @@ void ObjectFile<E>::initialize_symbols(Context<E> &ctx) {
 // We expect them to be sorted, so sort them if necessary.
 template <typename E>
 void ObjectFile<E>::sort_relocations(Context<E> &ctx) {
-  if constexpr (is_riscv<E>) {
+  if constexpr (is_riscv<E> || is_loongarch<E>) {
     auto less = [&](const ElfRel<E> &a, const ElfRel<E> &b) {
       return a.r_offset < b.r_offset;
     };
@@ -662,13 +767,14 @@ split_section(Context<E> &ctx, InputSection<E> &sec) {
 // atomic unit of mergeable section "section pieces".
 //
 // This feature is typically used for string literals. String literals
-// are usually put into a mergeable section by a compiler. If the same
-// string literal happen to occur in two different translation units,
-// a linker merges them into a single instance of a string, so that
-// a linker's output doesn't contain duplicate string literals.
+// are usually put into a mergeable section by the compiler. If the same
+// string literal happens to occur in two different translation units,
+// the linker merges them into a single instance of a string, so that
+// the linker's output doesn't contain duplicate string literals.
 //
-// Handling symbols in mergeable sections is a bit tricky. Assume that
-// we have a mergeable section with the following contents and symbols:
+// Handling symbols in the mergeable sections is a bit tricky. Assume
+// that we have a mergeable section with the following contents and
+// symbols:
 //
 //   Hello world\0foo bar\0
 //   ^            ^
@@ -677,23 +783,23 @@ split_section(Context<E> &ctx, InputSection<E> &sec) {
 //
 // '\0' represents a NUL byte. This mergeable section contains two
 // section pieces, "Hello world" and "foo bar". The first string is
-// referred by two symbols, .rodata and .L.str0, and the second by
+// referred to by two symbols, .rodata and .L.str0, and the second by
 // .L.str1. .rodata is a section symbol and therefore a local symbol
-// and refers the begining of the section.
+// and refers to the beginning of the section.
 //
 // In this example, there are actually two different ways to point to
-// string "foo bar", because .rodata+12 and .L.str1+0 refer the same
+// string "foo bar", because .rodata+12 and .L.str1+0 refer to the same
 // place in the section. This kind of "out-of-bound" reference occurs
-// only when a symbol is a section symbol. In other words, compiler
-// may use an offset from the beginning of a section to refer any
+// only when a symbol is a section symbol. In other words, the compiler
+// may use an offset from the beginning of a section to refer to any
 // section piece in a section, but it doesn't do for any other types
 // of symbols.
 //
-// In mold, we attach section pieces symbols. If a relocation refers a
-// section symbol whose section is a mergeable section, we create a
-// new dummy symbol with a section piece and redirect the relocation
-// to the symbol. If a non-section symbol refers a section piece, the
-// section piece is attached to the symbol.
+// In mold, we attach symbols to section pieces. If a relocation refers
+// to a section symbol, and that symbol's section is a mergeable one,
+// we create a new dummy symbol for a section piece and redirect the
+// relocation to this new symbol. If a non-section symbol refers to a
+// section piece, the section piece is attached to the symbol.
 template <typename E>
 void ObjectFile<E>::initialize_mergeable_sections(Context<E> &ctx) {
   mergeable_sections.resize(sections.size());
@@ -809,7 +915,7 @@ void ObjectFile<E>::mark_addrsig(Context<E> &ctx) {
     u8 *end = cur + llvm_addrsig->contents.size();
 
     while (cur != end) {
-      Symbol<E> &sym = *this->symbols[read_uleb(cur)];
+      Symbol<E> &sym = *this->symbols[read_uleb(&cur)];
       if (sym.file == this)
         if (InputSection<E> *isec = sym.get_input_section())
           isec->address_significant = true;
@@ -839,6 +945,9 @@ void ObjectFile<E>::parse(Context<E> &ctx) {
     this->first_global = symtab_sec->sh_info;
     this->elf_syms = this->template get_data<ElfSym<E>>(ctx, *symtab_sec);
     this->symbol_strtab = this->get_string(ctx, symtab_sec->sh_link);
+
+    if (ElfShdr<E> *shdr = this->find_section(SHT_SYMTAB_SHNDX))
+      symtab_shndx_sec = this->template get_data<U32<E>>(ctx, *shdr);
   }
 
   initialize_sections(ctx);
@@ -999,6 +1108,12 @@ void ObjectFile<E>::scan_relocations(Context<E> &ctx) {
   for (CieRecord<E> &cie : cies) {
     for (ElfRel<E> &rel : cie.get_rels()) {
       Symbol<E> &sym = *this->symbols[rel.r_sym];
+
+      if constexpr (!is_mips<E>)
+        if (ctx.arg.pic && rel.r_type == E::R_ABS)
+          Error(ctx) << *this << ": relocation " << rel << " in .eh_frame can"
+                     << " not be used when making a position-independent output;"
+                     << " recompile with -fPIE or -fPIC";
 
       if (sym.is_imported) {
         if (sym.get_type() != STT_FUNC)
@@ -1162,8 +1277,7 @@ void ObjectFile<E>::populate_symtab(Context<E> &ctx) {
   auto write_sym = [&](Symbol<E> &sym, i64 &symtab_idx) {
     U32<E> *xindex = nullptr;
     if (ctx.symtab_shndx)
-      xindex = (U32<E> *)(ctx.buf + ctx.symtab_shndx->shdr.sh_offset +
-                          symtab_idx * 4);
+      xindex = (U32<E> *)(ctx.buf + ctx.symtab_shndx->shdr.sh_offset) + symtab_idx;
 
     symtab_base[symtab_idx++] = to_output_esym(ctx, sym, strtab_off, xindex);
     strtab_off += write_string(strtab_base + strtab_off, sym.name());
@@ -1369,7 +1483,8 @@ SharedFile<E>::mark_live_objects(Context<E> &ctx,
     if (sym.is_traced)
       print_trace_symbol(ctx, *this, esym, sym);
 
-    if (esym.is_undef() && sym.file && !sym.file->is_alive.test_and_set()) {
+    if (esym.is_undef() && !esym.is_weak() && sym.file &&
+        !sym.file->is_alive.test_and_set()) {
       feeder(sym.file);
 
       if (sym.is_traced)
@@ -1466,8 +1581,8 @@ void SharedFile<E>::populate_symtab(Context<E> &ctx) {
 
     U32<E> *xindex = nullptr;
     if (ctx.symtab_shndx)
-      xindex = (U32<E> *)(ctx.buf + ctx.symtab_shndx->shdr.sh_offset +
-                          (this->global_symtab_idx + i) * 4);
+      xindex = (U32<E> *)(ctx.buf + ctx.symtab_shndx->shdr.sh_offset) +
+               this->global_symtab_idx + i;
 
     *symtab++ = to_output_esym(ctx, sym, strtab_off, xindex);
     strtab_off += write_string(strtab + strtab_off, sym.name());
