@@ -50,6 +50,7 @@ template <typename E> struct CieRecord;
 template <typename E> struct Context;
 template <typename E> struct FdeRecord;
 template <typename E> class RelocSection;
+template <typename E> class MipsGotSection;
 
 template <typename E>
 std::ostream &operator<<(std::ostream &out, const Symbol<E> &sym);
@@ -102,8 +103,8 @@ class RangeExtensionThunk {};
 template <typename E> requires needs_thunk<E>
 class RangeExtensionThunk<E> {
 public:
-  RangeExtensionThunk(OutputSection<E> &osec, i64 thunk_idx, i64 offset)
-    : output_section(osec), thunk_idx(thunk_idx), offset(offset) {}
+  RangeExtensionThunk(OutputSection<E> &osec, i64 offset)
+    : output_section(osec), offset(offset) {}
 
   i64 size() const { return E::thunk_hdr_size + symbols.size() * E::thunk_size; }
   void copy_buf(Context<E> &ctx);
@@ -113,10 +114,9 @@ public:
            idx * E::thunk_size;
   }
 
-  static constexpr i64 alignment = 4;
+  static constexpr i64 alignment = 16;
 
   OutputSection<E> &output_section;
-  i64 thunk_idx;
   i64 offset;
   std::mutex mu;
   std::vector<Symbol<E> *> symbols;
@@ -300,10 +300,10 @@ private:
   void check_tlsle(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel);
 
   void apply_dyn_absrel(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel,
-                        u8 *loc, u64 S, i64 A, u64 P, ElfRel<E> *&dynrel);
+                        u8 *loc, u64 S, i64 A, u64 P, ElfRel<E> **dynrel);
 
   void apply_toc_rel(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel,
-                     u8 *loc, u64 S, i64 A, u64 P, ElfRel<E> *&dynrel);
+                     u8 *loc, u64 S, i64 A, u64 P, ElfRel<E> **dynrel);
 
   void copy_contents_riscv(Context<E> &ctx, u8 *buf);
 
@@ -332,9 +332,6 @@ u64 get_eflags(Context<E> &ctx);
 
 template <typename E>
 i64 to_phdr_flags(Context<E> &ctx, Chunk<E> *chunk);
-
-template <typename E>
-bool is_relro(Context<E> &ctx, Chunk<E> *chunk);
 
 template <typename E>
 std::string_view get_output_name(Context<E> &ctx, std::string_view name, u64 flags);
@@ -368,6 +365,7 @@ public:
   std::string_view name;
   ElfShdr<E> shdr = { .sh_addralign = 1 };
   i64 shndx = 0;
+  bool is_relro = false;
 
   // Some synethetic sections add local symbols to the output.
   // For example, range extension thunks adds function_name@thunk
@@ -451,12 +449,7 @@ public:
 template <typename E>
 class OutputSection : public Chunk<E> {
 public:
-  OutputSection(std::string_view name, u32 type, u64 flags) {
-    this->name = name;
-    this->shdr.sh_type = type;
-    this->shdr.sh_flags = flags;
-  }
-
+  OutputSection(std::string_view name, u32 type, u64 flags);
   ChunkKind kind() override { return OUTPUT_SECTION; }
   OutputSection<E> *to_osec() override { return this; }
   void copy_buf(Context<E> &ctx) override;
@@ -479,13 +472,14 @@ class GotSection : public Chunk<E> {
 public:
   GotSection() {
     this->name = ".got";
+    this->is_relro = true;
     this->shdr.sh_type = SHT_PROGBITS;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
     this->shdr.sh_addralign = sizeof(Word<E>);
 
     // We always create a .got so that _GLOBAL_OFFSET_TABLE_ has
-    // something to point to. s390x psABI defines GOT[1] as a
-    // reserved slot, so we allocate one more on s390x.
+    // something to point to. s390x/MIPS psABIs define GOT[1] as a
+    // reserved slot, so we allocate one more for them.
     this->shdr.sh_size = (is_s390x<E> ? 2 : 1) * sizeof(Word<E>);
   }
 
@@ -504,9 +498,9 @@ public:
   void populate_symtab(Context<E> &ctx) override;
 
   std::vector<Symbol<E> *> got_syms;
-  std::vector<Symbol<E> *> gottp_syms;
   std::vector<Symbol<E> *> tlsgd_syms;
   std::vector<Symbol<E> *> tlsdesc_syms;
+  std::vector<Symbol<E> *> gottp_syms;
   u32 tlsld_idx = -1;
 
   void construct_relr(Context<E> &ctx);
@@ -516,8 +510,9 @@ public:
 template <typename E>
 class GotPltSection : public Chunk<E> {
 public:
-  GotPltSection() {
+  GotPltSection(Context<E> &ctx) {
     this->name = ".got.plt";
+    this->is_relro = ctx.arg.z_now;
     this->shdr.sh_type = is_ppc64<E> ? SHT_NOBITS : SHT_PROGBITS;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
     this->shdr.sh_addralign = sizeof(Word<E>);
@@ -669,6 +664,7 @@ class DynamicSection : public Chunk<E> {
 public:
   DynamicSection() {
     this->name = ".dynamic";
+    this->is_relro = true;
     this->shdr.sh_type = SHT_DYNAMIC;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
     this->shdr.sh_addralign = sizeof(Word<E>);
@@ -800,7 +796,7 @@ public:
   }
 
   void construct(Context<E> &ctx);
-  void apply_reloc(Context<E> &ctx, const ElfRel<E> &rel, u64 offset, u64 val);
+  void apply_eh_reloc(Context<E> &ctx, const ElfRel<E> &rel, u64 offset, u64 val);
   void copy_buf(Context<E> &ctx) override;
 };
 
@@ -841,8 +837,9 @@ public:
 template <typename E>
 class CopyrelSection : public Chunk<E> {
 public:
-  CopyrelSection(bool is_relro) : is_relro(is_relro) {
+  CopyrelSection(bool is_relro) {
     this->name = is_relro ? ".copyrel.rel.ro" : ".copyrel";
+    this->is_relro = is_relro;
     this->shdr.sh_type = SHT_NOBITS;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
   }
@@ -852,7 +849,6 @@ public:
   i64 get_reldyn_size(Context<E> &ctx) const override { return symbols.size(); }
   void copy_buf(Context<E> &ctx) override;
 
-  bool is_relro;
   std::vector<Symbol<E> *> symbols;
 };
 
@@ -1040,6 +1036,7 @@ class RelroPaddingSection : public Chunk<E> {
 public:
   RelroPaddingSection() {
     this->name = ".relro_padding";
+    this->is_relro = true;
     this->shdr.sh_type = SHT_NOBITS;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
     this->shdr.sh_addralign = 1;
@@ -1189,6 +1186,26 @@ protected:
   std::vector<Symbol<E>> frag_syms;
 };
 
+template <typename E> struct ObjectFileExtras {};
+
+template <typename E> requires is_riscv<E>
+struct ObjectFileExtras<E> {
+  std::optional<i64> stack_align;
+  std::optional<std::string_view> arch;
+  bool unaligned_access = false;
+};
+
+template <> struct ObjectFileExtras<PPC32> {
+  InputSection<PPC32> *got2 = nullptr;
+};
+
+template <typename E> requires is_mips<E>
+struct ObjectFileExtras<E> {
+  std::unique_ptr<InputSection<E>> abi_flags;
+  MipsGotSection<E> *got = nullptr;
+  u64 gp0 = 0;
+};
+
 // ObjectFile represents an input .o file.
 template <typename E>
 class ObjectFile : public InputFile<E> {
@@ -1254,8 +1271,11 @@ public:
   i64 num_areas = 0;
   i64 area_offset = 0;
 
-  // For PPC32
-  InputSection<E> *ppc32_got2 = nullptr;
+  // For LTO
+  std::vector<std::string_view> lto_symbol_versions;
+
+  // Target-specific member
+  [[no_unique_address]] ObjectFileExtras<E> extra;
 
 private:
   ObjectFile(Context<E> &ctx, MappedFile<Context<E>> *mf,
@@ -1384,6 +1404,13 @@ template <typename E>
 void process_run_subcommand(Context<E> &ctx, int argc, char **argv);
 
 //
+// jobs.cc
+//
+
+template <typename E> void acquire_global_lock(Context<E> &ctx);
+template <typename E> void release_global_lock(Context<E> &ctx);
+
+//
 // commandline.cc
 //
 
@@ -1444,6 +1471,20 @@ void fixup_arm_exidx_section(Context<ARM32> &ctx);
 // arch-riscv64.cc
 //
 
+template <typename E> requires is_riscv<E>
+class RiscvAttributesSection : public Chunk<E> {
+public:
+  RiscvAttributesSection() {
+    this->name = ".riscv.attributes";
+    this->shdr.sh_type = SHT_RISCV_ATTRIBUTES;
+  }
+
+  void update_shdr(Context<E> &ctx) override;
+  void copy_buf(Context<E> &ctx) override;
+
+  std::vector<u8> contents;
+};
+
 template <typename E>
 i64 riscv_resize_sections(Context<E> &ctx);
 
@@ -1497,6 +1538,7 @@ class AlphaGotSection : public Chunk<ALPHA> {
 public:
   AlphaGotSection() {
     this->name = ".alpha_got";
+    this->is_relro = true;
     this->shdr.sh_type = SHT_PROGBITS;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
     this->shdr.sh_addralign = 8;
@@ -1518,6 +1560,86 @@ private:
   std::vector<Entry> entries;
   std::mutex mu;
 };
+
+//
+// arch-mips64.cc
+//
+
+template <typename E>
+class MipsQuickstartSection : public Chunk<E> {
+public:
+  MipsQuickstartSection() {
+    this->name = ".mips_quickstart";
+    this->is_relro = true;
+    this->shdr.sh_type = SHT_PROGBITS;
+    this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE | SHF_MIPS_GPREL;
+    this->shdr.sh_addralign = 8;
+  }
+
+  static constexpr i64 NUM_RESERVED = 2;
+
+  void update_shdr(Context<E> &ctx) override;
+  void copy_buf(Context<E> &ctx) override;
+};
+
+template <typename E>
+class MipsGotSection : public Chunk<E> {
+public:
+  MipsGotSection(Context<E> &ctx, const ObjectFile<E> &file) {
+    this->name = save_string(ctx, ".mips_got." + std::to_string(file.priority));
+    this->is_relro = true;
+    this->shdr.sh_type = SHT_PROGBITS;
+    this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE | SHF_MIPS_GPREL;
+    this->shdr.sh_addralign = 8;
+  }
+
+  u64 get_got_addr(Context<E> &ctx, Symbol<E> &sym, i64 addend) const;
+  u64 get_gotpage_addr(Context<E> &ctx, Symbol<E> &sym, i64 addend) const;
+  u64 get_tlsgd_addr(Context<E> &ctx, Symbol<E> &sym) const;
+  u64 get_gottp_addr(Context<E> &ctx, Symbol<E> &sym) const;
+  u64 get_tlsld_addr(Context<E> &ctx) const;
+
+  void update_shdr(Context<E> &ctx) override;
+  i64 get_reldyn_size(Context<E> &ctx) const override;
+  void copy_buf(Context<E> &ctx) override;
+
+  struct SymbolAddend {
+    bool operator==(const SymbolAddend &) const = default;
+    bool operator<(const SymbolAddend &) const;
+    u64 get_addr(Context<E> &ctx, i64 flags = 0) const;
+
+    Symbol<E> *sym;
+    i64 addend;
+  };
+
+  std::vector<SymbolAddend> got_syms;
+  std::vector<SymbolAddend> gotpage_syms;
+  std::vector<Symbol<E> *> tlsgd_syms;
+  std::vector<Symbol<E> *> gottp_syms;
+  bool has_tlsld = false;
+};
+
+template <typename E>
+class MipsABIFlagsSection : public Chunk<E> {
+public:
+  MipsABIFlagsSection() {
+    this->name = ".MIPS.abiflags";
+    this->shdr.sh_type = SHT_MIPS_ABIFLAGS;
+    this->shdr.sh_flags = SHF_ALLOC;
+    this->shdr.sh_addralign = 8;
+  }
+
+  std::string_view contents;
+
+  void update_shdr(Context<E> &ctx) override;
+  void copy_buf(Context<E> &ctx) override;
+};
+
+template <typename E>
+void mips_merge_got_sections(Context<E> &ctx);
+
+template <typename E>
+void mips_rewrite_cie(Context<E> &ctx, u8 *buf, CieRecord<E> &cie);
 
 //
 // main.cc
@@ -1574,6 +1696,11 @@ struct SectionOrder {
 // Target-specific context members
 template <typename E> struct ContextExtras {};
 
+template <typename E> requires is_riscv<E>
+struct ContextExtras<E> {
+  RiscvAttributesSection<E> *riscv_attributes = nullptr;
+};
+
 template <> struct ContextExtras<PPC32> {
   Symbol<PPC32> *_SDA_BASE_ = nullptr;
 };
@@ -1595,6 +1722,12 @@ template <> struct ContextExtras<SPARC64> {
 
 template <> struct ContextExtras<ALPHA> {
   AlphaGotSection *got = nullptr;
+};
+
+template <typename E> requires is_mips<E>
+struct ContextExtras<E> {
+  MipsQuickstartSection<E> *quickstart = nullptr;
+  MipsABIFlagsSection<E> *abi_flags = nullptr;
 };
 
 // Context represents a context object for each invocation of the linker.
@@ -1639,7 +1772,7 @@ struct Context {
     bool fork = true;
     bool gc_sections = false;
     bool gdb_index = false;
-    bool hash_style_gnu = true;
+    bool hash_style_gnu = !is_mips<E>;
     bool hash_style_sysv = true;
     bool icf = false;
     bool icf_all = false;
@@ -1690,21 +1823,23 @@ struct Context {
     bool z_now = false;
     bool z_origin = false;
     bool z_relro = true;
+    bool z_sectionheader = true;
     bool z_shstk = false;
     bool z_text = false;
     i64 filler = -1;
     i64 spare_dynamic_tags = 5;
     i64 thread_count = 0;
+    i64 z_stack_size = 0;
+    u64 shuffle_sections_seed;
     std::string_view emulation;
     std::optional<Glob> unique;
     std::optional<u64> physical_image_base;
-    std::optional<u64> shuffle_sections_seed;
     std::string Map;
     std::string chroot;
     std::string dependency_file;
     std::string directory;
     std::string dynamic_linker;
-    std::string entry = "_start";
+    std::string entry = is_mips<E> ? "__start" : "_start";
     std::string fini = "_fini";
     std::string init = "_init";
     std::string output = "a.out";
@@ -1734,8 +1869,11 @@ struct Context {
 
   std::vector<VersionPattern> version_patterns;
   u16 default_version = VER_NDX_GLOBAL;
-  bool default_version_from_version_script = false; // true if default_version is set by a wildcard in version script.
   i64 page_size = -1;
+  std::optional<int> global_lock_fd;
+
+  // true if default_version is set by a wildcard in version script.
+  bool default_version_from_version_script = false;
 
   // Reader context
   bool as_needed = false;
@@ -1862,6 +2000,7 @@ struct Context {
   Symbol<E> *_edata = nullptr;
   Symbol<E> *_end = nullptr;
   Symbol<E> *_etext = nullptr;
+  Symbol<E> *_gp = nullptr;
   Symbol<E> *edata = nullptr;
   Symbol<E> *end = nullptr;
   Symbol<E> *etext = nullptr;
@@ -2472,32 +2611,21 @@ u64 Symbol<E>::get_addr(Context<E> &ctx, i64 flags) const {
       return isec->leader->get_addr() + value;
 
     if (isec->name() == ".eh_frame") {
-      auto test = [this](const char *pattern) {
-      if (name() == pattern)
-        return true;
-
-      // If LTO was enabled when building GCC and its CRT itself, then GCC
-      // will be able to move around the .eh_frame marker symbols. A suffix
-      // seems to be attached in such cases; we detect it here.
+      // .eh_frame contents are parsed and reconstructed by the linker,
+      // so pointing to a specific location in a source .eh_frame
+      // section doesn't make much sense. However, CRT files contain
+      // symbols pointing to the very beginning and ending of the section.
       //
-      // This tests for `<pattern>.lto_priv.*`. It's a little convoluted
-      // but this is the best we can do without compile-time string
-      // concatenation.
-      if (name().starts_with(pattern) && name().substr(strlen(pattern)).starts_with(".lto_priv."))
-        return true;
+      // If LTO is enabled, GCC may add `.lto_priv.<whatever>` as a symbol
+      // suffix. That's why we use starts_with() instead of `==` here.
+      if (name().starts_with("__EH_FRAME_BEGIN__") ||
+          name().starts_with("__EH_FRAME_LIST__") ||
+          name().starts_with(".eh_frame_seg") ||
+          esym().st_type == STT_SECTION)
+        return ctx.eh_frame->shdr.sh_addr;
 
-      return false;
-    };
-
-    // .eh_frame contents are parsed and reconstructed by the linker,
-    // so pointing to a specific location in a source .eh_frame
-    // section doesn't make much sense. However, CRT files contain
-    // symbols pointing to the very beginning and ending of the section.
-    if (test("__EH_FRAME_BEGIN__") || test("__EH_FRAME_LIST__") ||
-          test(".eh_frame_seg") || esym().st_type == STT_SECTION)
-    return ctx.eh_frame->shdr.sh_addr;
-
-      if (test("__FRAME_END__") || test("__EH_FRAME_LIST_END__"))
+      if (name().starts_with("__FRAME_END__") ||
+          name().starts_with("__EH_FRAME_LIST_END__"))
         return ctx.eh_frame->shdr.sh_addr + ctx.eh_frame->shdr.sh_size;
 
       // ARM object files contain "$d" local symbol at the beginning
@@ -2506,7 +2634,7 @@ u64 Symbol<E>::get_addr(Context<E> &ctx, i64 flags) const {
       if (name() == "$d" || name().starts_with("$d."))
         return ctx.eh_frame->shdr.sh_addr;
 
-      Fatal(ctx) << "symbol referring .eh_frame is not supported: "
+      Fatal(ctx) << "symbol referring to .eh_frame is not supported: "
                  << *this << " " << *file;
     }
 

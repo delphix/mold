@@ -394,28 +394,34 @@ inline i64 write_uleb(u8 *buf, u64 val) {
   return i;
 }
 
-inline u64 read_uleb(u8 *&buf) {
+inline u64 read_uleb(u8 **buf) {
   u64 val = 0;
   u8 shift = 0;
   u8 byte;
   do {
-    byte = *buf++;
+    byte = *(*buf)++;
     val |= (byte & 0x7f) << shift;
     shift += 7;
   } while (byte & 0x80);
   return val;
 }
 
-inline u64 read_uleb(u8 const*&buf) {
-  return read_uleb(const_cast<u8 *&>(buf));
+inline u64 read_uleb(u8 *buf) {
+  u8 *tmp = buf;
+  return read_uleb(&tmp);
 }
 
-inline u64 read_uleb(std::string_view &str) {
-  u8 *start = (u8 *)&str[0];
+inline u64 read_uleb(std::string_view *str) {
+  u8 *start = (u8 *)str->data();
   u8 *ptr = start;
-  u64 val = read_uleb(ptr);
-  str = str.substr(ptr - start);
+  u64 val = read_uleb(&ptr);
+  *str = str->substr(ptr - start);
   return val;
+}
+
+inline u64 read_uleb(std::string_view str) {
+  std::string_view tmp = str;
+  return read_uleb(&tmp);
 }
 
 inline i64 uleb_size(u64 val) {
@@ -426,6 +432,14 @@ inline i64 uleb_size(u64 val) {
     if (val < (1LL << (7 * i)))
       return i;
   return 9;
+}
+
+inline void overwrite_uleb(u8 *loc, u64 val) {
+  while (*loc & 0b1000'0000) {
+    *loc++ = 0b1000'0000 | (val & 0b0111'1111);
+    val >>= 7;
+  }
+  *loc = val & 0b0111'1111;
 }
 
 template <typename Context>
@@ -876,8 +890,11 @@ MappedFile<Context> *MappedFile<Context>::open(Context &ctx, std::string path) {
     fd = ::open(path.c_str(), O_RDONLY);
 #endif
 
-  if (fd == -1)
+  if (fd == -1) {
+    if (errno != ENOENT)
+      Fatal(ctx) << "opening " << path << " failed: " << errno_string();
     return nullptr;
+  }
 
   struct stat st;
   if (fstat(fd, &st) == -1)

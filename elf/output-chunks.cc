@@ -38,13 +38,13 @@ static u32 djb_hash(std::string_view name) {
 
 template <typename E>
 u64 get_eflags(Context<E> &ctx) {
+  std::vector<ObjectFile<E> *> objs = ctx.objs;
+  std::erase(objs, ctx.internal_obj);
+
   if constexpr (is_arm32<E>)
     return EF_ARM_EABI_VER5;
 
   if constexpr (is_riscv<E>) {
-    std::vector<ObjectFile<E> *> objs = ctx.objs;
-    std::erase(objs, ctx.internal_obj);
-
     if (objs.empty())
       return 0;
 
@@ -55,21 +55,27 @@ u64 get_eflags(Context<E> &ctx) {
         ret |= EF_RISCV_RVC;
 
       if ((flags & EF_RISCV_FLOAT_ABI) != (ret & EF_RISCV_FLOAT_ABI))
-        Error(ctx) << *objs[i]
-                   << ": cannot link object files with different floating-point ABI from "
-                   << *objs[0];
+        Error(ctx) << *objs[i] << ": cannot link object files with different"
+                   << " floating-point ABI from " << *objs[0];
 
       if ((flags & EF_RISCV_RVE) != (ret & EF_RISCV_RVE))
-        Error(ctx) << *objs[i]
-                   << ": cannot link object files with different EF_RISCV_RVE from "
-                   << *objs[0];
-
+        Error(ctx) << *objs[i] << ": cannot link object files with different"
+                   << " EF_RISCV_RVE from " << *objs[0];
     }
     return ret;
   }
 
   if constexpr (is_ppc64v2<E>)
     return 2;
+
+  if constexpr (is_mips<E>) {
+    // Real MIPS e_flags computation is much more complicated.
+    // For now, we just copy the first object's e_flags to the output.
+    if (objs.empty())
+      return 0;
+    return objs[0]->get_ehdr().e_flags;
+  }
+
   return 0;
 }
 
@@ -104,10 +110,12 @@ void OutputEhdr<E>::copy_buf(Context<E> &ctx) {
 
   // If e_shstrndx is too large, a dummy value is set to e_shstrndx.
   // The real value is stored to the zero'th section's sh_link field.
-  if (ctx.shstrtab->shndx < SHN_LORESERVE)
-    hdr.e_shstrndx = ctx.shstrtab->shndx;
-  else
-    hdr.e_shstrndx = SHN_XINDEX;
+  if (ctx.shstrtab) {
+    if (ctx.shstrtab->shndx < SHN_LORESERVE)
+      hdr.e_shstrndx = ctx.shstrtab->shndx;
+    else
+      hdr.e_shstrndx = SHN_XINDEX;
+  }
 
   if (ctx.arg.relocatable)
     hdr.e_type = ET_REL;
@@ -143,7 +151,7 @@ void OutputShdr<E>::copy_buf(Context<E> &ctx) {
   if (UINT16_MAX < shnum)
     hdr->sh_size = shnum;
 
-  if (SHN_LORESERVE <= ctx.shstrtab->shndx)
+  if (ctx.shstrtab && SHN_LORESERVE <= ctx.shstrtab->shndx)
     hdr->sh_link = ctx.shstrtab->shndx;
 
   for (Chunk<E> *chunk : ctx.chunks)
@@ -175,36 +183,6 @@ i64 to_phdr_flags(Context<E> &ctx, Chunk<E> *chunk) {
   return PF_R | (write ? PF_W : PF_NONE) | (exec ? PF_X : PF_NONE);
 }
 
-// PT_GNU_RELRO segment is a security mechanism to make more pages
-// read-only than we could have done without it.
-//
-// Traditionally, sections are either read-only or read-write.  If a
-// section contains dynamic relocations, it must have been put into a
-// read-write segment so that the program loader can mutate its
-// contents in memory, even if no one will write to it at runtime.
-//
-// RELRO segment allows us to make such pages writable only when a
-// program is being loaded. After that, the page becomes read-only.
-//
-// Some sections, such as .init, .fini, .got, .dynamic, contain
-// dynamic relocations but doesn't have to be writable at runtime,
-// so they are put into a RELRO segment.
-template <typename E>
-bool is_relro(Context<E> &ctx, Chunk<E> *chunk) {
-  u64 flags = chunk->shdr.sh_flags;
-  u64 type = chunk->shdr.sh_type;
-
-  if (flags & SHF_WRITE)
-    return (flags & SHF_TLS) || type == SHT_INIT_ARRAY ||
-           type == SHT_FINI_ARRAY || type == SHT_PREINIT_ARRAY ||
-           chunk == ctx.got || chunk == ctx.dynamic ||
-           chunk == ctx.relro_padding ||
-           (ctx.arg.z_now && ctx.gotplt && chunk == ctx.gotplt) ||
-           chunk->name == ".alpha_got" || chunk->name == ".toc" ||
-           chunk->name.ends_with(".rel.ro");
-  return false;
-}
-
 template <typename E>
 static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
   std::vector<ElfPhdr<E>> vec;
@@ -216,17 +194,21 @@ static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
     phdr.p_flags = flags;
     phdr.p_align = std::max<u64>(min_align, chunk->shdr.sh_addralign);
     phdr.p_offset = chunk->shdr.sh_offset;
-    phdr.p_filesz =
-      (chunk->shdr.sh_type == SHT_NOBITS) ? 0 : (u64)chunk->shdr.sh_size;
+
+    if (chunk->shdr.sh_type != SHT_NOBITS)
+      phdr.p_filesz = chunk->shdr.sh_size;
+
     phdr.p_vaddr = chunk->shdr.sh_addr;
     phdr.p_paddr = chunk->shdr.sh_addr;
-    phdr.p_memsz = chunk->shdr.sh_size;
+
+    if (chunk->shdr.sh_flags & SHF_ALLOC)
+      phdr.p_memsz = chunk->shdr.sh_size;
   };
 
   auto append = [&](Chunk<E> *chunk) {
     ElfPhdr<E> &phdr = vec.back();
     phdr.p_align = std::max<u64>(phdr.p_align, chunk->shdr.sh_addralign);
-    if (!(chunk->shdr.sh_type == SHT_NOBITS))
+    if (chunk->shdr.sh_type != SHT_NOBITS)
       phdr.p_filesz = chunk->shdr.sh_addr + chunk->shdr.sh_size - phdr.p_vaddr;
     phdr.p_memsz = chunk->shdr.sh_addr + chunk->shdr.sh_size - phdr.p_vaddr;
   };
@@ -325,29 +307,47 @@ static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
 
   // Add PT_GNU_STACK, which is a marker segment that doesn't really
   // contain any segments. It controls executable bit of stack area.
-  ElfPhdr<E> phdr = {};
-  phdr.p_type = PT_GNU_STACK,
-  phdr.p_flags = ctx.arg.z_execstack ? (PF_R | PF_W | PF_X) : (PF_R | PF_W),
-  phdr.p_align = 1;
-  vec.push_back(phdr);
+  {
+    ElfPhdr<E> phdr = {};
+    phdr.p_type = PT_GNU_STACK;
+    phdr.p_flags = ctx.arg.z_execstack ? (PF_R | PF_W | PF_X) : (PF_R | PF_W);
+    phdr.p_memsz = ctx.arg.z_stack_size;
+    phdr.p_align = 1;
+    vec.push_back(phdr);
+  }
 
   // Create a PT_GNU_RELRO.
   if (ctx.arg.z_relro) {
     for (i64 i = 0; i < ctx.chunks.size(); i++) {
-      if (!is_relro(ctx, ctx.chunks[i]))
+      if (!ctx.chunks[i]->is_relro)
         continue;
 
       define(PT_GNU_RELRO, PF_R, 1, ctx.chunks[i++]);
-      while (i < ctx.chunks.size() && is_relro(ctx, ctx.chunks[i]))
+      while (i < ctx.chunks.size() && ctx.chunks[i]->is_relro)
         append(ctx.chunks[i++]);
       vec.back().p_align = 1;
     }
   }
 
-  // Add PT_ARM_EDXIDX
+  // Create a PT_ARM_EDXIDX
   if constexpr (is_arm32<E>)
     if (OutputSection<E> *osec = find_section(ctx, SHT_ARM_EXIDX))
       define(PT_ARM_EXIDX, PF_R, 4, osec);
+
+  // Create a PT_RISCV_ATTRIBUTES
+  if constexpr (is_riscv<E>)
+    if (ctx.extra.riscv_attributes->shdr.sh_size)
+      define(PT_RISCV_ATTRIBUTES, PF_R, 1, ctx.extra.riscv_attributes);
+
+  // Create a PT_MIPS_ABIFLAGS
+  if constexpr (is_mips<E>)
+    if (ctx.extra.abi_flags->shdr.sh_size)
+      define(PT_MIPS_ABIFLAGS, PF_R, 8, ctx.extra.abi_flags);
+
+  // Create a PT_OPENBSD_RANDOMIZE
+  for (Chunk<E> *chunk : ctx.chunks)
+    if (chunk->name == ".openbsd.randomdata")
+      define(PT_OPENBSD_RANDOMIZE, PF_R | PF_W, 1, chunk);
 
   // Set p_paddr if --physical-image-base was given. --physical-image-base
   // is typically used in embedded programming to specify the base address
@@ -639,6 +639,11 @@ void SymtabSection<E>::copy_buf(Context<E> &ctx) {
   // Write the initial NUL byte to .strtab.
   ctx.buf[ctx.strtab->shdr.sh_offset] = '\0';
 
+  if (ctx.symtab_shndx) {
+    ElfShdr<E> &shdr = ctx.symtab_shndx->shdr;
+    memset(ctx.buf + shdr.sh_offset, 0, shdr.sh_size);
+  }
+
   // Create section symbols
   for (Chunk<E> *chunk : ctx.chunks) {
     if (chunk->shndx) {
@@ -646,7 +651,14 @@ void SymtabSection<E>::copy_buf(Context<E> &ctx) {
       memset(&sym, 0, sizeof(sym));
       sym.st_type = STT_SECTION;
       sym.st_value = chunk->shdr.sh_addr;
-      sym.st_shndx = chunk->shndx;
+
+      if (ctx.symtab_shndx) {
+        U32<E> *xindex = (U32<E> *)(ctx.buf + ctx.symtab_shndx->shdr.sh_offset);
+        xindex[chunk->shndx] = chunk->shndx;
+        sym.st_shndx = SHN_XINDEX;
+      } else {
+        sym.st_shndx = chunk->shndx;
+      }
     }
   }
 
@@ -714,6 +726,8 @@ static std::vector<Word<E>> create_dynamic_section(Context<E> &ctx) {
   } else if constexpr (is_ppc32<E>) {
     if (ctx.gotplt->shdr.sh_size)
       define(DT_PLTGOT, ctx.gotplt->shdr.sh_addr + GotPltSection<E>::HDR_SIZE);
+  } else if constexpr (is_mips<E>) {
+    define(DT_PLTGOT, ctx.extra.quickstart->shdr.sh_addr);
   } else {
     if (ctx.gotplt->shdr.sh_size)
       define(DT_PLTGOT, ctx.gotplt->shdr.sh_addr);
@@ -804,7 +818,18 @@ static std::vector<Word<E>> create_dynamic_section(Context<E> &ctx) {
   if (ctx.arg.z_interpose)
     flags1 |= DF_1_INTERPOSE;
 
-  if (!ctx.got->gottp_syms.empty())
+  auto has_gottp_syms = [&] {
+    if constexpr (is_mips<E>) {
+      for (ObjectFile<E> *file : ctx.objs)
+        if (!file->extra.got->gottp_syms.empty())
+          return true;
+      return false;
+    } else {
+      return !ctx.got->gottp_syms.empty();
+    }
+  };
+
+  if (has_gottp_syms())
     flags |= DF_STATIC_TLS;
   if (ctx.has_textrel)
     flags |= DF_TEXTREL;
@@ -822,6 +847,16 @@ static std::vector<Word<E>> create_dynamic_section(Context<E> &ctx) {
     // the first PLT entry. I don't know why it's 32 bytes off, but
     // it's what it is.
     define(DT_PPC64_GLINK, ctx.plt->shdr.sh_addr + E::plt_hdr_size - 32);
+  }
+
+  if constexpr (is_mips<E>) {
+    define(DT_MIPS_RLD_VERSION, 1);
+    define(DT_MIPS_FLAGS, 0);
+    define(DT_MIPS_BASE_ADDRESS, ctx.arg.image_base);
+    define(DT_MIPS_LOCAL_GOTNO, 2);
+    define(DT_MIPS_SYMTABNO, ctx.dynsym->symbols.size());
+    define(DT_MIPS_GOTSYM, 0);
+    define(DT_MIPS_OPTIONS, 0);
   }
 
   // GDB needs a DT_DEBUG entry in an executable to store a word-size
@@ -851,6 +886,31 @@ void DynamicSection<E>::copy_buf(Context<E> &ctx) {
   std::vector<Word<E>> contents = create_dynamic_section(ctx);
   assert(this->shdr.sh_size == contents.size() * sizeof(contents[0]));
   write_vector(ctx.buf + this->shdr.sh_offset, contents);
+}
+
+template <typename E>
+OutputSection<E>::OutputSection(std::string_view name, u32 type, u64 flags) {
+  this->name = name;
+  this->shdr.sh_type = type;
+  this->shdr.sh_flags = flags;
+
+  // PT_GNU_RELRO segment is a security mechanism to make more pages
+  // read-only than we could have done without it.
+  //
+  // Traditionally, sections are either read-only or read-write. If a
+  // section contains dynamic relocations, it must have been put into a
+  // read-write segment so that the program loader can mutate its
+  // contents in memory, even if no one will write to it at runtime.
+  //
+  // RELRO segment allows us to make such pages writable only when a
+  // program is being loaded. After that, the page becomes read-only.
+  //
+  // Some sections, such as .init, .fini, .got, .dynamic, contain
+  // dynamic relocations but doesn't have to be writable at runtime,
+  // so they are put into a RELRO segment.
+  this->is_relro = (name == ".toc" || name.ends_with(".rel.ro") ||
+                    type == SHT_INIT_ARRAY || type == SHT_FINI_ARRAY ||
+                    type == SHT_PREINIT_ARRAY || (flags & SHF_TLS));
 }
 
 template <typename E>
@@ -1100,6 +1160,7 @@ u64 GotSection<E>::get_tlsld_addr(Context<E> &ctx) const {
   return this->shdr.sh_addr + tlsld_idx * sizeof(Word<E>);
 }
 
+namespace {
 template <typename E>
 struct GotEntry {
   bool is_relr(Context<E> &ctx) const {
@@ -1111,6 +1172,7 @@ struct GotEntry {
   i64 r_type = R_NONE;
   Symbol<E> *sym = nullptr;
 };
+}
 
 // Get .got and .rel.dyn contents.
 //
@@ -1130,6 +1192,7 @@ struct GotEntry {
 template <typename E>
 static std::vector<GotEntry<E>> get_got_entries(Context<E> &ctx) {
   std::vector<GotEntry<E>> entries;
+  auto add = [&](GotEntry<E> ent) { entries.push_back(ent); };
 
   // Create GOT entries for ordinary symbols
   for (Symbol<E> *sym : ctx.got->got_syms) {
@@ -1137,14 +1200,14 @@ static std::vector<GotEntry<E>> get_got_entries(Context<E> &ctx) {
 
     // If a symbol is imported, let the dynamic linker to resolve it.
     if (sym->is_imported) {
-      entries.push_back({idx, 0, E::R_GLOB_DAT, sym});
+      add({idx, 0, E::R_GLOB_DAT, sym});
       continue;
     }
 
     // IFUNC always needs to be fixed up by the dynamic linker.
     if constexpr (supports_ifunc<E>) {
       if (sym->is_ifunc()) {
-        entries.push_back({idx, sym->get_addr(ctx, NO_PLT), E::R_IRELATIVE});
+        add({idx, sym->get_addr(ctx, NO_PLT), E::R_IRELATIVE});
         continue;
       }
     }
@@ -1152,34 +1215,30 @@ static std::vector<GotEntry<E>> get_got_entries(Context<E> &ctx) {
     // If we know an address at link-time, fill that GOT entry now.
     // It may need a base relocation, though.
     if (ctx.arg.pic && sym->is_relative())
-      entries.push_back({idx, sym->get_addr(ctx, NO_PLT), E::R_RELATIVE});
+      add({idx, sym->get_addr(ctx, NO_PLT), E::R_RELATIVE});
     else
-      entries.push_back({idx, sym->get_addr(ctx, NO_PLT)});
+      add({idx, sym->get_addr(ctx, NO_PLT)});
   }
 
   // Create GOT entries for TLVs.
   for (Symbol<E> *sym : ctx.got->tlsgd_syms) {
     i64 idx = sym->get_tlsgd_idx(ctx);
 
-    // If a symbol is imported, let the dynamic linker to resolve it.
     if (sym->is_imported) {
-      entries.push_back({idx, 0, E::R_DTPMOD, sym});
-      entries.push_back({idx + 1, 0, E::R_DTPOFF, sym});
-      continue;
+      // If a symbol is imported, let the dynamic linker to resolve it.
+      add({idx, 0, E::R_DTPMOD, sym});
+      add({idx + 1, 0, E::R_DTPOFF, sym});
+    } else if (ctx.arg.shared) {
+      // If we are creating a shared library, we know the TLV's offset
+      // within the current TLS block. We don't know the module ID though.
+      add({idx, 0, E::R_DTPMOD});
+      add({idx + 1, sym->get_addr(ctx) - ctx.dtp_addr});
+    } else {
+      // If we are creating an executable, we know both the module ID and
+      // the offset. Module ID 1 indicates the main executable.
+      add({idx, 1});
+      add({idx + 1, sym->get_addr(ctx) - ctx.dtp_addr});
     }
-
-    // If we are creating a shared library, we know the TLV's offset
-    // within the current TLS block. We don't know the module ID though.
-    if (ctx.arg.shared) {
-      entries.push_back({idx, 0, E::R_DTPMOD});
-      entries.push_back({idx + 1, sym->get_addr(ctx) - ctx.dtp_addr});
-      continue;
-    }
-
-    // If we are creating an executable, we know both the module ID and the
-    // offset. Module ID 1 indicates the main executable.
-    entries.push_back({idx, 1});
-    entries.push_back({idx + 1, sym->get_addr(ctx) - ctx.dtp_addr});
   }
 
   if constexpr (supports_tlsdesc<E>) {
@@ -1187,39 +1246,35 @@ static std::vector<GotEntry<E>> get_got_entries(Context<E> &ctx) {
       // _TLS_MODULE_BASE_ is a linker-synthesized virtual symbol that
       // refers the begining of the TLS block.
       if (sym == ctx._TLS_MODULE_BASE_)
-        entries.push_back({sym->get_tlsdesc_idx(ctx), 0, E::R_TLSDESC});
+        add({sym->get_tlsdesc_idx(ctx), 0, E::R_TLSDESC});
       else
-        entries.push_back({sym->get_tlsdesc_idx(ctx), 0, E::R_TLSDESC, sym});
+        add({sym->get_tlsdesc_idx(ctx), 0, E::R_TLSDESC, sym});
     }
   }
 
   for (Symbol<E> *sym : ctx.got->gottp_syms) {
     i64 idx = sym->get_gottp_idx(ctx);
 
-    // If we know nothing about the symbol, let the dynamic linker
-    // to fill the GOT entry.
     if (sym->is_imported) {
-      entries.push_back({idx, 0, E::R_TPOFF, sym});
-      continue;
+      // If we know nothing about the symbol, let the dynamic linker
+      // to fill the GOT entry.
+      add({idx, 0, E::R_TPOFF, sym});
+    } else if (ctx.arg.shared) {
+      // If we know the offset within the current thread vector,
+      // let the dynamic linker to adjust it.
+      add({idx, sym->get_addr(ctx) - ctx.tls_begin, E::R_TPOFF});
+    } else {
+      // Otherwise, we know the offset from the thread pointer (TP) at
+      // link-time, so we can fill the GOT entry directly.
+      add({idx, sym->get_addr(ctx) - ctx.tp_addr});
     }
-
-    // If we know the offset within the current thread vector,
-    // let the dynamic linker to adjust it.
-    if (ctx.arg.shared) {
-      entries.push_back({idx, sym->get_addr(ctx) - ctx.tls_begin, E::R_TPOFF});
-      continue;
-    }
-
-    // Otherwise, we know the offset from the thread pointer (TP) at
-    // link-time, so we can fill the GOT entry directly.
-    entries.push_back({idx, sym->get_addr(ctx) - ctx.tp_addr});
   }
 
   if (ctx.got->tlsld_idx != -1) {
     if (ctx.arg.shared)
-      entries.push_back({ctx.got->tlsld_idx, 0, E::R_DTPMOD});
+      add({ctx.got->tlsld_idx, 0, E::R_DTPMOD});
     else
-      entries.push_back({ctx.got->tlsld_idx, 1}); // 1 means the main executable
+      add({ctx.got->tlsld_idx, 1}); // 1 means the main executable
   }
 
   return entries;
@@ -1529,7 +1584,7 @@ ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym, u32 st_name,
   memset(&esym, 0, sizeof(esym));
 
   esym.st_name = st_name;
-  esym.st_type = sym.esym().st_type;
+  esym.st_type = sym.get_type();
   esym.st_size = sym.esym().st_size;
 
   if (sym.is_local(ctx))
@@ -1566,12 +1621,12 @@ ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym, u32 st_name,
     return SHN_UNDEF;
   };
 
-  u32 shndx = 0;
+  i64 shndx = -1;
   if (sym.has_copyrel) {
     shndx = sym.is_copyrel_readonly ? ctx.copyrel_relro->shndx : ctx.copyrel->shndx;
     esym.st_value = sym.get_addr(ctx);
   } else if (sym.file->is_dso || sym.esym().is_undef()) {
-    shndx = SHN_UNDEF;
+    esym.st_shndx = SHN_UNDEF;
     if (sym.is_canonical)
       esym.st_value = sym.get_plt_addr(ctx);
   } else if (Chunk<E> *osec = sym.get_output_section()) {
@@ -1584,7 +1639,7 @@ ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym, u32 st_name,
     esym.st_value = sym.get_addr(ctx);
   } else if (!sym.get_input_section()) {
     // Absolute symbol
-    shndx = SHN_ABS;
+    esym.st_shndx = SHN_ABS;
     esym.st_value = sym.get_addr(ctx);
   } else if (sym.get_type() == STT_TLS) {
     shndx = get_st_shndx(sym);
@@ -1600,14 +1655,12 @@ ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym, u32 st_name,
   // or greater than SHN_LORESERVE (= 65280), the real index is stored
   // to a SHT_SYMTAB_SHNDX section which contains a parallel array of
   // the symbol table.
-  if (shn_xindex) {
-    *shn_xindex = shndx;
-    esym.st_shndx = SHN_XINDEX;
-  } else {
-    if (shndx >= SHN_LORESERVE && shndx != SHN_ABS && shndx != SHN_COMMON)
-      Fatal(ctx) << sym << ": internal error: output symbol index too large: "
-                 << shndx;
+  if (0 <= shndx && shndx < SHN_LORESERVE) {
     esym.st_shndx = shndx;
+  } else if (SHN_LORESERVE <= shndx) {
+    assert(shn_xindex);
+    esym.st_shndx = SHN_XINDEX;
+    *shn_xindex = shndx;
   }
 
   return esym;
@@ -2079,13 +2132,16 @@ void EhFrameSection<E>::copy_buf(Context<E> &ctx) {
       if (ctx.arg.relocatable)
         continue;
 
+      if constexpr (is_mips<E>)
+        mips_rewrite_cie(ctx, base + cie.output_offset, cie);
+
       for (const ElfRel<E> &rel : cie.get_rels()) {
         assert(rel.r_offset - cie.input_offset < contents.size());
 
         Symbol<E> &sym = *file->symbols[rel.r_sym];
         u64 loc = cie.output_offset + rel.r_offset - cie.input_offset;
         u64 val = sym.get_addr(ctx) + get_addend(cie.input_section, rel);
-        apply_reloc(ctx, rel, loc, val);
+        apply_eh_reloc(ctx, rel, loc, val);
       }
     }
 
@@ -2110,7 +2166,7 @@ void EhFrameSection<E>::copy_buf(Context<E> &ctx) {
         Symbol<E> &sym = *file->symbols[rel.r_sym];
         u64 loc = offset + rel.r_offset - fde.input_offset;
         u64 val = sym.get_addr(ctx) + get_addend(cie.input_section, rel);
-        apply_reloc(ctx, rel, loc, val);
+        apply_eh_reloc(ctx, rel, loc, val);
 
         if (eh_hdr_begin && is_first) {
           // Write to .eh_frame_hdr
@@ -2252,7 +2308,7 @@ void CopyrelSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
     sym2->is_imported = true;
     sym2->is_exported = true;
     sym2->has_copyrel = true;
-    sym2->is_copyrel_readonly = is_relro;
+    sym2->is_copyrel_readonly = this->is_relro;
     sym2->value = offset;
     ctx.dynsym->add_symbol(ctx, sym2);
   }
@@ -2265,7 +2321,7 @@ void CopyrelSection<E>::update_shdr(Context<E> &ctx) {
   // segment for it. We turn a .copyrel.rel.ro into a regular section
   // if it is very small to avoid the cost of the extra segment.
   constexpr i64 threshold = 4096;
-  if (is_relro && ctx.arg.z_relro && this->shdr.sh_size < threshold)
+  if (this->is_relro && ctx.arg.z_relro && this->shdr.sh_size < threshold)
     this->shdr.sh_type = SHT_PROGBITS;
 }
 
@@ -2316,12 +2372,13 @@ void VerneedSection<E>::construct(Context<E> &ctx) {
            std::tuple(((SharedFile<E> *)b->file)->soname, b->ver_idx);
   });
 
-  // Resize of .gnu.version
+  // Resize .gnu.version
   ctx.versym->contents.resize(ctx.dynsym->symbols.size(), 1);
   ctx.versym->contents[0] = 0;
 
   // Allocate a large enough buffer for .gnu.version_r.
-  contents.resize((sizeof(ElfVerneed<E>) + sizeof(ElfVernaux<E>)) * syms.size());
+  contents.resize((sizeof(ElfVerneed<E>) + sizeof(ElfVernaux<E>)) *
+                  (syms.size() + 1));
 
   // Fill .gnu.version_r.
   u8 *buf = (u8 *)&contents[0];
@@ -2337,14 +2394,14 @@ void VerneedSection<E>::construct(Context<E> &ctx) {
       verneed->vn_next = ptr - (u8 *)verneed;
 
     verneed = (ElfVerneed<E> *)ptr;
-    ptr += sizeof(*verneed);
+    ptr += sizeof(ElfVerneed<E>);
     verneed->vn_version = 1;
     verneed->vn_file = ctx.dynstr->find_string(((SharedFile<E> *)file)->soname);
     verneed->vn_aux = sizeof(ElfVerneed<E>);
     aux = nullptr;
   };
 
-  auto add_entry = [&](Symbol<E> *sym) {
+  auto add_entry = [&](std::string_view verstr) {
     verneed->vn_cnt++;
 
     if (aux)
@@ -2352,21 +2409,50 @@ void VerneedSection<E>::construct(Context<E> &ctx) {
     aux = (ElfVernaux<E> *)ptr;
     ptr += sizeof(*aux);
 
-    std::string_view verstr = sym->get_version();
     aux->vna_hash = elf_hash(verstr);
     aux->vna_other = ++veridx;
     aux->vna_name = ctx.dynstr->add_string(verstr);
   };
 
+  // Create version entries.
   for (i64 i = 0; i < syms.size(); i++) {
     if (i == 0 || syms[i - 1]->file != syms[i]->file) {
       start_group(syms[i]->file);
-      add_entry(syms[i]);
+      add_entry(syms[i]->get_version());
     } else if (syms[i - 1]->ver_idx != syms[i]->ver_idx) {
-      add_entry(syms[i]);
+      add_entry(syms[i]->get_version());
     }
 
     ctx.versym->contents[syms[i]->get_dynsym_idx(ctx)] = veridx;
+  }
+
+  if (ctx.arg.pack_dyn_relocs_relr) {
+    // If `-z pack-relative-relocs` is specified, we'll create a .relr.dyn
+    // section and store base relocation records to that section instead of
+    // to the usual .rela.dyn section.
+    //
+    // .relr.dyn is relatively new feature and not supported by glibc until
+    // 2.38 which was released in 2022. Executables built with `-z
+    // pack-relative-relocs` don't work and usually crash immediately on
+    // startup if libc doesn't support it.
+    //
+    // In the following code, we'll add a dependency to a dummy version name
+    // "GLIBC_ABI_DT_RELR" so that executables built with the option failed
+    // with a more friendly "version `GLIBC_ABI_DT_RELR' not found" error
+    // message. glibc 2.38 or later knows about this dummy version name and
+    // simply ignores it.
+    auto find_glibc2 = [&]() -> InputFile<E> * {
+      for (Symbol<E> *sym : syms)
+        if (((SharedFile<E> *)sym->file)->soname.starts_with("libc.so.") &&
+            sym->get_version().starts_with("GLIBC_2."))
+          return sym->file;
+      return nullptr;
+    };
+
+    if (InputFile<E> *file = find_glibc2()) {
+      start_group(file);
+      add_entry("GLIBC_ABI_DT_RELR");
+    }
   }
 
   // Resize .gnu.version_r to fit to its contents.
@@ -3131,7 +3217,6 @@ template class CompressedSection<E>;
 template class RelocSection<E>;
 template class ComdatGroupSection<E>;
 template i64 to_phdr_flags(Context<E> &ctx, Chunk<E> *chunk);
-template bool is_relro(Context<E> &, Chunk<E> *);
 template ElfSym<E> to_output_esym(Context<E> &, Symbol<E> &, u32, U32<E> *);
 
 } // namespace mold::elf

@@ -5,8 +5,8 @@
 //
 // Even though they are similiar, ELFv1 isn't only different from ELFv2 in
 // endianness. The most notable difference is, in ELFv1, a function
-// pointer doesn't directly refer the entry point of a function but
-// instead refers a data structure so-called "function descriptor".
+// pointer doesn't directly refer to the entry point of a function but
+// instead refers to a data structure so-called "function descriptor".
 //
 // The function descriptor is essentially a pair of a function entry point
 // address and a value that should be set to %r2 before calling that
@@ -26,8 +26,8 @@
 //
 // In this way, you can't call a function just by knowing the function's
 // entry point address. You also need to know a proper %r2 value for the
-// function. This is why a function pointer refers a tuple of an address
-// and a %r2 value.
+// function. This is why a function pointer refers to a tuple of an
+// address and a %r2 value.
 //
 // If a function call is made through PLT, PLT takes care of restoring %r2.
 // Therefore, the caller has to restore %r2 only for function calls
@@ -40,7 +40,7 @@
 // few different addresses for different purposes. It may not only have an
 // entry point address but may also have PLT and/or GOT addresses.
 // In PPCV1, it may have an OPD address in addition to these. OPD address
-// is used for relocations that refers the address of a function as a
+// is used for relocations that refers to the address of a function as a
 // function pointer.
 //
 // https://github.com/rui314/psabi/blob/main/ppc64v1.pdf
@@ -129,8 +129,8 @@ template <>
 void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {}
 
 template <>
-void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
-                                    u64 offset, u64 val) {
+void EhFrameSection<E>::apply_eh_reloc(Context<E> &ctx, const ElfRel<E> &rel,
+                                       u64 offset, u64 val) {
   u8 *loc = ctx.buf + this->shdr.sh_offset + offset;
 
   switch (rel.r_type) {
@@ -183,10 +183,10 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 
     switch (rel.r_type) {
     case R_PPC64_ADDR64:
-      apply_toc_rel(ctx, sym, rel, loc, S, A, P, dynrel);
+      apply_toc_rel(ctx, sym, rel, loc, S, A, P, &dynrel);
       break;
     case R_PPC64_TOC:
-      apply_toc_rel(ctx, *ctx.extra.TOC, rel, loc, TOC, A, P, dynrel);
+      apply_toc_rel(ctx, *ctx.extra.TOC, rel, loc, TOC, A, P, &dynrel);
       break;
     case R_PPC64_TOC16_HA:
       *(ub16 *)loc = ha(S + A - TOC);
@@ -217,6 +217,9 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         *(ub32 *)(loc + 4) = 0xe841'0028; // ld r2, 40(r1)
       break;
     }
+    case R_PPC64_REL32:
+      *(ub32 *)loc = S + A - P;
+      break;
     case R_PPC64_REL64:
       *(ub64 *)loc = S + A - P;
       break;
@@ -377,6 +380,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_PPC64_TPREL16_LO:
       check_tlsle(ctx, sym, rel);
       break;
+    case R_PPC64_REL32:
     case R_PPC64_REL64:
     case R_PPC64_TOC16_HA:
     case R_PPC64_TOC16_LO:
@@ -533,10 +537,10 @@ get_opd_sym_at(Context<E> &ctx, std::span<OpdSymbol> syms, u64 offset) {
 // However, in reality, .opd isn't a normal input section. It needs many
 // special treatments as follows:
 //
-// 1. A function symbol refers not a .text but an .opd. Its address works
-//    fine for address-taking relocations such as R_PPC64_ADDR64. However,
-//    R_PPC64_REL24 (which is used for branch instruction) needs a
-//    function's real address instead of the function's .opd address.
+// 1. A function symbol refers to not a .text but an .opd. Its address
+//    works fine for address-taking relocations such as R_PPC64_ADDR64.
+//    However, R_PPC64_REL24 (which is used for branch instruction) needs
+//    a function's real address instead of the function's .opd address.
 //    We need to read .opd contents to find out a function entry point
 //    address to apply R_PPC64_REL24.
 //
@@ -544,9 +548,9 @@ get_opd_sym_at(Context<E> &ctx, std::span<OpdSymbol> syms, u64 offset) {
 //    are taken. Just copying input .opd sections to an output would
 //    produces lots of dead .opd entries.
 //
-// 3. In this design, all function symbols refer an .opd section, and that
-//    doesn't work well with graph traversal optimizations such as garbage
-//    collection or identical comdat folding. For example, garbage
+// 3. In this design, all function symbols refer to an .opd section, and
+//    that doesn't work well with graph traversal optimizations such as
+//    garbage collection or identical comdat folding. For example, garbage
 //    collector would mark an .opd alive which in turn mark all functions
 //    thatare referenced by .opd as alive, effectively keeping all
 //    functions as alive.
@@ -559,9 +563,9 @@ get_opd_sym_at(Context<E> &ctx, std::span<OpdSymbol> syms, u64 offset) {
 //
 // So, in this function, we undo what the compiler did to .opd. We remove
 // function symbols from .opd and reattach them to their function entry
-// points. We also rewrite relocations that directly refer an input .opd
-// section so that they refer function symbols instead. We then mark input
-// .opd sections as dead.
+// points. We also rewrite relocations that directly refer to an input
+// .opd  section so that they refer to function symbols instead. We then
+// mark input .opd sections as dead.
 //
 // After this function, we mark symbols with the NEEDS_PPC_OPD flag if the
 // symbol needs an .opd entry. We then create an output .opd just like we
@@ -624,8 +628,8 @@ void ppc64v1_rewrite_opd(Context<E> &ctx) {
 }
 
 // When a function is exported, the dynamic symbol for the function should
-// refers the function's .opd entry. This function marks such symbols with
-// NEEDS_PPC_OPD.
+// refers to the function's .opd entry. This function marks such symbols
+// with NEEDS_PPC_OPD.
 void ppc64v1_scan_symbols(Context<E> &ctx) {
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     for (Symbol<E> *sym : file->symbols)

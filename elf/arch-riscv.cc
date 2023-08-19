@@ -67,6 +67,8 @@
 //
 // https://github.com/riscv-non-isa/riscv-elf-psabi-doc/blob/master/riscv-elf.adoc
 
+#if MOLD_RV64LE || MOLD_RV64BE || MOLD_RV32LE || MOLD_RV32BE
+
 #include "mold.h"
 
 #include <tbb/parallel_for.h>
@@ -74,79 +76,54 @@
 
 namespace mold::elf {
 
-static u32 itype(u32 val) {
-  return val << 20;
+using E = MOLD_TARGET;
+
+static void write_itype(u8 *loc, u32 val) {
+  *(ul32 *)loc &= 0b000000'00000'11111'111'11111'1111111;
+  *(ul32 *)loc |= bits(val, 11, 0) << 20;
 }
 
-static u32 stype(u32 val) {
-  return bits(val, 11, 5) << 25 | bits(val, 4, 0) << 7;
+static void write_stype(u8 *loc, u32 val) {
+  *(ul32 *)loc &= 0b000000'11111'11111'111'00000'1111111;
+  *(ul32 *)loc |= bits(val, 11, 5) << 25 | bits(val, 4, 0) << 7;
 }
 
-static u32 btype(u32 val) {
-  return bit(val, 12) << 31 | bits(val, 10, 5) << 25 |
-         bits(val, 4, 1) << 8 | bit(val, 11) << 7;
+static void write_btype(u8 *loc, u32 val) {
+  *(ul32 *)loc &= 0b000000'11111'11111'111'00000'1111111;
+  *(ul32 *)loc |= bit(val, 12) << 31   | bits(val, 10, 5) << 25 |
+                  bits(val, 4, 1) << 8 | bit(val, 11) << 7;
 }
 
-static u32 utype(u32 val) {
+static void write_utype(u8 *loc, u32 val) {
+  *(ul32 *)loc &= 0b000000'00000'00000'000'11111'1111111;
+
   // U-type instructions are used in combination with I-type
   // instructions. U-type insn sets an immediate to the upper 20-bits
   // of a register. I-type insn sign-extends a 12-bits immediate and
   // adds it to a register value to construct a complete value. 0x800
   // is added here to compensate for the sign-extension.
-  return (val + 0x800) & 0xffff'f000;
-}
-
-static u32 jtype(u32 val) {
-  return bit(val, 20) << 31 | bits(val, 10, 1)  << 21 |
-         bit(val, 11) << 20 | bits(val, 19, 12) << 12;
-}
-
-static u32 cbtype(u32 val) {
-  return bit(val, 8) << 12 | bit(val, 4) << 11 | bit(val, 3) << 10 |
-         bit(val, 7) << 6  | bit(val, 6) << 5  | bit(val, 2) << 4  |
-         bit(val, 1) << 3  | bit(val, 5) << 2;
-}
-
-static u32 cjtype(u32 val) {
-  return bit(val, 11) << 12 | bit(val, 4)  << 11 | bit(val, 9) << 10 |
-         bit(val, 8)  << 9  | bit(val, 10) << 8  | bit(val, 6) << 7  |
-         bit(val, 7)  << 6  | bit(val, 3)  << 5  | bit(val, 2) << 4  |
-         bit(val, 1)  << 3  | bit(val, 5)  << 2;
-}
-
-static void write_itype(u8 *loc, u32 val) {
-  *(ul32 *)loc &= 0b000000'00000'11111'111'11111'1111111;
-  *(ul32 *)loc |= itype(val);
-}
-
-static void write_stype(u8 *loc, u32 val) {
-  *(ul32 *)loc &= 0b000000'11111'11111'111'00000'1111111;
-  *(ul32 *)loc |= stype(val);
-}
-
-static void write_btype(u8 *loc, u32 val) {
-  *(ul32 *)loc &= 0b000000'11111'11111'111'00000'1111111;
-  *(ul32 *)loc |= btype(val);
-}
-
-static void write_utype(u8 *loc, u32 val) {
-  *(ul32 *)loc &= 0b000000'00000'00000'000'11111'1111111;
-  *(ul32 *)loc |= utype(val);
+  *(ul32 *)loc |= (val + 0x800) & 0xffff'f000;
 }
 
 static void write_jtype(u8 *loc, u32 val) {
   *(ul32 *)loc &= 0b000000'00000'00000'000'11111'1111111;
-  *(ul32 *)loc |= jtype(val);
+  *(ul32 *)loc |= bit(val, 20) << 31 | bits(val, 10, 1)  << 21 |
+                  bit(val, 11) << 20 | bits(val, 19, 12) << 12;
 }
 
 static void write_cbtype(u8 *loc, u32 val) {
   *(ul16 *)loc &= 0b111'000'111'00000'11;
-  *(ul16 *)loc |= cbtype(val);
+  *(ul16 *)loc |= bit(val, 8) << 12 | bit(val, 4) << 11 | bit(val, 3) << 10 |
+                  bit(val, 7) << 6  | bit(val, 6) << 5  | bit(val, 2) << 4  |
+                  bit(val, 1) << 3  | bit(val, 5) << 2;
 }
 
 static void write_cjtype(u8 *loc, u32 val) {
   *(ul16 *)loc &= 0b111'00000000000'11;
-  *(ul16 *)loc |= cjtype(val);
+  *(ul16 *)loc |= bit(val, 11) << 12 | bit(val, 4)  << 11 | bit(val, 9) << 10 |
+                  bit(val, 8)  << 9  | bit(val, 10) << 8  | bit(val, 6) << 7  |
+                  bit(val, 7)  << 6  | bit(val, 3)  << 5  | bit(val, 2) << 4  |
+                  bit(val, 1)  << 3  | bit(val, 5)  << 2;
 }
 
 // Returns the rd register of an R/I/U/J-type instruction.
@@ -160,8 +137,8 @@ static void set_rs1(u8 *loc, u32 rs1) {
   *(ul32 *)loc |= rs1 << 15;
 }
 
-template <typename E>
-void write_plt_header(Context<E> &ctx, u8 *buf) {
+template <>
+void write_plt_header<E>(Context<E> &ctx, u8 *buf) {
   static const ul32 insn_64[] = {
     0x0000'0397, // auipc  t2, %pcrel_hi(.got.plt)
     0x41c3'0333, // sub    t1, t1, t3               # .plt entry + hdr + 12
@@ -184,13 +161,10 @@ void write_plt_header(Context<E> &ctx, u8 *buf) {
     0x000e'0067, // jr     t3
   };
 
-  if constexpr (E::is_64)
-    memcpy(buf, insn_64, sizeof(insn_64));
-  else
-    memcpy(buf, insn_32, sizeof(insn_32));
-
   u64 gotplt = ctx.gotplt->shdr.sh_addr;
   u64 plt = ctx.plt->shdr.sh_addr;
+
+  memcpy(buf, E::is_64 ? insn_64 : insn_32, E::plt_hdr_size);
   write_utype(buf, gotplt - plt);
   write_itype(buf + 8, gotplt - plt);
   write_itype(buf + 16, gotplt - plt);
@@ -210,35 +184,29 @@ static const ul32 plt_entry_32[] = {
   0x0000'0013, // nop
 };
 
-template <typename E>
-void write_plt_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
-  if constexpr (E::is_64)
-    memcpy(buf, plt_entry_64, sizeof(plt_entry_64));
-  else
-    memcpy(buf, plt_entry_32, sizeof(plt_entry_32));
-
+template <>
+void write_plt_entry<E>(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
   u64 gotplt = sym.get_gotplt_addr(ctx);
   u64 plt = sym.get_plt_addr(ctx);
+
+  memcpy(buf, E::is_64 ? plt_entry_64 : plt_entry_32, E::plt_size);
   write_utype(buf, gotplt - plt);
   write_itype(buf + 4, gotplt - plt);
 }
 
-template <typename E>
-void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
-  if constexpr (E::is_64)
-    memcpy(buf, plt_entry_64, sizeof(plt_entry_64));
-  else
-    memcpy(buf, plt_entry_32, sizeof(plt_entry_32));
-
+template <>
+void write_pltgot_entry<E>(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
   u64 got = sym.get_got_addr(ctx);
   u64 plt = sym.get_plt_addr(ctx);
+
+  memcpy(buf, E::is_64 ? plt_entry_64 : plt_entry_32, E::plt_size);
   write_utype(buf, got - plt);
   write_itype(buf + 4, got - plt);
 }
 
-template <typename E>
-void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
-                                    u64 offset, u64 val) {
+template <>
+void EhFrameSection<E>::apply_eh_reloc(Context<E> &ctx, const ElfRel<E> &rel,
+                                       u64 offset, u64 val) {
   u8 *loc = ctx.buf + this->shdr.sh_offset + offset;
 
   switch (rel.r_type) {
@@ -279,7 +247,7 @@ void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
   }
 }
 
-template <typename E>
+template <>
 void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
   std::span<const ElfRel<E>> rels = get_rels(ctx);
 
@@ -309,6 +277,28 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
                    << lo << ", " << hi << ")";
     };
 
+    auto is_hi20 = [](const ElfRel<E> &r) {
+      u32 ty = r.r_type;
+      return ty == R_RISCV_GOT_HI20 || ty == R_RISCV_TLS_GOT_HI20 ||
+             ty == R_RISCV_TLS_GD_HI20 || ty == R_RISCV_PCREL_HI20;
+    };
+
+    auto find_paired_reloc = [&] {
+      assert(sym.get_input_section() == this);
+
+      if (sym.value < r_offset) {
+        for (i64 j = i - 1; j >= 0; j--)
+          if (is_hi20(rels[j]) && sym.value == rels[j].r_offset - get_r_delta(j))
+            return j;
+      } else {
+        for (i64 j = i + 1; j < rels.size(); j++)
+          if (is_hi20(rels[j]) && sym.value == rels[j].r_offset - get_r_delta(j))
+            return j;
+      }
+
+      Fatal(ctx) << *this << ": paired relocation is missing: " << i;
+    };
+
     u64 S = sym.get_addr(ctx);
     u64 A = rel.r_addend;
     u64 P = get_addr() + r_offset;
@@ -320,11 +310,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       if constexpr (E::is_64)
         *(U32<E> *)loc = S + A;
       else
-        apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, dynrel);
+        apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, &dynrel);
       break;
     case R_RISCV_64:
       assert(E::is_64);
-      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, dynrel);
+      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, &dynrel);
       break;
     case R_RISCV_BRANCH:
       check(S + A - P, -(1 << 12), 1 << 12);
@@ -364,21 +354,52 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       break;
     }
     case R_RISCV_GOT_HI20:
-      *(ul32 *)loc = G + GOT + A - P;
+      write_utype(loc, G + GOT + A - P);
       break;
     case R_RISCV_TLS_GOT_HI20:
-      *(ul32 *)loc = sym.get_gottp_addr(ctx) + A - P;
+      write_utype(loc, sym.get_gottp_addr(ctx) + A - P);
       break;
     case R_RISCV_TLS_GD_HI20:
-      *(ul32 *)loc = sym.get_tlsgd_addr(ctx) + A - P;
+      write_utype(loc, sym.get_tlsgd_addr(ctx) + A - P);
       break;
     case R_RISCV_PCREL_HI20:
-      *(ul32 *)loc = S + A - P;
+      write_utype(loc, S + A - P);
       break;
     case R_RISCV_PCREL_LO12_I:
-    case R_RISCV_PCREL_LO12_S:
-      // These relocations are handled in the next loop.
+    case R_RISCV_PCREL_LO12_S: {
+      i64 idx2 = find_paired_reloc();
+      const ElfRel<E> &rel2 = rels[idx2];
+      Symbol<E> &sym2 = *file.symbols[rel2.r_sym];
+
+      u64 S = sym2.get_addr(ctx);
+      u64 A = rel2.r_addend;
+      u64 P = get_addr() + rel2.r_offset - get_r_delta(idx2);
+      u64 G = sym2.get_got_idx(ctx) * sizeof(Word<E>);
+      u64 val;
+
+      switch (rel2.r_type) {
+      case R_RISCV_GOT_HI20:
+        val = G + GOT + A - P;
+        break;
+      case R_RISCV_TLS_GOT_HI20:
+        val = sym2.get_gottp_addr(ctx) + A - P;
+        break;
+      case R_RISCV_TLS_GD_HI20:
+        val = sym2.get_tlsgd_addr(ctx) + A - P;
+        break;
+      case R_RISCV_PCREL_HI20:
+        val = S + A - P;
+        break;
+      default:
+        unreachable();
+      }
+
+      if (rel.r_type == R_RISCV_PCREL_LO12_I)
+        write_itype(loc, val);
+      else
+        write_stype(loc, val);
       break;
+    }
     case R_RISCV_HI20:
       assert(removed_bytes == 0 || removed_bytes == 4);
       if (removed_bytes == 0) {
@@ -475,7 +496,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       write_cjtype(loc, S + A - P);
       break;
     case R_RISCV_SUB6:
-      *loc = (*loc & 0b1100'0000) | ((*loc - (S + A)) & 0b0011'1111);
+      *loc = (*loc & 0b1100'0000) | ((*loc - S - A) & 0b0011'1111);
       break;
     case R_RISCV_SET6:
       *loc = (*loc & 0b1100'0000) | ((S + A) & 0b0011'1111);
@@ -493,49 +514,19 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_RISCV_32_PCREL:
       *(U32<E> *)loc = S + A - P;
       break;
+    case R_RISCV_SET_ULEB128:
+      overwrite_uleb(loc, S + A);
+      break;
+    case R_RISCV_SUB_ULEB128:
+      overwrite_uleb(loc, read_uleb(loc) - S - A);
+      break;
     default:
       unreachable();
     }
   }
-
-  // Handle PC-relative LO12 relocations. In the above loop, pcrel HI20
-  // relocations overwrote instructions with full 32-bit values to allow
-  // their corresponding pcrel LO12 relocations to read their values.
-  for (i64 i = 0; i < rels.size(); i++) {
-    switch (rels[i].r_type) {
-    case R_RISCV_PCREL_LO12_I:
-    case R_RISCV_PCREL_LO12_S: {
-      Symbol<E> &sym = *file.symbols[rels[i].r_sym];
-      assert(sym.get_input_section() == this);
-
-      u8 *loc = base + rels[i].r_offset - get_r_delta(i);
-      u32 val = *(ul32 *)(base + sym.value);
-
-      if (rels[i].r_type == R_RISCV_PCREL_LO12_I)
-        write_itype(loc, val);
-      else
-        write_stype(loc, val);
-    }
-    }
-  }
-
-  // Restore the original instructions pcrel HI20 relocations overwrote.
-  for (i64 i = 0; i < rels.size(); i++) {
-    switch (rels[i].r_type) {
-    case R_RISCV_GOT_HI20:
-    case R_RISCV_PCREL_HI20:
-    case R_RISCV_TLS_GOT_HI20:
-    case R_RISCV_TLS_GD_HI20: {
-      u8 *loc = base + rels[i].r_offset - get_r_delta(i);
-      u32 val = *(ul32 *)loc;
-      memcpy(loc, contents.data() + rels[i].r_offset, 4);
-      write_utype(loc, val);
-    }
-    }
-  }
 }
 
-template <typename E>
+template <>
 void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
   std::span<const ElfRel<E>> rels = get_rels(ctx);
 
@@ -589,7 +580,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       *(U64<E> *)loc -= S + A;
       break;
     case R_RISCV_SUB6:
-      *loc = (*loc & 0b1100'0000) | ((*loc - (S + A)) & 0b0011'1111);
+      *loc = (*loc & 0b1100'0000) | ((*loc - S - A) & 0b0011'1111);
       break;
     case R_RISCV_SET6:
       *loc = (*loc & 0b1100'0000) | ((S + A) & 0b0011'1111);
@@ -603,6 +594,12 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
     case R_RISCV_SET32:
       *(U32<E> *)loc = S + A;
       break;
+    case R_RISCV_SET_ULEB128:
+      overwrite_uleb(loc, S + A);
+      break;
+    case R_RISCV_SUB_ULEB128:
+      overwrite_uleb(loc, read_uleb(loc) - S - A);
+      break;
     default:
       Fatal(ctx) << *this << ": invalid relocation for non-allocated sections: "
                  << rel;
@@ -611,7 +608,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
   }
 }
 
-template <typename E>
+template <>
 void InputSection<E>::copy_contents_riscv(Context<E> &ctx, u8 *buf) {
   // If a section is not relaxed, we can copy it as a one big chunk.
   if (extra.r_deltas.empty()) {
@@ -638,7 +635,7 @@ void InputSection<E>::copy_contents_riscv(Context<E> &ctx, u8 *buf) {
   memcpy(buf, contents.data() + pos, contents.size() - pos);
 }
 
-template <typename E>
+template <>
 void InputSection<E>::scan_relocations(Context<E> &ctx) {
   assert(shdr().sh_flags & SHF_ALLOC);
 
@@ -687,6 +684,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       sym.flags |= NEEDS_TLSGD;
       break;
     case R_RISCV_32_PCREL:
+    case R_RISCV_PCREL_HI20:
       scan_pcrel(ctx, sym, rel);
       break;
     case R_RISCV_TPREL_HI20:
@@ -697,7 +695,6 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       break;
     case R_RISCV_BRANCH:
     case R_RISCV_JAL:
-    case R_RISCV_PCREL_HI20:
     case R_RISCV_PCREL_LO12_I:
     case R_RISCV_PCREL_LO12_S:
     case R_RISCV_LO12_I:
@@ -719,6 +716,8 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_RISCV_SET8:
     case R_RISCV_SET16:
     case R_RISCV_SET32:
+    case R_RISCV_SET_ULEB128:
+    case R_RISCV_SUB_ULEB128:
       break;
     default:
       Error(ctx) << *this << ": unknown relocation: " << rel;
@@ -869,8 +868,8 @@ static void shrink_section(Context<E> &ctx, InputSection<E> &isec, bool use_rvc)
 // linker to align the location referred to by the relocation to a
 // specified byte boundary. We at least have to interpret them to satisfy
 // the alignment constraints.
-template <typename E>
-i64 riscv_resize_sections(Context<E> &ctx) {
+template <>
+i64 riscv_resize_sections<E>(Context<E> &ctx) {
   Timer t(ctx, "riscv_resize_sections");
 
   // True if we can use the 2-byte instructions. This is usually true on
@@ -910,21 +909,252 @@ i64 riscv_resize_sections(Context<E> &ctx) {
   return set_osec_offsets(ctx);
 }
 
-#define INSTANTIATE(E)                                                       \
-  template void write_plt_header(Context<E> &, u8 *);                        \
-  template void write_plt_entry(Context<E> &, u8 *, Symbol<E> &);            \
-  template void write_pltgot_entry(Context<E> &, u8 *, Symbol<E> &);         \
-  template void                                                              \
-  EhFrameSection<E>::apply_reloc(Context<E> &, const ElfRel<E> &, u64, u64); \
-  template void InputSection<E>::apply_reloc_alloc(Context<E> &, u8 *);      \
-  template void InputSection<E>::apply_reloc_nonalloc(Context<E> &, u8 *);   \
-  template void InputSection<E>::copy_contents_riscv(Context<E> &, u8 *);    \
-  template void InputSection<E>::scan_relocations(Context<E> &);             \
-  template i64 riscv_resize_sections(Context<E> &);
+// ISA name handlers
+//
+// An example of ISA name is "rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0_zicsr2p0".
+// An ISA name starts with the base name (e.g. "rv64i2p1") followed by
+// ISA extensions separated by underscores.
+//
+// There are lots of ISA extensions defined for RISC-V, and they are
+// identified by name. Some extensions are of single-letter alphabet such
+// as "m" or "q". Newer extension names start with "z" followed by one or
+// more alphabets (i.e. "zicsr"). "s" and "x" prefixes are reserved
+// for supervisor-level extensions and private extensions, respectively.
+//
+// Each extension consists of a name, a major version and a minor version.
+// For example, "m2p0" indicates the "m" extension of version 2.0. "p" is
+// just a separator. Versions are often omitted in documents, but they are
+// mandatory in .riscv.attributes. Likewise, abbreviations as "g" (which
+// is short for "IMAFD") are not allowed in .riscv.attributes.
+//
+// Each RISC-V object file contains an ISA string enumerating extensions
+// used by the object file. We need to merge input objects' ISA strings
+// into a single ISA string.
+//
+// In order to guarantee string uniqueness, extensions have to be ordered
+// in a specific manner. The exact rule is unfortunately a bit complicated.
+//
+// The following functions takes care of ISA strings.
 
-INSTANTIATE(RV64LE);
-INSTANTIATE(RV64BE);
-INSTANTIATE(RV32LE);
-INSTANTIATE(RV32BE);
+struct Extn {
+  std::string name;
+  i64 major;
+  i64 minor;
+};
+
+// As per the RISC-V spec, the extension names must be sorted in a very
+// specific way, and unfortunately that's not just an alphabetical order.
+// For example, rv64imafd is a legal ISA string, whereas rv64iafdm is not.
+// The exact rule is somewhat arbitrary.
+//
+// This function returns true if the first extension name should precede
+// the second one as per the rule.
+static bool extn_name_less(const Extn &e1, const Extn &e2) {
+  auto get_single_letter_rank = [](char c) -> i64 {
+    std::string_view exts = "iemafdqlcbkjtpvnh";
+    size_t pos = exts.find_first_of(c);
+    if (pos != exts.npos)
+      return pos;
+    return c - 'a' + exts.size();
+  };
+
+  auto get_rank = [&](std::string_view str) -> i64 {
+    switch (str[0]) {
+    case 'x':
+      return 1 << 20;
+    case 's':
+      return 1 << 19;
+    case 'z':
+      return (1 << 18) + get_single_letter_rank(str[1]);
+    default:
+      return get_single_letter_rank(str[0]);
+    }
+  };
+
+  return std::tuple{get_rank(e1.name), e1.name} <
+         std::tuple{get_rank(e2.name), e2.name};
+}
+
+static bool extn_version_less(const Extn &e1, const Extn &e2) {
+  return std::tuple{e1.major, e1.minor} <
+         std::tuple{e2.major, e2.minor};
+}
+
+static std::optional<Extn> read_extn_string(std::string_view &str) {
+  Extn extn;
+
+  size_t pos = str.find_first_of("0123456789");
+  if (pos == str.npos)
+    return {};
+
+  extn.name = str.substr(0, pos);
+  str = str.substr(pos);
+
+  size_t nread;
+  extn.major = std::stoul(std::string(str), &nread, 10);
+  str = str.substr(nread);
+  if (str.size() < 2 || str[0] != 'p')
+    return {};
+  str = str.substr(1);
+
+  extn.minor = std::stoul(std::string(str), &nread, 10);
+  str = str.substr(nread);
+  if (str.empty() || str[0] == '_')
+    return extn;
+  return {};
+}
+
+static std::vector<Extn> parse_arch_string(std::string_view str) {
+  if (str.size() < 5)
+    return {};
+
+  // Parse the base part
+  std::string_view base = str.substr(0, 5);
+  if (base != "rv32i" && base != "rv32e" && base != "rv64i" && base != "rv64e")
+    return {};
+  str = str.substr(4);
+
+  std::optional<Extn> extn = read_extn_string(str);
+  if (!extn)
+    return {};
+
+  std::vector<Extn> vec;
+  extn->name = base;
+  vec.push_back(*extn);
+
+  // Parse extensions
+  while (!str.empty()) {
+    if (str[0] != '_')
+      return {};
+    str = str.substr(1);
+
+    std::optional<Extn> extn = read_extn_string(str);
+    if (!extn)
+      return {};
+    vec.push_back(*extn);
+  }
+  return vec;
+}
+
+static std::vector<Extn> merge_extensions(std::span<Extn> x, std::span<Extn> y) {
+  std::vector<Extn> vec;
+
+  // The base part (i.e. "rv64i" or "rv32i") must match.
+  if (x[0].name != y[0].name)
+    return {};
+
+  // Merge ISA extension strings
+  while (!x.empty() && !y.empty()) {
+    if (x[0].name == y[0].name) {
+      vec.push_back(extn_version_less(x[0], y[0]) ? y[0] : x[0]);
+      x = x.subspan(1);
+      y = y.subspan(1);
+    } else if (extn_name_less(x[0], y[0])) {
+      vec.push_back(x[0]);
+      x = x.subspan(1);
+    } else {
+      vec.push_back(y[0]);
+      y = y.subspan(1);
+    }
+  }
+
+  vec.insert(vec.end(), x.begin(), x.end());
+  vec.insert(vec.end(), y.begin(), y.end());
+  return vec;
+}
+
+static std::string to_string(std::span<Extn> v) {
+  std::string str = v[0].name + std::to_string(v[0].major) + "p" +
+                    std::to_string(v[0].minor);
+
+  for (i64 i = 1; i < v.size(); i++)
+    str += "_" + v[i].name + std::to_string(v[i].major) + "p" +
+           std::to_string(v[i].minor);
+  return str;
+}
+
+//
+// Output .riscv.attributes class
+//
+
+template <>
+void RiscvAttributesSection<E>::update_shdr(Context<E> &ctx) {
+  if (!contents.empty())
+    return;
+
+  i64 stack = -1;
+  std::vector<Extn> arch;
+  bool unaligned = false;
+
+  for (ObjectFile<E> *file : ctx.objs) {
+    if (file->extra.stack_align) {
+      i64 val = *file->extra.stack_align;
+      if (stack != -1 && stack != val)
+        Error(ctx) << *file << ": stack alignment requirement mistmatch";
+      stack = val;
+    }
+
+    if (file->extra.arch) {
+      std::vector<Extn> arch2 = parse_arch_string(*file->extra.arch);
+      if (arch2.empty())
+        Error(ctx) << *file << ": corrupted .riscv.attributes ISA string: "
+                   << *file->extra.arch;
+
+      if (arch.empty()) {
+        arch = arch2;
+      } else {
+        arch = merge_extensions(arch, arch2);
+        if (arch.empty())
+          Error(ctx) << *file << ": incompatible .riscv.attributes ISA string: "
+                     << *file->extra.arch;
+      }
+    }
+
+    if (file->extra.unaligned_access)
+      unaligned = true;
+  }
+
+  if (arch.empty())
+    return;
+
+  std::string arch_str = to_string(arch);
+  contents.resize(arch_str.size() + 100);
+
+  u8 *p = (u8 *)contents.data();
+  *p++ = 'A';                             // Format version
+  U32<E> *sub_sz = (U32<E> *)p;           // Sub-section length
+  p += 4;
+  p += write_string(p, "riscv");          // Vendor name
+  u8 *sub_sub_start = p;
+  *p++ = ELF_TAG_FILE;                    // Sub-section tag
+  U32<E> *sub_sub_sz = (U32<E> *)p;       // Sub-sub-section length
+  p += 4;
+
+  if (stack != -1) {
+    p += write_uleb(p, ELF_TAG_RISCV_STACK_ALIGN);
+    p += write_uleb(p, stack);
+  }
+
+  p += write_uleb(p, ELF_TAG_RISCV_ARCH);
+  p += write_string(p, arch_str);
+
+  if (unaligned) {
+    p += write_uleb(p, ELF_TAG_RISCV_UNALIGNED_ACCESS);
+    p += write_uleb(p, 1);
+  }
+
+  i64 sz = p - (u8 *)contents.data();
+  *sub_sz = sz - 1;
+  *sub_sub_sz = p - sub_sub_start;
+  contents.resize(sz);
+  this->shdr.sh_size = sz;
+}
+
+template <>
+void RiscvAttributesSection<E>::copy_buf(Context<E> &ctx) {
+  memcpy(ctx.buf + this->shdr.sh_offset, contents.data(), contents.size());
+}
 
 } // namespace mold::elf
+
+#endif

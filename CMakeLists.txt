@@ -44,7 +44,7 @@
 # features and behave exactly the same.
 
 cmake_minimum_required(VERSION 3.13)
-project(mold VERSION 1.11.0)
+project(mold VERSION 2.1.0)
 
 include(CMakeDependentOption)
 include(GNUInstallDirs)
@@ -71,6 +71,10 @@ endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   target_compile_options(mold PRIVATE -D_GLIBCXX_ASSERTIONS)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
+  set(OPENBSD ON)
 endif()
 
 # Build mold with -flto if -DMOLD_LTO=ON
@@ -147,7 +151,7 @@ check_cxx_source_compiles(
   "static_assert(sizeof(void *) == 4); int main() {}" P32)
 
 cmake_dependent_option(MOLD_USE_MIMALLOC "Use mimalloc" ON
-  "NOT APPLE; NOT ANDROID; NOT P32" OFF)
+  "NOT APPLE; NOT ANDROID; NOT OPENBSD; NOT P32" OFF)
 cmake_dependent_option(
   MOLD_USE_SYSTEM_MIMALLOC "Use system or vendored mimalloc" OFF
   MOLD_USE_MIMALLOC OFF)
@@ -284,16 +288,19 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR})
 # compiler instances. This is hacky but greatly reduces compile time
 # on a multicore machine.
 list(APPEND MOLD_ELF_TARGETS
-  X86_64 I386 ARM64 ARM32 RV32LE RV32BE RV64LE RV64BE
-  PPC32 PPC64V1 PPC64V2 S390X SPARC64 M68K SH4 ALPHA)
+  X86_64 I386 ARM64 ARM32 RV32LE RV32BE RV64LE RV64BE PPC32 PPC64V1 PPC64V2
+  S390X SPARC64 M68K SH4 ALPHA MIPS64LE MIPS64BE LOONGARCH32 LOONGARCH64)
 
 list(APPEND MOLD_ELF_TEMPLATE_FILES
+  elf/arch-loongarch.cc
+  elf/arch-riscv.cc
   elf/cmdline.cc
   elf/dwarf.cc
   elf/gc-sections.cc
   elf/icf.cc
   elf/input-files.cc
   elf/input-sections.cc
+  elf/jobs.cc
   elf/linker-script.cc
   elf/lto.cc
   elf/main.cc
@@ -360,10 +367,10 @@ target_sources(mold PRIVATE
   elf/arch-arm64.cc
   elf/arch-i386.cc
   elf/arch-m68k.cc
+  elf/arch-mips64.cc
   elf/arch-ppc32.cc
   elf/arch-ppc64v1.cc
   elf/arch-ppc64v2.cc
-  elf/arch-riscv.cc
   elf/arch-s390x.cc
   elf/arch-sh4.cc
   elf/arch-sparc64.cc
@@ -435,6 +442,9 @@ if(NOT CMAKE_SKIP_INSTALL_RULES)
 
   if(EXISTS "${CMAKE_SOURCE_DIR}/LICENSE")
     install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
+  endif()
+  if(EXISTS "${CMAKE_SOURCE_DIR}/LICENSE.third-party")
+    install(FILES "LICENSE.third-party" DESTINATION "${CMAKE_INSTALL_DOCDIR}")
   endif()
 
   function(mold_install_relative_symlink OLD NEW)

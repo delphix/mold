@@ -90,8 +90,8 @@ void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
 }
 
 template <>
-void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
-                                    u64 offset, u64 val) {
+void EhFrameSection<E>::apply_eh_reloc(Context<E> &ctx, const ElfRel<E> &rel,
+                                       u64 offset, u64 val) {
   u8 *loc = ctx.buf + this->shdr.sh_offset + offset;
 
   switch (rel.r_type) {
@@ -149,7 +149,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 
     switch (rel.r_type) {
     case R_390_64:
-      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, dynrel);
+      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, &dynrel);
       break;
     case R_390_8:
       check(S + A, 0, 1 << 8);
@@ -482,7 +482,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_390_TLS_LDCALL:
       break;
     default:
-      Fatal(ctx) << *this << ": scan_relocations: " << rel;
+      Error(ctx) << *this << ": unknown relocation: " << rel;
     }
   }
 }

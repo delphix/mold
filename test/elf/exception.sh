@@ -26,7 +26,7 @@ $CXX -c -o $t/c.o $t/a.cc -fno-PIC
 $CXX -B. -o $t/exe1 $t/b.o $static
 $QEMU $t/exe1
 
-$CXX -B. -o $t/exe2 $t/c.o $static
+$CXX -B. -o $t/exe2 $t/c.o -no-pie $static
 $QEMU $t/exe2
 
 $CXX -B. -o $t/exe3 $t/b.o -pie
@@ -38,7 +38,7 @@ $QEMU $t/exe4
 $CXX -B. -o $t/exe5 $t/b.o -pie -Wl,--gc-sections
 $QEMU $t/exe5
 
-$CXX -B. -o $t/exe6 $t/c.o $static -Wl,--gc-sections
+$CXX -B. -o $t/exe6 $t/c.o -no-pie $static -Wl,--gc-sections
 $QEMU $t/exe6
 
 if [ $MACHINE = x86_64 ]; then
@@ -54,7 +54,7 @@ fi
 if [ $MACHINE = x86_64 -o $MACHINE = aarch64 ]; then
   $CXX -c -o $t/e.o $t/a.cc -mcmodel=large -fno-PIC
 
-  $CXX -B. -o $t/exe9 $t/e.o $static
+  $CXX -B. -o $t/exe9 $t/e.o -no-pie $static
   $QEMU $t/exe9
 
   $CXX -B. -o $t/exe10 $t/e.o -no-pie
@@ -62,7 +62,7 @@ if [ $MACHINE = x86_64 -o $MACHINE = aarch64 ]; then
 fi
 
 # riscv64-linux-gnu-strip crashes for some reason
-if [ $MACHINE != riscv32 ]; then
+if [ $MACHINE != riscv32 ] && [[ $MACHINE != mips* ]]; then
   $CXX -B. -o $t/exe11 $t/b.o -pie
   $STRIP $t/exe11
   $QEMU $t/exe11

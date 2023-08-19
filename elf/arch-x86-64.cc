@@ -89,8 +89,8 @@ void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
 }
 
 template <>
-void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
-                                    u64 offset, u64 val) {
+void EhFrameSection<E>::apply_eh_reloc(Context<E> &ctx, const ElfRel<E> &rel,
+                                       u64 offset, u64 val) {
   u8 *loc = ctx.buf + this->shdr.sh_offset + offset;
 
   switch (rel.r_type) {
@@ -382,7 +382,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       write32s(S + A);
       break;
     case R_X86_64_64:
-      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, dynrel);
+      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, &dynrel);
       break;
     case R_X86_64_PC8:
       check(S + A - P, -(1 << 7), 1 << 7);
