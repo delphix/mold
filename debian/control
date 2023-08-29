@@ -4,15 +4,15 @@ Priority: optional
 Maintainer: Sylvestre Ledru <sylvestre@debian.org>
 Build-Depends:
  cmake,
- debhelper-compat (= 13),
+ debhelper-compat (= 12),
  dwarfdump,
- libmimalloc-dev,
  libssl-dev,
  libtbb-dev,
  libxxhash-dev,
  pkg-config,
  zlib1g-dev,
- gdb
+ gdb,
+ g++-10
 Standards-Version: 4.6.0
 Homepage: https://github.com/rui314/mold
 Vcs-Browser: https://salsa.debian.org/pkg-llvm-team/mold
