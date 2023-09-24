@@ -165,28 +165,6 @@ static u32 relax_gottpoff(u8 *loc) {
   return 0;
 }
 
-static u32 relax_gotpc32_tlsdesc(u8 *loc) {
-  switch ((loc[0] << 16) | (loc[1] << 8) | loc[2]) {
-  case 0x488d05: return 0x48c7c0; // lea 0(%rip), %rax -> mov $0, %rax
-  case 0x488d0d: return 0x48c7c1; // lea 0(%rip), %rcx -> mov $0, %rcx
-  case 0x488d15: return 0x48c7c2; // lea 0(%rip), %rdx -> mov $0, %rdx
-  case 0x488d1d: return 0x48c7c3; // lea 0(%rip), %rbx -> mov $0, %rbx
-  case 0x488d25: return 0x48c7c4; // lea 0(%rip), %rsp -> mov $0, %rsp
-  case 0x488d2d: return 0x48c7c5; // lea 0(%rip), %rbp -> mov $0, %rbp
-  case 0x488d35: return 0x48c7c6; // lea 0(%rip), %rsi -> mov $0, %rsi
-  case 0x488d3d: return 0x48c7c7; // lea 0(%rip), %rdi -> mov $0, %rdi
-  case 0x4c8d05: return 0x49c7c0; // lea 0(%rip), %r8  -> mov $0, %r8
-  case 0x4c8d0d: return 0x49c7c1; // lea 0(%rip), %r9  -> mov $0, %r9
-  case 0x4c8d15: return 0x49c7c2; // lea 0(%rip), %r10 -> mov $0, %r10
-  case 0x4c8d1d: return 0x49c7c3; // lea 0(%rip), %r11 -> mov $0, %r11
-  case 0x4c8d25: return 0x49c7c4; // lea 0(%rip), %r12 -> mov $0, %r12
-  case 0x4c8d2d: return 0x49c7c5; // lea 0(%rip), %r13 -> mov $0, %r13
-  case 0x4c8d35: return 0x49c7c6; // lea 0(%rip), %r14 -> mov $0, %r14
-  case 0x4c8d3d: return 0x49c7c7; // lea 0(%rip), %r15 -> mov $0, %r15
-  }
-  return 0;
-}
-
 // Rewrite a function call to __tls_get_addr to a cheaper instruction
 // sequence. We can do this when we know the thread-local variable's TP-
 // relative address at link-time.
@@ -267,7 +245,7 @@ static void relax_gd_to_ie(u8 *loc, ElfRel<E> rel, u64 val) {
 // sequence. The difference from relax_gd_to_le is that we are
 // materializing a Dynamic Thread Pointer for the current ELF module
 // instead of an address for a particular thread-local variable.
-static void relax_ld_to_le(u8 *loc, ElfRel<E> rel, u64 val) {
+static void relax_ld_to_le(u8 *loc, ElfRel<E> rel, u64 tls_size) {
   switch (rel.r_type) {
   case R_X86_64_PLT32:
   case R_X86_64_PC32: {
@@ -275,13 +253,18 @@ static void relax_ld_to_le(u8 *loc, ElfRel<E> rel, u64 val) {
     //
     //  48 8d 3d 00 00 00 00    lea    foo@tlsld(%rip), %rdi
     //  e8 00 00 00 00          call   __tls_get_addr
+    //
+    // The instructions are so short that we cannot rewrite them with
+    // "mov %fs:0, %rax" which is 9 bytes long. We use a shorter code
+    // sequence instead. Since "xor %eax, %eax" zero-clears %rax, the
+    // meaning is equivalent.
     static const u8 insn[] = {
       0x31, 0xc0,                   // xor %eax, %eax
       0x64, 0x48, 0x8b, 0x00,       // mov %fs:(%rax), %rax
       0x48, 0x2d, 0, 0, 0, 0,       // sub $tls_size, %rax
     };
     memcpy(loc - 3, insn, sizeof(insn));
-    *(ul32 *)(loc + 5) = val;
+    *(ul32 *)(loc + 5) = tls_size;
     break;
   }
   case R_X86_64_GOTPCREL:
@@ -297,7 +280,7 @@ static void relax_ld_to_le(u8 *loc, ElfRel<E> rel, u64 val) {
       0x90,                         // nop
     };
     memcpy(loc - 3, insn, sizeof(insn));
-    *(ul32 *)(loc + 5) = val;
+    *(ul32 *)(loc + 5) = tls_size;
     break;
   }
   case R_X86_64_PLTOFF64: {
@@ -308,14 +291,12 @@ static void relax_ld_to_le(u8 *loc, ElfRel<E> rel, u64 val) {
     //  48 01 d8                       add    %rbx, %rax
     //  ff d0                          call   *%rax
     static const u8 insn[] = {
-      0x31, 0xc0,                   // xor %eax, %eax
-      0x64, 0x48, 0x8b, 0x00,       // mov %fs:(%rax), %rax
-      0x48, 0x2d, 0, 0, 0, 0,       // sub $tls_size, %rax
-      0x0f, 0x1f, 0x44, 0x00, 0x00, // nop
-      0x0f, 0x1f, 0x44, 0x00, 0x00, // nop
+      0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, // mov %fs:0, %rax
+      0x48, 0x2d, 0, 0, 0, 0,                   // sub $tls_size, %rax
+      0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00, // nop
     };
     memcpy(loc - 3, insn, sizeof(insn));
-    *(ul32 *)(loc + 5) = val;
+    *(ul32 *)(loc + 8) = tls_size;
     break;
   }
   default:
@@ -400,7 +381,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul64 *)loc = S + A - P;
       break;
     case R_X86_64_GOT32:
-      write32s(G + A);
+      write32(G + A);
       break;
     case R_X86_64_GOT64:
       *(ul64 *)loc = G + A;
@@ -425,7 +406,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       // We always want to relax GOTPCRELX relocs even if --no-relax
       // was given because some static PIE runtime code depends on these
       // relaxations.
-      if (!sym.is_imported && !sym.is_ifunc() && sym.is_relative()) {
+      if (sym.is_pcrel_linktime_const(ctx)) {
         u32 insn = relax_gotpcrelx(loc - 2);
         i64 val = S + A - P;
         if (insn && (i32)val == val) {
@@ -438,7 +419,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       write32s(G + GOTPLT + A - P);
       break;
     case R_X86_64_REX_GOTPCRELX:
-      if (!sym.is_imported && !sym.is_ifunc() && sym.is_relative()) {
+      if (sym.is_pcrel_linktime_const(ctx)) {
         u32 insn = relax_rex_gotpcrelx(loc - 3);
         i64 val = S + A - P;
         if (insn && (i32)val == val) {
@@ -452,23 +433,18 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       write32s(G + GOTPLT + A - P);
       break;
     case R_X86_64_TLSGD:
-      if (sym.has_tlsgd(ctx)) {
+      if (sym.has_tlsgd(ctx))
         write32s(sym.get_tlsgd_addr(ctx) + A - P);
-      } else if (sym.has_gottp(ctx)) {
-        relax_gd_to_ie(loc, rels[i + 1], sym.get_gottp_addr(ctx) - P);
-        i++;
-      } else {
-        relax_gd_to_le(loc, rels[i + 1], S - ctx.tp_addr);
-        i++;
-      }
+      else if (sym.has_gottp(ctx))
+        relax_gd_to_ie(loc, rels[++i], sym.get_gottp_addr(ctx) - P);
+      else
+        relax_gd_to_le(loc, rels[++i], S - ctx.tp_addr);
       break;
     case R_X86_64_TLSLD:
-      if (ctx.got->has_tlsld(ctx)) {
+      if (ctx.got->has_tlsld(ctx))
         write32s(ctx.got->get_tlsld_addr(ctx) + A - P);
-      } else {
-        relax_ld_to_le(loc, rels[i + 1], ctx.tp_addr - ctx.tls_begin);
-        i++;
-      }
+      else
+        relax_ld_to_le(loc, rels[++i], ctx.tp_addr - ctx.tls_begin);
       break;
     case R_X86_64_DTPOFF32:
       write32s(S + A - ctx.dtp_addr);
@@ -495,15 +471,46 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       }
       break;
     case R_X86_64_GOTPC32_TLSDESC:
+      // x86-64 TLSDESC uses the following code sequence to materialize
+      // a TP-relative address in %rax.
+      //
+      //   lea    0(%rip), %rax
+      //       R_X86_64_GOTPC32_TLSDESC    foo
+      //   call   *(%rax)
+      //       R_X86_64_TLSDESC_CALL       foo
+      //
+      // We may relax the instructions to the following for non-dlopen'd DSO
+      //
+      //   mov     foo@GOTTPOFF(%rip), %rax
+      //   nop
+      //
+      // or to the following for executable.
+      //
+      //   mov     $foo@TPOFF, %rax
+      //   nop
       if (sym.has_tlsdesc(ctx)) {
         write32s(sym.get_tlsdesc_addr(ctx) + A - P);
+      } else if (sym.has_gottp(ctx)) {
+        // mov foo@gottpoff(%rip), %rax
+        loc[-3] = 0x48;
+        loc[-2] = 0x8b;
+        loc[-1] = 0x05;
+        write32s(sym.get_gottp_addr(ctx) + A - P);
       } else {
-        u32 insn = relax_gotpc32_tlsdesc(loc - 3);
-        loc[-3] = insn >> 16;
-        loc[-2] = insn >> 8;
-        loc[-1] = insn;
+        // mov $foo@tpoff, %rax
+        loc[-3] = 0x48;
+        loc[-2] = 0xc7;
+        loc[-1] = 0xc0;
         write32s(S - ctx.tp_addr);
-        assert(A == -4);
+      }
+      break;
+    case R_X86_64_TLSDESC_CALL:
+      if (sym.has_tlsdesc(ctx)) {
+        // Do nothing
+      } else {
+        // call *(%rax) -> nop
+        loc[0] = 0x66;
+        loc[1] = 0x90;
       }
       break;
     case R_X86_64_SIZE32:
@@ -511,13 +518,6 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       break;
     case R_X86_64_SIZE64:
       *(ul64 *)loc = sym.esym().st_size + A;
-      break;
-    case R_X86_64_TLSDESC_CALL:
-      if (!sym.has_tlsdesc(ctx)) {
-        // call *(%rax) -> nop
-        loc[0] = 0x66;
-        loc[1] = 0x90;
-      }
       break;
     default:
       unreachable();
@@ -653,6 +653,19 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     if (sym.is_ifunc())
       sym.flags |= NEEDS_GOT | NEEDS_PLT;
 
+    if (rel.r_type == R_X86_64_TLSGD || rel.r_type == R_X86_64_TLSLD) {
+      if (i + 1 == rels.size())
+        Fatal(ctx) << *this << ": " << rel
+                   << " must be followed by PLT or GOTPCREL";
+
+      if (u32 ty = rels[i + 1].r_type;
+          ty != R_X86_64_PLT32 && ty != R_X86_64_PC32 &&
+          ty != R_X86_64_PLTOFF64 && ty != R_X86_64_GOTPCREL &&
+          ty != R_X86_64_GOTPCRELX)
+        Fatal(ctx) << *this << ": " << rel
+                   << " must be followed by PLT or GOTPCREL";
+    }
+
     switch (rel.r_type) {
     case R_X86_64_8:
     case R_X86_64_16:
@@ -685,25 +698,12 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
         sym.flags |= NEEDS_PLT;
       break;
     case R_X86_64_TLSGD:
-      if (rel.r_addend != -4)
-        Fatal(ctx) << *this << ": bad r_addend for R_X86_64_TLSGD";
-
-      if (i + 1 == rels.size())
-        Fatal(ctx) << *this << ": TLSGD reloc must be followed by PLT or GOTPCREL";
-
-      if (u32 ty = rels[i + 1].r_type;
-          ty != R_X86_64_PLT32 && ty != R_X86_64_PC32 &&
-          ty != R_X86_64_PLTOFF64 && ty != R_X86_64_GOTPCREL &&
-          ty != R_X86_64_GOTPCRELX)
-        Fatal(ctx) << *this << ": TLSGD reloc must be followed by PLT or GOTPCREL";
-
-      if (ctx.arg.is_static ||
-          (ctx.arg.relax && !sym.is_imported && !ctx.arg.shared)) {
+      if ((ctx.arg.relax && sym.is_tprel_linktime_const(ctx)) ||
+          ctx.arg.is_static) {
         // We always relax if -static because libc.a doesn't contain
         // __tls_get_addr().
         i++;
-      } else if (ctx.arg.relax && !sym.is_imported && ctx.arg.shared &&
-                 !ctx.arg.z_dlopen) {
+      } else if (ctx.arg.relax && sym.is_tprel_runtime_const(ctx)) {
         sym.flags |= NEEDS_GOTTP;
         i++;
       } else {
@@ -711,18 +711,6 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       }
       break;
     case R_X86_64_TLSLD:
-      if (rel.r_addend != -4)
-        Fatal(ctx) << *this << ": bad r_addend for R_X86_64_TLSLD";
-
-      if (i + 1 == rels.size())
-        Fatal(ctx) << *this << ": TLSLD reloc must be followed by PLT or GOTPCREL";
-
-      if (u32 ty = rels[i + 1].r_type;
-          ty != R_X86_64_PLT32 && ty != R_X86_64_PC32 &&
-          ty != R_X86_64_PLTOFF64 && ty != R_X86_64_GOTPCREL &&
-          ty != R_X86_64_GOTPCRELX)
-        Fatal(ctx) << *this << ": TLSLD reloc must be followed by PLT or GOTPCREL";
-
       // We always relax if -static because libc.a doesn't contain
       // __tls_get_addr().
       if (ctx.arg.is_static || (ctx.arg.relax && !ctx.arg.shared))
@@ -730,28 +718,17 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       else
         ctx.needs_tlsld = true;
       break;
-    case R_X86_64_GOTTPOFF: {
-      if (rel.r_addend != -4)
-        Fatal(ctx) << *this << ": bad r_addend for R_X86_64_GOTTPOFF";
-
-      bool do_relax = ctx.arg.relax && !ctx.arg.shared &&
-                      !sym.is_imported && relax_gottpoff(loc - 3);
-      if (!do_relax)
+    case R_X86_64_GOTTPOFF:
+      if (ctx.arg.relax && relax_gottpoff(loc - 3) &&
+          sym.is_tprel_linktime_const(ctx)) {
+        // do nothing
+      } else {
         sym.flags |= NEEDS_GOTTP;
+      }
       break;
-    }
-    case R_X86_64_GOTPC32_TLSDESC: {
-      if (rel.r_addend != -4)
-        Fatal(ctx) << *this << ": bad r_addend for R_X86_64_GOTPC32_TLSDESC";
-
-      if (relax_gotpc32_tlsdesc(loc - 3) == 0)
-        Fatal(ctx) << *this << ": GOTPC32_TLSDESC relocation is used"
-                   << " against an invalid code sequence";
-
-      if (!relax_tlsdesc(ctx, sym))
-        sym.flags |= NEEDS_TLSDESC;
+    case R_X86_64_TLSDESC_CALL:
+      scan_tlsdesc(ctx, sym);
       break;
-    }
     case R_X86_64_TPOFF32:
     case R_X86_64_TPOFF64:
       check_tlsle(ctx, sym, rel);
@@ -761,7 +738,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_X86_64_DTPOFF64:
     case R_X86_64_SIZE32:
     case R_X86_64_SIZE64:
-    case R_X86_64_TLSDESC_CALL:
+    case R_X86_64_GOTPC32_TLSDESC:
       break;
     default:
       Error(ctx) << *this << ": unknown relocation: " << rel;

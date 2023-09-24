@@ -112,25 +112,26 @@ void write_plt_header(Context<E> &ctx, u8 *buf) {
     0x7c08'03a6, // mtlr    r0
 
     // Compute the PLT entry index
-    0xe80b'002c, // ld      r0, 44(r11)
-    0x7d8b'6050, // subf    r12, r11, r12
-    0x7d60'5a14, // add     r11, r0, r11
-    0x380c'ffcc, // addi    r0, r12, -52
+    0x398c'ffd4, // addi    r12, r12, -44
+    0x7c0b'6050, // subf    r0, r11, r12
     0x7800'f082, // rldicl  r0, r0, 62, 2
+
+    // Compute the address of .got.plt
+    0x3d6b'0000, // addis   r11, r11, GOTPLT_OFFSET@ha
+    0x396b'0000, // addi    r11, r11, GOTPLT_OFFSET@lo
 
     // Load .got.plt[0] and .got.plt[1] and branch to .got.plt[0]
     0xe98b'0000, // ld      r12, 0(r11)
     0x7d89'03a6, // mtctr   r12
     0xe96b'0008, // ld      r11, 8(r11)
     0x4e80'0420, // bctr
-
-    // .quad .got.plt - .plt - 8
-    0x0000'0000,
-    0x0000'0000,
   };
 
   memcpy(buf, insn, sizeof(insn));
-  *(ul64 *)(buf + 52) = ctx.gotplt->shdr.sh_addr - ctx.plt->shdr.sh_addr - 8;
+
+  i64 val = ctx.gotplt->shdr.sh_addr - ctx.plt->shdr.sh_addr - 8;
+  *(ul32 *)(buf + 28) |= higha(val);
+  *(ul32 *)(buf + 32) |= lo(val);
 }
 
 template <>
@@ -478,8 +479,6 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 
 template <>
 void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
-
   // If the destination is PLT, we read an address from .got.plt or .got
   // and jump there.
   static const ul32 plt_thunk[] = {
@@ -521,34 +520,43 @@ void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
   static_assert(E::thunk_size == sizeof(local_thunk));
   static_assert(E::thunk_size == sizeof(local_thunk_power10));
 
-  for (i64 i = 0; i < symbols.size(); i++) {
-    Symbol<E> &sym = *symbols[i];
-    ul32 *loc = (ul32 *)(buf + i * E::thunk_size);
+  u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
+  u64 P = output_section.shdr.sh_addr + offset;
 
-    if (sym.has_plt(ctx)) {
-      u64 got = sym.has_got(ctx) ? sym.get_got_addr(ctx) : sym.get_gotplt_addr(ctx);
+  for (Symbol<E> *sym : symbols) {
+    if (sym->has_plt(ctx)) {
+      u64 got =
+        sym->has_got(ctx) ? sym->get_got_addr(ctx) : sym->get_gotplt_addr(ctx);
 
       if (ctx.extra.is_power10) {
-        memcpy(loc, plt_thunk_power10, E::thunk_size);
-        *(ul64 *)(loc + 1) |= prefix34(got - get_addr(i) - 4);
+        memcpy(buf, plt_thunk_power10, E::thunk_size);
+        *(ul64 *)(buf + 1) |= prefix34(got - P - 4);
       } else {
         i64 val = got - ctx.extra.TOC->value;
-        memcpy(loc, plt_thunk, E::thunk_size);
-        loc[1] |= higha(val);
-        loc[2] |= lo(val);
+        memcpy(buf, plt_thunk, E::thunk_size);
+        *(ul32 *)(buf + 4) |= higha(val);
+        *(ul32 *)(buf + 8) |= lo(val);
       }
     } else {
       if (ctx.extra.is_power10) {
-        memcpy(loc, local_thunk_power10, E::thunk_size);
-        *(ul64 *)(loc + 1) |= prefix34(sym.get_addr(ctx) - get_addr(i) - 4);
+        memcpy(buf, local_thunk_power10, E::thunk_size);
+        *(ul64 *)(buf + 1) |= prefix34(sym->get_addr(ctx) - P - 4);
       } else {
-        i64 val = sym.get_addr(ctx) - ctx.extra.TOC->value;
-        memcpy(loc, local_thunk, E::thunk_size);
-        loc[1] |= higha(val);
-        loc[2] |= lo(val);
+        i64 val = sym->get_addr(ctx) - ctx.extra.TOC->value;
+        memcpy(buf, local_thunk, E::thunk_size);
+        *(ul32 *)(buf + 4) |= higha(val);
+        *(ul32 *)(buf + 8) |= lo(val);
       }
     }
+
+    buf += E::thunk_size;
+    P += E::thunk_size;
   }
+}
+
+template <>
+u64 get_eflags(Context<E> &ctx) {
+  return 2;
 }
 
 } // namespace mold::elf

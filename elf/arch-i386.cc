@@ -338,20 +338,16 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul32 *)loc = sym.get_gottp_addr(ctx) + A;
       break;
     case R_386_TLS_GD:
-      if (sym.has_tlsgd(ctx)) {
+      if (sym.has_tlsgd(ctx))
         *(ul32 *)loc = sym.get_tlsgd_addr(ctx) + A - GOT;
-      } else {
-        relax_gd_to_le(loc, rels[i + 1], S - ctx.tp_addr);
-        i++;
-      }
+      else
+        relax_gd_to_le(loc, rels[++i], S - ctx.tp_addr);
       break;
     case R_386_TLS_LDM:
-      if (ctx.got->has_tlsld(ctx)) {
+      if (ctx.got->has_tlsld(ctx))
         *(ul32 *)loc = ctx.got->get_tlsld_addr(ctx) + A - GOT;
-      } else {
-        relax_ld_to_le(loc, rels[i + 1], ctx.tp_addr - ctx.tls_begin);
-        i++;
-      }
+        else
+        relax_ld_to_le(loc, rels[++i], ctx.tp_addr - ctx.tls_begin);
       break;
     case R_386_TLS_LDO_32:
       *(ul32 *)loc = S + A - ctx.dtp_addr;
@@ -360,13 +356,32 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul32 *)loc = sym.esym().st_size + A;
       break;
     case R_386_TLS_GOTDESC:
+      // i386 TLSDESC uses the following code sequence to materialize
+      // a TP-relative address in %eax.
+      //
+      //   lea    0(%ebx), %eax
+      //       R_386_TLS_GOTDESC   foo
+      //   call   *(%eax)
+      //       R_386_TLS_DESC_CALL foo
+      //
+      // We may relax the instructions to the following for non-dlopen'd DSO
+      //
+      //   mov     foo@GOTTPOFF(%ebx), %eax
+      //   nop
+      //
+      // or to the following for executable.
+      //
+      //   mov     $foo@TPOFF, %eax
+      //   nop
       if (sym.has_tlsdesc(ctx)) {
         *(ul32 *)loc = sym.get_tlsdesc_addr(ctx) + A - GOT;
+      } else if (sym.has_gottp(ctx)) {
+        loc[-2] = 0x8b;
+        loc[-1] = 0x83;
+        *(ul32 *)loc = sym.get_gottp_addr(ctx) + A - GOT;
       } else {
-        static const u8 insn[] = {
-          0x8d, 0x05, 0, 0, 0, 0, // lea 0, %eax
-        };
-        memcpy(loc - 2, insn, sizeof(insn));
+        loc[-2] = 0x90;
+        loc[-1] = 0xb8;
         *(ul32 *)loc = S + A - ctx.tp_addr;
       }
       break;
@@ -476,6 +491,16 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     if (sym.is_ifunc())
       sym.flags |= NEEDS_GOT | NEEDS_PLT;
 
+    if (rel.r_type == R_386_TLS_GD || rel.r_type == R_386_TLS_LDM) {
+      if (i + 1 == rels.size())
+        Fatal(ctx) << *this << ": " << rel << " must be followed by PLT or GOT32";
+
+      if (u32 ty = rels[i + 1].r_type;
+          ty != R_386_PLT32 && ty != R_386_PC32 &&
+          ty != R_386_GOT32 && ty != R_386_GOT32X)
+        Fatal(ctx) << *this << ": " << rel << " must be followed by PLT or GOT32";
+    }
+
     switch (rel.r_type) {
     case R_386_8:
     case R_386_16:
@@ -493,15 +518,15 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_386_GOTPC:
       sym.flags |= NEEDS_GOT;
       break;
-    case R_386_GOT32X: {
-      // We always want to relax GOT32X because static PIE doesn't
-      // work without it.
-      bool do_relax = !sym.is_imported && sym.is_relative() &&
-                      relax_got32x(loc - 2);
-      if (!do_relax)
+    case R_386_GOT32X:
+      // We always want to relax GOT32X even if --no-relax is given
+      // because static PIE doesn't work without it.
+      if (sym.is_pcrel_linktime_const(ctx) && relax_got32x(loc - 2)) {
+        // Do nothing
+      } else {
         sym.flags |= NEEDS_GOT;
+      }
       break;
-    }
     case R_386_PLT32:
       if (sym.is_imported)
         sym.flags |= NEEDS_PLT;
@@ -511,31 +536,15 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       sym.flags |= NEEDS_GOTTP;
       break;
     case R_386_TLS_GD:
-      if (i + 1 == rels.size())
-        Fatal(ctx) << *this << ": TLS_GD reloc must be followed by PLT or GOT32";
-
-      if (u32 ty = rels[i + 1].r_type;
-          ty != R_386_PLT32 && ty != R_386_PC32 &&
-          ty != R_386_GOT32 && ty != R_386_GOT32X)
-        Fatal(ctx) << *this << ": TLS_GD reloc must be followed by PLT or GOT32";
-
       // We always relax if -static because libc.a doesn't contain
       // __tls_get_addr().
-      if (ctx.arg.is_static ||
-          (ctx.arg.relax && !ctx.arg.shared && !sym.is_imported))
+      if ((ctx.arg.relax && sym.is_tprel_linktime_const(ctx)) ||
+          ctx.arg.is_static)
         i++;
       else
         sym.flags |= NEEDS_TLSGD;
       break;
     case R_386_TLS_LDM:
-      if (i + 1 == rels.size())
-        Fatal(ctx) << *this << ": TLS_LDM reloc must be followed by PLT or GOT32";
-
-      if (u32 ty = rels[i + 1].r_type;
-          ty != R_386_PLT32 && ty != R_386_PC32 &&
-          ty != R_386_GOT32 && ty != R_386_GOT32X)
-        Fatal(ctx) << *this << ": TLS_LDM reloc must be followed by PLT or GOT32";
-
       // We always relax if -static because libc.a doesn't contain
       // __tls_get_addr().
       if (ctx.arg.is_static || (ctx.arg.relax && !ctx.arg.shared))
@@ -544,8 +553,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
         ctx.needs_tlsld = true;
       break;
     case R_386_TLS_GOTDESC:
-      if (!relax_tlsdesc(ctx, sym))
-        sym.flags |= NEEDS_TLSDESC;
+      scan_tlsdesc(ctx, sym);
       break;
     case R_386_TLS_LE:
       check_tlsle(ctx, sym, rel);

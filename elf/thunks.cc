@@ -30,8 +30,9 @@
 
 namespace mold::elf {
 
+using E = MOLD_TARGET;
+
 // Returns a branch reach in bytes for a given target.
-template <typename E>
 static consteval i64 max_distance() {
   // ARM64's branch has 26 bits immediate. The immediate is padded with
   // implicit two-bit zeros because all instructions are 4 bytes aligned
@@ -60,11 +61,12 @@ static consteval i64 max_distance() {
 
 // We create thunks for each 12.8/1.6/3.2 MiB code block for
 // ARM64/ARM32/PPC, respectively.
-template <typename E>
-static constexpr i64 batch_size = max_distance<E>() / 10;
+static constexpr i64 batch_size = max_distance() / 10;
 
 // We assume that a single thunk group is smaller than 100 KiB.
 static constexpr i64 max_thunk_size = 102400;
+
+static_assert(max_thunk_size / E::thunk_size < INT16_MAX);
 
 // Returns true if a given relocation is of type used for function calls.
 template <typename E>
@@ -135,10 +137,9 @@ static bool is_reachable(Context<E> &ctx, InputSection<E> &isec,
   i64 A = get_addend(isec, rel);
   i64 P = isec.get_addr() + rel.r_offset;
   i64 val = S + A - P;
-  return -max_distance<E>() <= val && val < max_distance<E>();
+  return -max_distance() <= val && val < max_distance();
 }
 
-template <typename E>
 static void reset_thunk(RangeExtensionThunk<E> &thunk) {
   for (Symbol<E> *sym : thunk.symbols) {
     sym->extra.thunk_idx = -1;
@@ -148,7 +149,6 @@ static void reset_thunk(RangeExtensionThunk<E> &thunk) {
 }
 
 // Scan relocations to collect symbols that need thunks.
-template <typename E>
 static void scan_rels(Context<E> &ctx, InputSection<E> &isec,
                       RangeExtensionThunk<E> &thunk, i64 thunk_idx) {
   std::span<const ElfRel<E>> rels = isec.get_rels(ctx);
@@ -189,9 +189,9 @@ static void scan_rels(Context<E> &ctx, InputSection<E> &isec,
   }
 }
 
-template <typename E>
-void create_range_extension_thunks(Context<E> &ctx, OutputSection<E> &osec) {
-  std::span<InputSection<E> *> m = osec.members;
+template <>
+void OutputSection<E>::create_range_extension_thunks(Context<E> &ctx) {
+  std::span<InputSection<E> *> m = members;
   if (m.empty())
     return;
 
@@ -236,7 +236,7 @@ void create_range_extension_thunks(Context<E> &ctx, OutputSection<E> &osec) {
     // Move D foward as far as we can jump from B to anywhere in a thunk at D.
     while (d < m.size() &&
            align_to(offset, 1 << m[d]->p2align) + m[d]->sh_size + max_thunk_size <
-           m[b]->offset + max_distance<E>()) {
+           m[b]->offset + max_distance()) {
       offset = align_to(offset, 1 << m[d]->p2align);
       m[d]->offset = offset;
       offset += m[d]->sh_size;
@@ -248,33 +248,33 @@ void create_range_extension_thunks(Context<E> &ctx, OutputSection<E> &osec) {
     // to ensure progress.
     c = b + 1;
     while (c < m.size() &&
-           m[c]->offset + m[c]->sh_size < m[b]->offset + batch_size<E>)
+           m[c]->offset + m[c]->sh_size < m[b]->offset + batch_size)
       c++;
 
     // Move A forward so that A is reachable from C.
     i64 c_offset = (c == m.size()) ? offset : m[c]->offset;
-    while (a < m.size() && m[a]->offset + max_distance<E>() < c_offset)
+    while (a < m.size() && m[a]->offset + max_distance() < c_offset)
       a++;
 
     // Erase references to out-of-range thunks.
-    while (t < osec.thunks.size() &&
-           osec.thunks[t]->offset < m[a]->offset)
-      reset_thunk(*osec.thunks[t++]);
+    while (t < thunks.size() && thunks[t]->offset < m[a]->offset)
+      reset_thunk(*thunks[t++]);
 
-    // Create a thunk for input sections between B and C and place it at D.
+    // Create a new thunk and place it at D.
     offset = align_to(offset, RangeExtensionThunk<E>::alignment);
-    i64 thunk_idx = osec.thunks.size();
-    RangeExtensionThunk<E> *thunk = new RangeExtensionThunk<E>(osec, offset);
-    osec.thunks.emplace_back(thunk);
+    i64 thunk_idx = thunks.size();
+    RangeExtensionThunk<E> *thunk = new RangeExtensionThunk<E>(*this, offset);
+    thunks.emplace_back(thunk);
 
-    // Scan relocations between B and C to collect symbols that need thunks.
+    // Scan relocations between B and C to collect symbols that need
+    // entries in the new thunk.
     tbb::parallel_for_each(m.begin() + b, m.begin() + c,
                            [&](InputSection<E> *isec) {
       scan_rels(ctx, *isec, *thunk, thunk_idx);
     });
 
     // Now that we know the number of symbols in the thunk, we can compute
-    // its size.
+    // the thunk's size.
     assert(thunk->size() < max_thunk_size);
     offset += thunk->size();
 
@@ -307,17 +307,15 @@ void create_range_extension_thunks(Context<E> &ctx, OutputSection<E> &osec) {
     b = c;
   }
 
-  while (t < osec.thunks.size())
-    reset_thunk(*osec.thunks[t++]);
+  while (t < thunks.size())
+    reset_thunk(*thunks[t++]);
 
-  osec.shdr.sh_size = offset;
+  this->shdr.sh_size = offset;
+
+  for (InputSection<E> *isec : members)
+    this->shdr.sh_addralign =
+      std::max<u32>(this->shdr.sh_addralign, 1 << isec->p2align);
 }
-
-using E = MOLD_TARGET;
-
-static_assert(max_thunk_size / E::thunk_size < INT16_MAX);
-
-template void create_range_extension_thunks(Context<E> &, OutputSection<E> &);
 
 } // namespace mold::elf
 

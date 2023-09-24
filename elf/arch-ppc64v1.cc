@@ -72,22 +72,22 @@ void write_plt_header(Context<E> &ctx, u8 *buf) {
     0x7d88'02a6, // mflr    r12
     0x429f'0005, // bcl     20, 31, 4 // obtain PC
     0x7d68'02a6, // mflr    r11
-    0xe84b'0024, // ld      r2,36(r11)
     0x7d88'03a6, // mtlr    r12
-    0x7d62'5a14, // add     r11,r2,r11
+    0x3d6b'0000, // addis   r11, r11, GOTPLT_OFFSET@ha
+    0x396b'0000, // addi    r11, r11, GOTPLT_OFFSET@lo
     0xe98b'0000, // ld      r12,0(r11)
     0xe84b'0008, // ld      r2,8(r11)
     0x7d89'03a6, // mtctr   r12
     0xe96b'0010, // ld      r11,16(r11)
     0x4e80'0420, // bctr
-    // .quad .got.plt - .plt - 8
-    0x0000'0000,
-    0x0000'0000,
   };
 
   static_assert(sizeof(insn) == E::plt_hdr_size);
   memcpy(buf, insn, sizeof(insn));
-  *(ub64 *)(buf + 44) = ctx.gotplt->shdr.sh_addr - ctx.plt->shdr.sh_addr - 8;
+
+  i64 val = ctx.gotplt->shdr.sh_addr - ctx.plt->shdr.sh_addr - 8;
+  *(ub32 *)(buf + 16) |= higha(val);
+  *(ub32 *)(buf + 20) |= lo(val);
 }
 
 template <>
@@ -410,8 +410,6 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 
 template <>
 void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
-
   // If the destination is .plt.got, we save the current r2, read an
   // address of a function descriptor from .got, restore %r2 and jump
   // to the function.
@@ -466,26 +464,29 @@ void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
   static_assert(E::thunk_size == sizeof(plt_thunk));
   static_assert(E::thunk_size == sizeof(local_thunk));
 
-  for (i64 i = 0; i < symbols.size(); i++) {
-    Symbol<E> &sym = *symbols[i];
-    ub32 *loc = (ub32 *)(buf + i * E::thunk_size);
+  u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
+  u64 P = output_section.shdr.sh_addr + offset;
 
-    if (sym.has_got(ctx)) {
-      memcpy(loc, pltgot_thunk, sizeof(pltgot_thunk));
-      i64 val = sym.get_got_addr(ctx) - ctx.extra.TOC->value;
-      loc[1] |= higha(val);
-      loc[2] |= lo(val);
-    } else if(sym.has_plt(ctx)) {
-      memcpy(loc, plt_thunk, sizeof(plt_thunk));
-      i64 val = sym.get_gotplt_addr(ctx) - ctx.extra.TOC->value;
-      loc[1] |= higha(val);
-      loc[2] |= lo(val);
+  for (Symbol<E> *sym : symbols) {
+    if (sym->has_got(ctx)) {
+      i64 val = sym->get_got_addr(ctx) - ctx.extra.TOC->value;
+      memcpy(buf, pltgot_thunk, sizeof(pltgot_thunk));
+      *(ub32 *)(buf + 4) |= higha(val);
+      *(ub32 *)(buf + 8) |= lo(val);
+    } else if(sym->has_plt(ctx)) {
+      i64 val = sym->get_gotplt_addr(ctx) - ctx.extra.TOC->value;
+      memcpy(buf, plt_thunk, sizeof(plt_thunk));
+      *(ub32 *)(buf + 4) |= higha(val);
+      *(ub32 *)(buf + 8) |= lo(val);
     } else {
-      memcpy(loc, local_thunk, sizeof(local_thunk));
-      i64 val = sym.get_addr(ctx, NO_OPD) - ctx.extra.TOC->value;
-      loc[0] |= higha(val);
-      loc[1] |= lo(val);
+      i64 val = sym->get_addr(ctx, NO_OPD) - ctx.extra.TOC->value;
+      memcpy(buf, local_thunk, sizeof(local_thunk));
+      *(ub32 *)buf |= higha(val);
+      *(ub32 *)(buf + 4) |= lo(val);
     }
+
+    buf += E::thunk_size;
+    P += E::thunk_size;
   }
 }
 
