@@ -43,8 +43,8 @@
 # of the mold linker of the same version will have the exactly same set of
 # features and behave exactly the same.
 
-cmake_minimum_required(VERSION 3.13)
-project(mold VERSION 2.1.0)
+cmake_minimum_required(VERSION 3.14)
+project(mold VERSION 2.2.0)
 
 include(CMakeDependentOption)
 include(GNUInstallDirs)
@@ -66,6 +66,7 @@ if(NOT "${CMAKE_CXX_COMPILER_FRONTEND_VARIANT}" STREQUAL "MSVC")
     -fno-asynchronous-unwind-tables
     -Wno-sign-compare
     -Wno-unused-function
+    -Wunused-variable
     -ggnu-pubnames)
 endif()
 
@@ -97,7 +98,7 @@ if(MOLD_USE_TSAN)
   target_link_options(mold PRIVATE -fsanitize=thread)
 endif()
 
-# Statically-link libstdc++ and libcrypto if -DMOLD_MOSTLY_STATIC=ON.
+# Statically-link libstdc++ if -DMOLD_MOSTLY_STATIC=ON.
 #
 # This option is intended to be used by `./dist.sh` script to create a
 # mold binary that works on various Linux distros. You probably don't
@@ -105,13 +106,12 @@ endif()
 option(MOLD_MOSTLY_STATIC "Statically link libstdc++ and libcrypto" OFF)
 if(MOLD_MOSTLY_STATIC)
   target_link_options(mold PRIVATE -static-libstdc++)
-  target_link_libraries(mold PRIVATE libcrypto.a)
 endif()
 
 # Find zlib. If libz.so is not found, we compile a bundled one and
 # statically-link it to mold.
 find_package(ZLIB QUIET)
-if(ZLIB_FOUND)
+if(ZLIB_FOUND AND NOT MOLD_MOSTLY_STATIC)
   target_link_libraries(mold PRIVATE ZLIB::ZLIB)
 else()
   add_subdirectory(third-party/zlib EXCLUDE_FROM_ALL)
@@ -120,12 +120,23 @@ else()
   target_link_libraries(mold PRIVATE zlibstatic)
 endif()
 
-# Find zstd compression library. Just like zlib, if libzstd.so is not
-# found, we compile a bundled one and statically-link it to mold.
+# Find BLAKE3 cryptographic hash library. Just like zlib, if libblkae3.so
+# is not found, we compile a bundled one and statically-link it to mold.
+find_package(BLAKE3 QUIET)
+if(BLAKE3_FOUND AND NOT MOLD_MOSTLY_STATIC)
+  target_link_libraries(mold PRIVATE BLAKE3::blake3)
+else()
+  add_subdirectory(third-party/blake3/c EXCLUDE_FROM_ALL)
+  target_link_libraries(mold PRIVATE blake3)
+  target_include_directories(mold PUBLIC third-party/blake3/c)
+endif()
+
+# Find zstd compression library. If libzstd.so is not found, we compile a
+# bundled one and statically-link it to mold.
 include(CheckIncludeFile)
 check_include_file(zstd.h HAVE_ZSTD_H)
 
-if(HAVE_ZSTD_H)
+if(HAVE_ZSTD_H AND NOT MOLD_MOSTLY_STATIC)
   target_link_libraries(mold PRIVATE zstd)
 else()
   add_subdirectory(third-party/zstd/build/cmake EXCLUDE_FROM_ALL)
@@ -236,11 +247,6 @@ if(NOT APPLE AND NOT WIN32)
   target_sources(mold-wrapper PRIVATE elf/mold-wrapper.c)
 endif()
 
-if(NOT APPLE AND NOT WIN32 AND NOT MOLD_MOSTLY_STATIC)
-  find_package(OpenSSL REQUIRED COMPONENTS Crypto)
-  target_link_libraries(mold PRIVATE OpenSSL::Crypto)
-endif()
-
 # If atomics doesn't work by default, add -latomic.
 # We need the flag on riscv, armv6 and m68k.
 include(CheckCXXSourceCompiles)
@@ -289,7 +295,7 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR})
 # on a multicore machine.
 list(APPEND MOLD_ELF_TARGETS
   X86_64 I386 ARM64 ARM32 RV32LE RV32BE RV64LE RV64BE PPC32 PPC64V1 PPC64V2
-  S390X SPARC64 M68K SH4 ALPHA MIPS64LE MIPS64BE LOONGARCH32 LOONGARCH64)
+  S390X SPARC64 M68K SH4 ALPHA LOONGARCH32 LOONGARCH64)
 
 list(APPEND MOLD_ELF_TEMPLATE_FILES
   elf/arch-loongarch.cc
@@ -329,10 +335,12 @@ list(APPEND MOLD_MACHO_TEMPLATE_FILES
 
 function(mold_instantiate_templates SOURCE TARGET)
   set(PATH ${CMAKE_BINARY_DIR}/${SOURCE}.${TARGET}.cc)
-  file(WRITE ${PATH} "#define MOLD_${TARGET} 1
+  if(NOT EXISTS ${PATH})
+    file(WRITE ${PATH} "#define MOLD_${TARGET} 1
 #define MOLD_TARGET ${TARGET}
 #include \"${CMAKE_SOURCE_DIR}/${SOURCE}\"
 ")
+  endif()
   target_sources(mold PRIVATE ${PATH})
 endfunction()
 
@@ -367,7 +375,6 @@ target_sources(mold PRIVATE
   elf/arch-arm64.cc
   elf/arch-i386.cc
   elf/arch-m68k.cc
-  elf/arch-mips64.cc
   elf/arch-ppc32.cc
   elf/arch-ppc64v1.cc
   elf/arch-ppc64v2.cc

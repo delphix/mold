@@ -160,18 +160,19 @@ u64 get_tp_addr(Context<E> &ctx) {
     // of TLV template image when copying TLVs to the TLS block, so we need
     // to offset it.
     return align_down(phdr->p_vaddr - sizeof(Word<E>) * 2, phdr->p_align);
-  } else if constexpr (is_ppc<E> || is_m68k<E> || is_mips<E>) {
-    // On PPC and m68k, TP is 0x7000 (28 KiB) past the beginning of the TLV
-    // block to maximize the addressable range for load/store instructions
-    // with 16-bits signed immediates. It's not exactly 0x8000 (32 KiB) off
-    // because there's a small implementation-defined piece of data before
-    // the TLV block, and the runtime wants to access them efficiently too.
+  } else if constexpr (is_ppc<E> || is_m68k<E>) {
+    // On PowerPC and m68k, TP is 0x7000 (28 KiB) past the beginning
+    // of the TLV block to maximize the addressable range of load/store
+    // instructions with 16-bits signed immediates. It's not exactly 0x8000
+    // (32 KiB) off because there's a small implementation-defined piece of
+    // data before the initial TLV block, and the runtime wants to access
+    // them efficiently too.
     return phdr->p_vaddr + 0x7000;
   } else {
-    // RISC-V just uses the beginning of the main executable's TLV block as
-    // TP. RISC-V load/store instructions usually take 12-bits signed
-    // immediates, so the beginning of the TLS block ± 2 KiB is accessible
-    // with a single load/store instruction.
+    // RISC-V and LoongArch just uses the beginning of the main executable's
+    // TLV block as TP. Their load/store instructions usually take 12-bits
+    // signed immediates, so the beginning of the TLS block ± 2 KiB is
+    // accessible with a single load/store instruction.
     static_assert(is_riscv<E> || is_loongarch<E>);
     return phdr->p_vaddr;
   }
@@ -185,12 +186,12 @@ u64 get_dtp_addr(Context<E> &ctx) {
   if (!phdr)
     return 0;
 
-  if constexpr (is_ppc<E> || is_m68k<E> || is_mips<E>) {
-    // On PPC64 and m68k, R_DTPOFF is resolved to the address 0x8000
+  if constexpr (is_ppc<E> || is_m68k<E>) {
+    // On PowerPC and m68k, R_DTPOFF is resolved to the address 0x8000
     // (32 KiB) past the start of the TLS block. The bias maximizes the
-    // accessible range for load/store instructions with 16-bits signed
-    // immediates. That is, if the offset were right at the beginning of
-    // the start of the TLS block, the half of addressible space (negative
+    // accessible range of load/store instructions with 16-bits signed
+    // immediates. That is, if the offset were right at the beginning of the
+    // start of the TLS block, the half of addressible space (negative
     // immediates) would have been wasted.
     return phdr->p_vaddr + 0x8000;
   } else if constexpr (is_riscv<E>) {

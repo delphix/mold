@@ -8,6 +8,7 @@
 #include <bitset>
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
@@ -298,7 +299,7 @@ inline u64 bits(u64 val, u64 hi, u64 lo) {
 
 inline i64 sign_extend(u64 val, i64 size) {
   return (i64)(val << (63 - size)) >> (63 - size);
-};
+}
 
 template <typename T, typename Compare = std::less<T>>
 void update_minimum(std::atomic<T> &atomic, u64 new_val, Compare cmp = {}) {
@@ -478,53 +479,72 @@ public:
   }
 
   ~ConcurrentMap() {
-    if (keys) {
-      free((void *)keys);
-      free((void *)key_sizes);
-      free((void *)values);
-    }
+    free(entries);
   }
 
+  // In order to avoid unnecessary cache-line false sharing, we want
+  // to make this object to be aligned to a reasonably large
+  // power-of-two address.
+  struct alignas(32) Entry {
+    std::atomic<const char *> key;
+    T value;
+    u32 keylen;
+  };
+
   void resize(i64 nbuckets) {
-    this->~ConcurrentMap();
+    this->nbuckets = std::max<i64>(MIN_NBUCKETS, bit_ceil(nbuckets));
 
-    nbuckets = std::max<i64>(MIN_NBUCKETS, bit_ceil(nbuckets));
+    i64 sz = sizeof(Entry) * this->nbuckets;
+    free(entries);
 
-    this->nbuckets = nbuckets;
-    keys = (std::atomic<const char *> *)calloc(nbuckets, sizeof(char *));
-    key_sizes = (u32 *)malloc(nbuckets * sizeof(u32));
-    values = (T *)malloc(nbuckets * sizeof(T));
+#if _WIN32
+    // Even though std::aligned_alloc is defined in C++17, MSVC doesn't
+    // seem to provide that function.
+    entries = (Entry *)_aligned_malloc(sz, alignof(Entry));
+#else
+    entries = (Entry *)std::aligned_alloc(alignof(Entry), sz);
+#endif
+
+    memset(entries, 0, sz);
   }
 
   std::pair<T *, bool> insert(std::string_view key, u64 hash, const T &val) {
-    if (!keys)
-      return {nullptr, false};
-
     assert(has_single_bit(nbuckets));
+
     i64 idx = hash & (nbuckets - 1);
     i64 retry = 0;
 
     while (retry < MAX_RETRY) {
-      const char *ptr = keys[idx].load(std::memory_order_acquire);
-      if (ptr == marker) {
-        pause();
+      Entry &ent = entries[idx];
+      const char *ptr = nullptr;
+      bool claimed = ent.key.compare_exchange_weak(ptr, (char *)-1,
+                                                   std::memory_order_acquire);
+
+      // If we successfully claimed the ownership of an unused slot,
+      // copy values to it.
+      if (claimed) {
+        new (&ent.value) T(val);
+        ent.keylen = key.size();
+        ent.key.store(key.data(), std::memory_order_release);
+        return {&ent.value, true};
+      }
+
+      // Loop on a spurious failure.
+      if (ptr == nullptr)
         continue;
+
+      // If someone is copying values to the slot, do busy wait.
+      while (ptr == (char *)-1) {
+        pause();
+        ptr = ent.key.load(std::memory_order_acquire);
       }
 
-      if (ptr == nullptr) {
-        if (!keys[idx].compare_exchange_weak(ptr, marker,
-                                             std::memory_order_acquire))
-          continue;
-        new (values + idx) T(val);
-        key_sizes[idx] = key.size();
-        keys[idx].store(key.data(), std::memory_order_release);
-        return {values + idx, true};
-      }
+      // If the same key is already present, this is the slot we are
+      // looking for.
+      if (key == std::string_view(ptr, ent.keylen))
+        return {&ent.value, false};
 
-      if (key.size() == key_sizes[idx] &&
-          memcmp(ptr, key.data(), key_sizes[idx]) == 0)
-        return {values + idx, false};
-
+      // Otherwise, move on to the next slot.
       u64 mask = nbuckets / NUM_SHARDS - 1;
       idx = (idx & ~mask) | ((idx + 1) & mask);
       retry++;
@@ -535,16 +555,20 @@ public:
   }
 
   const char *get_key(i64 idx) {
-    return keys[idx].load(std::memory_order_relaxed);
+    return entries[idx].key.load(std::memory_order_relaxed);
+  }
+
+  i64 get_idx(T *value) const {
+    uintptr_t addr = (uintptr_t)value - (uintptr_t)value % sizeof(Entry);
+    return (Entry *)addr - entries;
   }
 
   static constexpr i64 MIN_NBUCKETS = 2048;
   static constexpr i64 NUM_SHARDS = 16;
   static constexpr i64 MAX_RETRY = 128;
 
+  Entry *entries = nullptr;
   i64 nbuckets = 0;
-  u32 *key_sizes = nullptr;
-  T *values = nullptr;
 
 private:
   static void pause() {
@@ -554,10 +578,6 @@ private:
     asm volatile("yield");
 #endif
   }
-
-private:
-  std::atomic<const char *> *keys = nullptr;
-  static constexpr const char *marker = "marker";
 };
 
 //

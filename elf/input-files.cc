@@ -104,7 +104,7 @@ static bool is_debug_section(const ElfShdr<E> &shdr, std::string_view name) {
 
 template <typename E>
 void
-ObjectFile<E>::read_note_gnu_property(Context<E> &ctx, const ElfShdr<E> &shdr) {
+ObjectFile<E>::parse_note_gnu_property(Context<E> &ctx, const ElfShdr<E> &shdr) {
   std::string_view data = this->get_string(ctx, shdr);
 
   while (!data.empty()) {
@@ -140,19 +140,11 @@ ObjectFile<E>::read_note_gnu_property(Context<E> &ctx, const ElfShdr<E> &shdr) {
   }
 }
 
-static inline std::string_view read_string(std::string_view &str) {
-  i64 pos = str.find_first_of('\0');
-  std::string_view val = str.substr(0, pos);
-  str = str.substr(pos + 1);
-  return val;
-}
-
 // <format-version>
 // [ <section-length> "vendor-name" <file-tag> <size> <attribute>*]+ ]*
 template <typename E>
 static void read_riscv_attributes(Context<E> &ctx, ObjectFile<E> &file,
                                   std::string_view data) {
-  const char *begin = data.data();
   if (data.empty())
     Fatal(ctx) << file << ": corrupted .riscv.attributes section";
 
@@ -183,9 +175,12 @@ static void read_riscv_attributes(Context<E> &ctx, ObjectFile<E> &file,
       case ELF_TAG_RISCV_STACK_ALIGN:
         file.extra.stack_align = read_uleb(&p);
         break;
-      case ELF_TAG_RISCV_ARCH:
-        file.extra.arch = read_string(p);
+      case ELF_TAG_RISCV_ARCH: {
+        i64 pos = p.find_first_of('\0');
+        file.extra.arch = p.substr(0, pos);
+        p = p.substr(pos + 1);
         break;
+      }
       case ELF_TAG_RISCV_UNALIGNED_ACCESS:
         file.extra.unaligned_access = read_uleb(&p);
         break;
@@ -194,26 +189,6 @@ static void read_riscv_attributes(Context<E> &ctx, ObjectFile<E> &file,
       }
     }
   }
-}
-
-template <typename E>
-static u64 read_mips_gp0(Context<E> &ctx, InputSection<E> &isec) {
-  std::string_view data = isec.contents;
-  while (!data.empty()) {
-    if (data.size() < sizeof(MipsOptions<E>))
-      Fatal(ctx) << isec << ": corrupted .MIPS.options section";
-
-    MipsOptions<E> *opt = (MipsOptions<E> *)data.data();
-    if (opt->kind == ODK_REGINFO) {
-      if (data.size() < sizeof(MipsOptions<E>) + sizeof(MipsRegInfo<E>))
-        Fatal(ctx) << isec << ": corrupted .MIPS.options section";
-      MipsRegInfo<E> *info = (MipsRegInfo<E> *)(opt + 1);
-      return info->ri_gp_value;
-    }
-
-    data = data.substr(opt->size);
-  }
-  return 0;
 }
 
 template <typename E>
@@ -295,11 +270,8 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
       // area in GNU linkers. We ignore that section because silently
       // making the stack area executable is too dangerous. Tell our
       // users about the difference if that matters.
-      //
-      // MIPS object files don't contain .note.GNU-stack for some reason,
-      // so ignore this error on MIPS.
       if (name == ".note.GNU-stack" && !ctx.arg.relocatable) {
-        if ((shdr.sh_flags & SHF_EXECINSTR) && !is_mips<E>) {
+        if (shdr.sh_flags & SHF_EXECINSTR) {
           if (!ctx.arg.z_execstack && !ctx.arg.z_execstack_if_needed)
             Warn(ctx) << *this << ": this file may cause a segmentation"
               " fault because it requires an executable stack. See"
@@ -311,7 +283,7 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
       }
 
       if (name == ".note.gnu.property") {
-        read_note_gnu_property(ctx, shdr);
+        parse_note_gnu_property(ctx, shdr);
         continue;
       }
 
@@ -350,19 +322,12 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
         continue;
       }
 
+      if (name == ".eh_frame")
+        eh_frame_section = this->sections[i].get();
+
       if constexpr (is_ppc32<E>)
         if (name == ".got2")
           extra.got2 = this->sections[i].get();
-
-      if constexpr (is_mips<E>) {
-        if (name == ".MIPS.abiflags") {
-          extra.abi_flags = std::move(this->sections[i]);
-          continue;
-        }
-
-        if (name == ".MIPS.options")
-          extra.gp0 = read_mips_gp0(ctx, *this->sections[i]);
-      }
 
       // Save debug sections for --gdb-index.
       if (ctx.arg.gdb_index) {
@@ -423,16 +388,6 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
   }
 }
 
-template <typename E>
-void ObjectFile<E>::initialize_ehframe_sections(Context<E> &ctx) {
-  for (i64 i = 0; i < sections.size(); i++) {
-    std::unique_ptr<InputSection<E>> &isec = sections[i];
-    if (isec && isec->is_alive && isec->name() == ".eh_frame") {
-      read_ehframe(ctx, *isec);
-    }
-  }
-}
-
 // .eh_frame contains data records explaining how to handle exceptions.
 // When an exception is thrown, the runtime searches a record from
 // .eh_frame with the current program counter as a key. A record that
@@ -463,7 +418,11 @@ void ObjectFile<E>::initialize_ehframe_sections(Context<E> &ctx) {
 //
 // This function parses an input .eh_frame section.
 template <typename E>
-void ObjectFile<E>::read_ehframe(Context<E> &ctx, InputSection<E> &isec) {
+void ObjectFile<E>::parse_ehframe(Context<E> &ctx) {
+  if (!eh_frame_section)
+    return;
+
+  InputSection<E> &isec = *eh_frame_section;
   std::span<ElfRel<E>> rels = isec.get_rels(ctx);
   i64 cies_begin = cies.size();
   i64 fdes_begin = fdes.size();
@@ -953,7 +912,7 @@ void ObjectFile<E>::parse(Context<E> &ctx) {
   initialize_sections(ctx);
   initialize_symbols(ctx);
   sort_relocations(ctx);
-  initialize_ehframe_sections(ctx);
+  parse_ehframe(ctx);
 }
 
 // Symbols with higher priorities overwrites symbols with lower priorities.
@@ -1109,11 +1068,10 @@ void ObjectFile<E>::scan_relocations(Context<E> &ctx) {
     for (ElfRel<E> &rel : cie.get_rels()) {
       Symbol<E> &sym = *this->symbols[rel.r_sym];
 
-      if constexpr (!is_mips<E>)
-        if (ctx.arg.pic && rel.r_type == E::R_ABS)
-          Error(ctx) << *this << ": relocation " << rel << " in .eh_frame can"
-                     << " not be used when making a position-independent output;"
-                     << " recompile with -fPIE or -fPIC";
+      if (ctx.arg.pic && rel.r_type == E::R_ABS)
+        Error(ctx) << *this << ": relocation " << rel << " in .eh_frame can"
+                   << " not be used when making a position-independent output;"
+                   << " recompile with -fPIE or -fPIC";
 
       if (sym.is_imported) {
         if (sym.get_type() != STT_FUNC)
@@ -1226,9 +1184,6 @@ void ObjectFile<E>::compute_symtab_size(Context<E> &ctx) {
   this->output_sym_indices.resize(this->elf_syms.size(), -1);
 
   auto is_alive = [&](Symbol<E> &sym) -> bool {
-    if (!ctx.arg.gc_sections)
-      return true;
-
     if (SectionFragment<E> *frag = sym.get_frag())
       return frag->is_alive;
     if (InputSection<E> *isec = sym.get_input_section())
@@ -1274,30 +1229,29 @@ void ObjectFile<E>::populate_symtab(Context<E> &ctx) {
   u8 *strtab_base = ctx.buf + ctx.strtab->shdr.sh_offset;
   i64 strtab_off = this->strtab_offset;
 
-  auto write_sym = [&](Symbol<E> &sym, i64 &symtab_idx) {
+  auto write_sym = [&](Symbol<E> &sym, i64 idx) {
     U32<E> *xindex = nullptr;
     if (ctx.symtab_shndx)
-      xindex = (U32<E> *)(ctx.buf + ctx.symtab_shndx->shdr.sh_offset) + symtab_idx;
+      xindex = (U32<E> *)(ctx.buf + ctx.symtab_shndx->shdr.sh_offset) + idx;
 
-    symtab_base[symtab_idx++] = to_output_esym(ctx, sym, strtab_off, xindex);
+    symtab_base[idx] = to_output_esym(ctx, sym, strtab_off, xindex);
     strtab_off += write_string(strtab_base + strtab_off, sym.name());
   };
 
   i64 local_symtab_idx = this->local_symtab_idx;
   i64 global_symtab_idx = this->global_symtab_idx;
-  for (i64 i = 1; i < this->first_global; i++) {
-    Symbol<E> &sym = *this->symbols[i];
-    if (sym.write_to_symtab)
-      write_sym(sym, local_symtab_idx);
-  }
+
+  for (i64 i = 1; i < this->first_global; i++)
+    if (Symbol<E> &sym = *this->symbols[i]; sym.write_to_symtab)
+      write_sym(sym, local_symtab_idx++);
 
   for (i64 i = this->first_global; i < this->elf_syms.size(); i++) {
     Symbol<E> &sym = *this->symbols[i];
     if (sym.file == this && sym.write_to_symtab) {
       if (sym.is_local(ctx))
-        write_sym(sym, local_symtab_idx);
+        write_sym(sym, local_symtab_idx++);
       else
-        write_sym(sym, global_symtab_idx);
+        write_sym(sym, global_symtab_idx++);
     }
   }
 }
@@ -1328,7 +1282,6 @@ SharedFile<E>::create(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 template <typename E>
 SharedFile<E>::SharedFile(Context<E> &ctx, MappedFile<Context<E>> *mf)
   : InputFile<E>(ctx, mf) {
-  this->is_needed = ctx.as_needed;
   this->is_alive = !ctx.as_needed;
 }
 
@@ -1483,7 +1436,7 @@ SharedFile<E>::mark_live_objects(Context<E> &ctx,
     if (sym.is_traced)
       print_trace_symbol(ctx, *this, esym, sym);
 
-    if (esym.is_undef() && !esym.is_weak() && sym.file &&
+    if (esym.is_undef() && !esym.is_weak() && sym.file && !sym.file->is_dso &&
         !sym.file->is_alive.test_and_set()) {
       feeder(sym.file);
 
@@ -1540,7 +1493,8 @@ bool SharedFile<E>::is_readonly(Symbol<E> *sym) {
   u64 val = sym->esym().st_value;
 
   for (ElfPhdr<E> &phdr : this->get_phdrs())
-    if (phdr.p_type == PT_LOAD && !(phdr.p_flags & PF_W) &&
+    if ((phdr.p_type == PT_LOAD || phdr.p_type == PT_GNU_RELRO) &&
+        !(phdr.p_flags & PF_W) &&
         phdr.p_vaddr <= val && val < phdr.p_vaddr + phdr.p_memsz)
       return true;
   return false;

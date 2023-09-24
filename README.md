@@ -1,8 +1,5 @@
 # mold: A Modern Linker
 
-[![CI](https://github.com/rui314/mold/actions/workflows/ci.yml/badge.svg)](https://github.com/rui314/mold/actions/workflows/ci.yml)
-[![build result](https://build.opensuse.org/projects/home:marxin:mold/packages/mold/badge.svg?type=default)](https://build.opensuse.org/package/show/home:marxin:mold/mold)
-
 <i>This repository contains a free version of the mold linker.
 If you are looking for a commercial version that supports macOS
 please visit the
@@ -74,11 +71,11 @@ necessary packages. You may need to run it as root.
 git clone https://github.com/rui314/mold.git
 mkdir mold/build
 cd mold/build
-git checkout v2.1.0
+git checkout v2.2.0
 ../install-build-deps.sh
 cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=c++ ..
 cmake --build . -j $(nproc)
-sudo cmake --install .
+sudo cmake --build . --target install
 ```
 
 You might need to pass a C++20 compiler command name to `cmake`. In the
