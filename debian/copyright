@@ -2,8 +2,7 @@ Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: mold
 Upstream-Contact: ruiu@cs.stanford.edu
 Source: https://github.com/rui314/mold
-Files-Excluded: third-party/mimalloc/docs/jquery.js
-                third-party/mimalloc/bin/mimalloc-redirect.dll
+Files-Excluded: third-party/mimalloc/bin/mimalloc-redirect.dll
                 third-party/mimalloc/bin/mimalloc-redirect32.dll
                 third-party/mimalloc/bin/minject.exe
                 third-party/mimalloc/bin/minject32.exe
