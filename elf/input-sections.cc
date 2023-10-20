@@ -37,8 +37,7 @@ static i64 to_p2align(u64 alignment) {
 }
 
 template <typename E>
-InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file,
-                              std::string_view name, i64 shndx)
+InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file, i64 shndx)
   : file(file), shndx(shndx) {
   if (shndx < file.elf_sections.size())
     contents = {(char *)file.mf->data + shdr().sh_offset, (size_t)shdr().sh_size};
@@ -372,7 +371,7 @@ static void apply_absrel(Context<E> &ctx, InputSection<E> &isec,
   bool writable = (isec.shdr().sh_flags & SHF_WRITE);
 
   auto emit_abs_dynrel = [&] {
-    *dynrel++ = ElfRel<E>(P, E::R_DYNAMIC, sym.get_dynsym_idx(ctx), A);
+    *dynrel++ = ElfRel<E>(P, E::R_ABS, sym.get_dynsym_idx(ctx), A);
     if (ctx.arg.apply_dynamic_relocs)
       *(Word<E> *)loc = A;
   };
@@ -457,6 +456,18 @@ void InputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
       apply_reloc_alloc(ctx, buf);
     else
       apply_reloc_nonalloc(ctx, buf);
+
+    if constexpr (is_x86_64<E>) {
+      if (ctx.arg.z_rewrite_endbr) {
+        // Rewrite the leading endbr instruction with a nop if the section
+        // is not address-taken.
+        u8 endbr[] = {0xf3, 0x0f, 0x1e, 0xfa};
+        u8 nop[] = {0x0f, 0x1f, 0x40, 0x00};
+        if (!address_taken && (shdr().sh_flags & SHF_EXECINSTR) &&
+            sh_size >= 4 && memcmp(buf, endbr, 4) == 0)
+          memcpy(buf, nop, 4);
+      }
+    }
   }
 }
 

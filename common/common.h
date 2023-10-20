@@ -225,8 +225,14 @@ struct Atomic : std::atomic<T> {
   void operator=(T val) { store(val); }
   operator T() const { return load(); }
 
-  void store(T val) { std::atomic<T>::store(val, relaxed); }
-  T load() const { return std::atomic<T>::load(relaxed); }
+  void store(T val, std::memory_order order = relaxed) {
+    std::atomic<T>::store(val, order);
+  }
+
+  T load(std::memory_order order = relaxed) const {
+    return std::atomic<T>::load(order);
+  }
+
   T exchange(T val) { return std::atomic<T>::exchange(val, relaxed); }
   T operator|=(T val) { return std::atomic<T>::fetch_or(val, relaxed); }
   T operator++() { return std::atomic<T>::fetch_add(1, relaxed) + 1; }
@@ -241,6 +247,85 @@ struct Atomic : std::atomic<T> {
     // early test tends to improve performance in the ~20% ballpark.
     return load() || exchange(true);
   }
+};
+
+//
+// perf.cc
+//
+
+// Counter is used to collect statistics numbers.
+class Counter {
+public:
+  Counter(std::string_view name, i64 value = 0) : name(name), values(value) {
+    static std::mutex mu;
+    std::scoped_lock lock(mu);
+    instances.push_back(this);
+  }
+
+  Counter &operator++(int) {
+    if (enabled) [[unlikely]]
+      values.local()++;
+    return *this;
+  }
+
+  Counter &operator+=(int delta) {
+    if (enabled) [[unlikely]]
+      values.local() += delta;
+    return *this;
+  }
+
+  static void print();
+
+  static inline bool enabled = false;
+
+private:
+  i64 get_value();
+
+  std::string_view name;
+  tbb::enumerable_thread_specific<i64> values;
+
+  static inline std::vector<Counter *> instances;
+};
+
+// Timer and TimeRecord records elapsed time (wall clock time)
+// used by each pass of the linker.
+struct TimerRecord {
+  TimerRecord(std::string name, TimerRecord *parent = nullptr);
+  void stop();
+
+  std::string name;
+  TimerRecord *parent;
+  tbb::concurrent_vector<TimerRecord *> children;
+  i64 start;
+  i64 end;
+  i64 user;
+  i64 sys;
+  bool stopped = false;
+};
+
+void
+print_timer_records(tbb::concurrent_vector<std::unique_ptr<TimerRecord>> &);
+
+template <typename Context>
+class Timer {
+public:
+  Timer(Context &ctx, std::string name, Timer *parent = nullptr) {
+    record = new TimerRecord(name, parent ? parent->record : nullptr);
+    ctx.timer_records.push_back(std::unique_ptr<TimerRecord>(record));
+  }
+
+  Timer(const Timer &) = delete;
+
+  ~Timer() {
+    record->stop();
+  }
+
+  void stop() {
+    record->stop();
+  }
+
+private:
+  TimerRecord *record;
 };
 
 //
@@ -486,7 +571,7 @@ public:
   // to make this object to be aligned to a reasonably large
   // power-of-two address.
   struct alignas(32) Entry {
-    std::atomic<const char *> key;
+    Atomic<const char *> key;
     T value;
     u32 keylen;
   };
@@ -555,7 +640,7 @@ public:
   }
 
   const char *get_key(i64 idx) {
-    return entries[idx].key.load(std::memory_order_relaxed);
+    return entries[idx].key;
   }
 
   i64 get_idx(T *value) const {
@@ -594,14 +679,53 @@ public:
   virtual ~OutputFile() = default;
 
   u8 *buf = nullptr;
+  std::vector<u8> buf2;
   std::string path;
-  i64 filesize;
-  bool is_mmapped;
+  i64 fd = -1;
+  i64 filesize = 0;
+  bool is_mmapped = false;
   bool is_unmapped = false;
 
 protected:
   OutputFile(std::string path, i64 filesize, bool is_mmapped)
     : path(path), filesize(filesize), is_mmapped(is_mmapped) {}
+};
+
+template <typename Context>
+class MallocOutputFile : public OutputFile<Context> {
+public:
+  MallocOutputFile(Context &ctx, std::string path, i64 filesize, i64 perm)
+    : OutputFile<Context>(path, filesize, false), perm(perm) {
+    this->buf = (u8 *)malloc(filesize);
+    if (!this->buf)
+      Fatal(ctx) << "malloc failed";
+  }
+
+  ~MallocOutputFile() {
+    free(this->buf);
+  }
+
+  void close(Context &ctx) override {
+    Timer t(ctx, "close_file");
+    FILE *fp;
+
+    if (this->path == "-") {
+      fp = stdout;
+    } else {
+      i64 fd = ::open(this->path.c_str(), O_RDWR | O_CREAT, perm);
+      if (fd == -1)
+        Fatal(ctx) << "cannot open " << this->path << ": " << errno_string();
+      fp = fdopen(fd, "w");
+    }
+
+    fwrite(this->buf, this->filesize, 1, fp);
+    if (!this->buf2.empty())
+      fwrite(this->buf2.data(), this->buf2.size(), 1, fp);
+    fclose(fp);
+  }
+
+private:
+  i64 perm;
 };
 
 //
@@ -740,85 +864,6 @@ private:
 };
 
 //
-// perf.cc
-//
-
-// Counter is used to collect statistics numbers.
-class Counter {
-public:
-  Counter(std::string_view name, i64 value = 0) : name(name), values(value) {
-    static std::mutex mu;
-    std::scoped_lock lock(mu);
-    instances.push_back(this);
-  }
-
-  Counter &operator++(int) {
-    if (enabled) [[unlikely]]
-      values.local()++;
-    return *this;
-  }
-
-  Counter &operator+=(int delta) {
-    if (enabled) [[unlikely]]
-      values.local() += delta;
-    return *this;
-  }
-
-  static void print();
-
-  static inline bool enabled = false;
-
-private:
-  i64 get_value();
-
-  std::string_view name;
-  tbb::enumerable_thread_specific<i64> values;
-
-  static inline std::vector<Counter *> instances;
-};
-
-// Timer and TimeRecord records elapsed time (wall clock time)
-// used by each pass of the linker.
-struct TimerRecord {
-  TimerRecord(std::string name, TimerRecord *parent = nullptr);
-  void stop();
-
-  std::string name;
-  TimerRecord *parent;
-  tbb::concurrent_vector<TimerRecord *> children;
-  i64 start;
-  i64 end;
-  i64 user;
-  i64 sys;
-  bool stopped = false;
-};
-
-void
-print_timer_records(tbb::concurrent_vector<std::unique_ptr<TimerRecord>> &);
-
-template <typename Context>
-class Timer {
-public:
-  Timer(Context &ctx, std::string name, Timer *parent = nullptr) {
-    record = new TimerRecord(name, parent ? parent->record : nullptr);
-    ctx.timer_records.push_back(std::unique_ptr<TimerRecord>(record));
-  }
-
-  Timer(const Timer &) = delete;
-
-  ~Timer() {
-    record->stop();
-  }
-
-  void stop() {
-    record->stop();
-  }
-
-private:
-  TimerRecord *record;
-};
-
-//
 // tar.cc
 //
 
@@ -905,9 +950,9 @@ MappedFile<Context> *MappedFile<Context>::open(Context &ctx, std::string path) {
 
   i64 fd;
 #ifdef _WIN32
-    fd = ::_open(path.c_str(), O_RDONLY);
+  fd = ::_open(path.c_str(), O_RDONLY);
 #else
-    fd = ::open(path.c_str(), O_RDONLY);
+  fd = ::open(path.c_str(), O_RDONLY);
 #endif
 
   if (fd == -1) {
@@ -943,7 +988,7 @@ MappedFile<Context> *MappedFile<Context>::open(Context &ctx, std::string path) {
     if (mf->data == MAP_FAILED)
       Fatal(ctx) << path << ": mmap failed: " << errno_string();
 #endif
-    }
+  }
 
   close(fd);
   return mf;

@@ -259,6 +259,7 @@ static inline bool is_hi20(const ElfRel<E> &rel) {
 template <>
 void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
   std::span<const ElfRel<E>> rels = get_rels(ctx);
+  u64 GP = ctx.__global_pointer ? ctx.__global_pointer->get_addr(ctx) : 0;
 
   ElfRel<E> *dynrel = nullptr;
   if (ctx.reldyn)
@@ -375,7 +376,9 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       write_utype(loc, S + A - P);
       break;
     case R_RISCV_PCREL_LO12_I:
-    case R_RISCV_PCREL_LO12_S: {
+    case R_RISCV_PCREL_LO12_S:
+    case R_RISCV_GPREL_LO12_I:
+    case R_RISCV_GPREL_LO12_S: {
       i64 idx2 = find_paired_reloc();
       const ElfRel<E> &rel2 = rels[idx2];
       Symbol<E> &sym2 = *file.symbols[rel2.r_sym];
@@ -399,11 +402,15 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       case R_RISCV_PCREL_HI20:
         val = S + A - P;
         break;
+      case R_RISCV_GPREL_HI20:
+        val = S + A - GP;
+        break;
       default:
         unreachable();
       }
 
-      if (rel.r_type == R_RISCV_PCREL_LO12_I)
+      if (rel.r_type == R_RISCV_PCREL_LO12_I ||
+          rel.r_type == R_RISCV_GPREL_LO12_I)
         write_itype(loc, val);
       else
         write_stype(loc, val);
@@ -559,6 +566,10 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_RISCV_RVC_JUMP:
       check(S + A - P, -(1 << 11), 1 << 11);
       write_cjtype(loc, S + A - P);
+      break;
+    case R_RISCV_GPREL_HI20:
+      check(S + A - GP, -(1LL << 31), 1LL << 31);
+      write_utype(loc, S + A - GP);
       break;
     case R_RISCV_SUB6:
       *loc = (*loc & 0b1100'0000) | ((*loc - S - A) & 0b0011'1111);
@@ -761,6 +772,10 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_RISCV_TPREL_ADD:
       check_tlsle(ctx, sym, rel);
       break;
+    case R_RISCV_GPREL_HI20:
+      if (ctx.arg.shared)
+        Fatal(ctx) << *this << ": R_RISCV_GPREL_HI20 may not be used with -shared";
+      break;
     case R_RISCV_BRANCH:
     case R_RISCV_JAL:
     case R_RISCV_PCREL_LO12_I:
@@ -781,6 +796,8 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_RISCV_ALIGN:
     case R_RISCV_RVC_BRANCH:
     case R_RISCV_RVC_JUMP:
+    case R_RISCV_GPREL_LO12_I:
+    case R_RISCV_GPREL_LO12_S:
     case R_RISCV_RELAX:
     case R_RISCV_SUB6:
     case R_RISCV_SET6:
@@ -821,7 +838,7 @@ u64 get_eflags(Context<E> &ctx) {
   return ret;
 }
 
-static bool is_resizable(Context<E> &ctx, InputSection<E> *isec) {
+static bool is_resizable(InputSection<E> *isec) {
   return isec && isec->is_alive && (isec->shdr().sh_flags & SHF_ALLOC) &&
          (isec->shdr().sh_flags & SHF_EXECINSTR);
 }
@@ -1021,7 +1038,7 @@ i64 riscv_resize_sections<E>(Context<E> &ctx) {
   // This step should only shrink sections.
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     for (std::unique_ptr<InputSection<E>> &isec : file->sections)
-      if (is_resizable(ctx, isec.get()))
+      if (is_resizable(isec.get()))
         shrink_section(ctx, *isec, use_rvc);
   });
 

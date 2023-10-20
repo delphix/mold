@@ -13,6 +13,50 @@
 
 namespace mold::elf {
 
+// Since elf_main is a template, we can't run it without a type parameter.
+// We speculatively run elf_main with X86_64, and if the speculation was
+// wrong, re-run it with an actual machine type.
+template <typename E>
+int redo_main(Context<E> &ctx, int argc, char **argv) {
+  std::string_view target = ctx.arg.emulation;
+
+  if (target == I386::target_name)
+    return elf_main<I386>(argc, argv);
+  if (target == ARM64::target_name)
+    return elf_main<ARM64>(argc, argv);
+  if (target == ARM32::target_name)
+    return elf_main<ARM32>(argc, argv);
+  if (target == RV64LE::target_name)
+    return elf_main<RV64LE>(argc, argv);
+  if (target == RV64BE::target_name)
+    return elf_main<RV64BE>(argc, argv);
+  if (target == RV32LE::target_name)
+    return elf_main<RV32LE>(argc, argv);
+  if (target == RV32BE::target_name)
+    return elf_main<RV32BE>(argc, argv);
+  if (target == PPC32::target_name)
+    return elf_main<PPC32>(argc, argv);
+  if (target == PPC64V1::target_name)
+    return elf_main<PPC64V1>(argc, argv);
+  if (target == PPC64V2::target_name)
+    return elf_main<PPC64V2>(argc, argv);
+  if (target == S390X::target_name)
+    return elf_main<S390X>(argc, argv);
+  if (target == SPARC64::target_name)
+    return elf_main<SPARC64>(argc, argv);
+  if (target == M68K::target_name)
+    return elf_main<M68K>(argc, argv);
+  if (target == SH4::target_name)
+    return elf_main<SH4>(argc, argv);
+  if (target == ALPHA::target_name)
+    return elf_main<ALPHA>(argc, argv);
+  if (target == LOONGARCH32::target_name)
+    return elf_main<LOONGARCH32>(argc, argv);
+  if (target == LOONGARCH64::target_name)
+    return elf_main<LOONGARCH64>(argc, argv);
+  unreachable();
+}
+
 template <typename E>
 void apply_exclude_libs(Context<E> &ctx) {
   Timer t(ctx, "apply_exclude_libs");
@@ -29,6 +73,14 @@ void apply_exclude_libs(Context<E> &ctx) {
           set.contains(filepath(file->archive_name).filename().string()))
         file->exclude_libs = true;
   }
+}
+
+template <typename E>
+static bool has_debug_info_section(Context<E> &ctx) {
+  for (ObjectFile<E> *file : ctx.objs)
+    if (file->debug_info)
+      return true;
+  return false;
 }
 
 template <typename E>
@@ -91,7 +143,7 @@ void create_synthetic_sections(Context<E> &ctx) {
     ctx.buildid = push(new BuildIdSection<E>);
   if (ctx.arg.eh_frame_hdr)
     ctx.eh_frame_hdr = push(new EhFrameHdrSection<E>);
-  if (ctx.arg.gdb_index)
+  if (ctx.arg.gdb_index && has_debug_info_section(ctx))
     ctx.gdb_index = push(new GdbIndexSection<E>);
   if (ctx.arg.z_relro && ctx.arg.section_order.empty() &&
       ctx.arg.z_separate_code != SEPARATE_LOADABLE_SEGMENTS)
@@ -982,8 +1034,8 @@ void check_symbol_types(Context<E> &ctx) {
       const ElfSym<E> &esym1 = sym.esym();
       const ElfSym<E> &esym2 = file->elf_syms[i];
 
-      u32 ty1 = (esym1.st_type == STT_GNU_IFUNC) ? STT_FUNC : esym1.st_type;
-      u32 ty2 = (esym2.st_type == STT_GNU_IFUNC) ? STT_FUNC : esym2.st_type;
+      u32 ty1 = (esym1.st_type == STT_GNU_IFUNC) ? (u32)STT_FUNC : esym1.st_type;
+      u32 ty2 = (esym2.st_type == STT_GNU_IFUNC) ? (u32)STT_FUNC : esym2.st_type;
 
       if (ty1 != STT_NOTYPE && ty2 != STT_NOTYPE && ty1 != ty2)
         Warn(ctx) << "symbol type mismatch: " << sym << '\n'
@@ -1672,12 +1724,85 @@ void compute_import_export(Context<E> &ctx) {
   });
 }
 
+// Compute the "address-taken" bit for each input section.
+//
+// As a space-saving optimization, we want to merge two read-only objects
+// into a single object if their contents are equivalent. That
+// optimization is called the Identical Code Folding or ICF.
+//
+// A catch is that comparing object contents is not enough to determine if
+// two objects can be merged safely; we need to take care of pointer
+// equivalence.
+//
+// In C/C++, two pointers are equivalent if and only if they are taken for
+// the same object. Merging two objects into a single object can break
+// this assumption because two distinctive pointers would become
+// equivalent as a result of merging. We can still merge one object with
+// another if no pointer to the object was taken in code, because without
+// a pointer, comparing its address becomes moot.
+//
+// In mold, each input section has an "address-taken" bit. If there is a
+// pointer-taking reference to the object, it's set to true. At the ICF
+// stage, we merge only objects whose addresses were not taken.
+//
+// For functions, address-taking relocations are separated from
+// non-address-taking ones. For example, x86-64 uses R_X86_64_PLT32 for
+// direct function calls (e.g., "call foo" to call the function foo) while
+// R_X86_64_PC32 or R_X86_64_GOT32 are used for pointer-taking operations.
+//
+// Unfortunately, for data, we can't distinguish between address-taking
+// relocations and non-address-taking ones. LLVM generates an "address
+// significance" table in the ".llvm_addrsig" section to mark symbols
+// whose addresses are taken in code. If that table is available, we use
+// that information in this function. Otherwise, we conservatively assume
+// that all data items are address-taken.
 template <typename E>
-void mark_addrsig(Context<E> &ctx) {
-  Timer t(ctx, "mark_addrsig");
+void compute_address_significance(Context<E> &ctx) {
+  Timer t(ctx, "compute_address_significance");
 
+  // Flip address-taken bit for executable sections first.
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    file->mark_addrsig(ctx);
+    for (std::unique_ptr<InputSection<E>> &src : file->sections)
+      if (src && src->is_alive && (src->shdr().sh_flags & SHF_ALLOC))
+        for (const ElfRel<E> &r : src->get_rels(ctx))
+          if (!is_func_call_rel(r))
+            if (InputSection<E> *dst = file->symbols[r.r_sym]->get_input_section())
+              if (dst->shdr().sh_flags & SHF_EXECINSTR)
+                dst->address_taken = true;
+  });
+
+  auto mark = [](Symbol<E> *sym) {
+    if (sym)
+      if (InputSection<E> *isec = sym->get_input_section())
+        isec->address_taken = true;
+  };
+
+  // Some symbols' pointer values are leaked to the dynamic section.
+  mark(get_symbol(ctx, ctx.arg.entry));
+  mark(get_symbol(ctx, ctx.arg.init));
+  mark(get_symbol(ctx, ctx.arg.fini));
+
+  // Exported symbols are conservatively considered address-taken.
+  if (ctx.dynsym)
+    for (Symbol<E> *sym : ctx.dynsym->symbols)
+      if (sym->is_exported)
+        mark(sym);
+
+  // Handle data objects.
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    if (InputSection<E> *sec = file->llvm_addrsig.get()) {
+      u8 *p = (u8 *)sec->contents.data();
+      u8 *end = p + sec->contents.size();
+      while (p != end) {
+        Symbol<E> *sym = file->symbols[read_uleb(&p)];
+        if (InputSection<E> *isec = sym->get_input_section())
+          isec->address_taken = true;
+      }
+    } else {
+      for (std::unique_ptr<InputSection<E>> &isec : file->sections)
+        if (isec && !(isec->shdr().sh_flags & SHF_EXECINSTR))
+          isec->address_taken = true;
+    }
   });
 }
 
@@ -1729,6 +1854,7 @@ void clear_padding(Context<E> &ctx) {
 //   <writable non-RELRO bss>
 //   <non-memory-allocated sections>
 //   <section header>
+//   .gdb_index
 //
 // .interp and some other linker-synthesized sections are placed at the
 // beginning of a file because they are needed by loader. Especially on
@@ -1739,6 +1865,10 @@ void clear_padding(Context<E> &ctx) {
 // included in a core crash dump even if it's truncated by ulimit. In
 // particular, if .note.gnu.build-id is in a truncated core file, you
 // can at least identify which executable has crashed.
+//
+// .gdb_index cannot be constructed before applying relocations to
+// other debug sections, so we create it after completing other part
+// of the output file and append it to the very end of the file.
 //
 // A PT_NOTE segment will contain multiple .note sections if exists,
 // but there's no way to represent a gap between .note sections.
@@ -1785,6 +1915,8 @@ void sort_output_sections_regular(Context<E> &ctx) {
     if (chunk == ctx.relplt)
       return 11;
     if (chunk == ctx.shdr)
+      return INT32_MAX - 1;
+    if (chunk == ctx.gdb_index)
       return INT32_MAX;
 
     bool alloc = (flags & SHF_ALLOC);
@@ -2188,8 +2320,9 @@ void compute_section_headers(Context<E> &ctx) {
     chunk->update_shdr(ctx);
 
   // Remove empty chunks.
-  std::erase_if(ctx.chunks, [](Chunk<E> *chunk) {
-    return chunk->kind() != OUTPUT_SECTION && chunk->shdr.sh_size == 0;
+  std::erase_if(ctx.chunks, [&](Chunk<E> *chunk) {
+    return chunk->kind() != OUTPUT_SECTION && chunk != ctx.gdb_index &&
+           chunk->shdr.sh_size == 0;
   });
 
   // Set section indices.
@@ -2592,6 +2725,7 @@ void show_stats(Context<E> &ctx) {
 
 using E = MOLD_TARGET;
 
+template int redo_main(Context<E> &, int, char **);
 template void create_internal_file(Context<E> &);
 template void apply_exclude_libs(Context<E> &);
 template void create_synthetic_sections(Context<E> &);
@@ -2622,7 +2756,7 @@ template void create_output_symtab(Context<E> &);
 template void apply_version_script(Context<E> &);
 template void parse_symbol_version(Context<E> &);
 template void compute_import_export(Context<E> &);
-template void mark_addrsig(Context<E> &);
+template void compute_address_significance(Context<E> &);
 template void clear_padding(Context<E> &);
 template void compute_section_headers(Context<E> &);
 template i64 set_osec_offsets(Context<E> &);

@@ -3,12 +3,18 @@
 
 [ $MACHINE = x86_64 ] || skip
 
-cat <<EOF | $CC -o $t/a.o -c -xc - 2> /dev/null || skip
-volatile char arr[0x100000000];
+cat <<EOF | $CC -o $t/a.o -c -xc - -mcmodel=large
+#include <stdio.h>
+char arr1[0xc0000000];
+extern char arr2[0xc0000000];
 int main() {
-  return arr[2000];
+  printf("%d %lx\n", (void *)arr1 < (void *)arr2, arr2 - arr1);
 }
 EOF
 
-$CC -B. -o $t/exe $t/a.o
-$QEMU $t/exe
+cat <<EOF | $CC -o $t/b.o -c -xc - -mcmodel=large
+char arr2[0xc0000000];
+EOF
+
+$CC -B. -o $t/exe $t/a.o $t/b.o
+$QEMU $t/exe | grep -Eq '^1 c0000000$'

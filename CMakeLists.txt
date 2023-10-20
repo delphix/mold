@@ -44,7 +44,7 @@
 # features and behave exactly the same.
 
 cmake_minimum_required(VERSION 3.14)
-project(mold VERSION 2.2.0)
+project(mold VERSION 2.3.1)
 
 include(CMakeDependentOption)
 include(GNUInstallDirs)
@@ -64,9 +64,12 @@ if(NOT "${CMAKE_CXX_COMPILER_FRONTEND_VARIANT}" STREQUAL "MSVC")
     -fno-exceptions
     -fno-unwind-tables
     -fno-asynchronous-unwind-tables
+    -Wall
+    -Wextra
     -Wno-sign-compare
     -Wno-unused-function
-    -Wunused-variable
+    -Wno-unused-parameter
+    -Wno-missing-field-initializers
     -ggnu-pubnames)
 endif()
 
@@ -301,8 +304,8 @@ list(APPEND MOLD_ELF_TEMPLATE_FILES
   elf/arch-loongarch.cc
   elf/arch-riscv.cc
   elf/cmdline.cc
-  elf/dwarf.cc
   elf/gc-sections.cc
+  elf/gdb-index.cc
   elf/icf.cc
   elf/input-files.cc
   elf/input-sections.cc
