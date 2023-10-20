@@ -191,7 +191,8 @@ void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
         break;
       }
     }
-    ctx.visited.insert(mf->name);
+    if (!ctx.whole_archive)
+      ctx.visited.insert(mf->name);
     return;
   case FileType::TEXT:
     parse_linker_script(ctx, mf);
@@ -338,47 +339,6 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
   ctx.tg.wait();
 }
 
-// Since elf_main is a template, we can't run it without a type parameter.
-// We speculatively run elf_main with X86_64, and if the speculation was
-// wrong, re-run it with an actual machine type.
-static int redo_main(int argc, char **argv, std::string_view target) {
-  if (target == I386::target_name)
-    return elf_main<I386>(argc, argv);
-  if (target == ARM64::target_name)
-    return elf_main<ARM64>(argc, argv);
-  if (target == ARM32::target_name)
-    return elf_main<ARM32>(argc, argv);
-  if (target == RV64LE::target_name)
-    return elf_main<RV64LE>(argc, argv);
-  if (target == RV64BE::target_name)
-    return elf_main<RV64BE>(argc, argv);
-  if (target == RV32LE::target_name)
-    return elf_main<RV32LE>(argc, argv);
-  if (target == RV32BE::target_name)
-    return elf_main<RV32BE>(argc, argv);
-  if (target == PPC32::target_name)
-    return elf_main<PPC32>(argc, argv);
-  if (target == PPC64V1::target_name)
-    return elf_main<PPC64V1>(argc, argv);
-  if (target == PPC64V2::target_name)
-    return elf_main<PPC64V2>(argc, argv);
-  if (target == S390X::target_name)
-    return elf_main<S390X>(argc, argv);
-  if (target == SPARC64::target_name)
-    return elf_main<SPARC64>(argc, argv);
-  if (target == M68K::target_name)
-    return elf_main<M68K>(argc, argv);
-  if (target == SH4::target_name)
-    return elf_main<SH4>(argc, argv);
-  if (target == ALPHA::target_name)
-    return elf_main<ALPHA>(argc, argv);
-  if (target == LOONGARCH32::target_name)
-    return elf_main<LOONGARCH32>(argc, argv);
-  if (target == LOONGARCH64::target_name)
-    return elf_main<LOONGARCH64>(argc, argv);
-  unreachable();
-}
-
 template <typename E>
 int elf_main(int argc, char **argv) {
   Context<E> ctx;
@@ -402,7 +362,7 @@ int elf_main(int argc, char **argv) {
   // Redo if -m is not x86-64.
   if constexpr (is_x86_64<E>)
     if (ctx.arg.emulation != X86_64::target_name)
-      return redo_main(argc, argv, ctx.arg.emulation);
+      return redo_main(ctx, argc, argv);
 
   Timer t_all(ctx, "all");
 
@@ -496,9 +456,9 @@ int elf_main(int argc, char **argv) {
   // Set is_imported and is_exported bits for each symbol.
   compute_import_export(ctx);
 
-  // Read address-significant section information.
-  if (ctx.arg.icf && !ctx.arg.icf_all)
-    mark_addrsig(ctx);
+  // Set "address-taken" bits for input sections.
+  if (ctx.arg.icf || ctx.arg.z_rewrite_endbr)
+    compute_address_significance(ctx);
 
   // Garbage-collect unreachable sections.
   if (ctx.arg.gc_sections)
@@ -637,10 +597,6 @@ int elf_main(int argc, char **argv) {
   // Here, we construct output .eh_frame contents.
   ctx.eh_frame->construct(ctx);
 
-  // Handle --gdb-index.
-  if (ctx.arg.gdb_index)
-    ctx.gdb_index->construct(ctx);
-
   // If --emit-relocs is given, we'll copy relocation sections from input
   // files to an output file.
   if (ctx.arg.emit_relocs)
@@ -686,18 +642,18 @@ int elf_main(int argc, char **argv) {
   // Copy input sections to the output file and apply relocations.
   copy_chunks(ctx);
 
-  // Some part of .gdb_index couldn't be computed until other debug
-  // sections are complete. We have complete debug sections now, so
-  // write the rest of .gdb_index.
-  if (ctx.gdb_index)
-    ctx.gdb_index->write_address_areas(ctx);
-
   // Dynamic linker works better with sorted .rela.dyn section,
   // so we sort them.
   ctx.reldyn->sort(ctx);
 
   // Zero-clear paddings between sections
   clear_padding(ctx);
+
+  // .gdb_index's contents cannot be constructed before applying
+  // relocations to other debug sections. We have relocated debug
+  // sections now, so write the .gdb_index section.
+  if (ctx.gdb_index)
+    write_gdb_index(ctx);
 
   // .note.gnu.build-id section contains a cryptographic hash of the
   // entire output file. Now that we wrote everything except build-id,
@@ -747,35 +703,13 @@ int elf_main(int argc, char **argv) {
 }
 
 #ifdef MOLD_X86_64
-
-extern template int elf_main<I386>(int, char **);
-extern template int elf_main<ARM32>(int, char **);
-extern template int elf_main<ARM64>(int, char **);
-extern template int elf_main<RV32BE>(int, char **);
-extern template int elf_main<RV32LE>(int, char **);
-extern template int elf_main<RV64LE>(int, char **);
-extern template int elf_main<RV64BE>(int, char **);
-extern template int elf_main<PPC32>(int, char **);
-extern template int elf_main<PPC64V1>(int, char **);
-extern template int elf_main<PPC64V2>(int, char **);
-extern template int elf_main<S390X>(int, char **);
-extern template int elf_main<SPARC64>(int, char **);
-extern template int elf_main<M68K>(int, char **);
-extern template int elf_main<SH4>(int, char **);
-extern template int elf_main<ALPHA>(int, char **);
-extern template int elf_main<LOONGARCH32>(int, char **);
-extern template int elf_main<LOONGARCH64>(int, char **);
-
 int main(int argc, char **argv) {
   return elf_main<X86_64>(argc, argv);
 }
-
-#else
+#endif
 
 using E = MOLD_TARGET;
 
 template int elf_main<E>(int, char **);
-
-#endif
 
 } // namespace mold::elf

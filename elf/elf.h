@@ -291,6 +291,7 @@ enum : u32 {
   DT_VERNEEDNUM = 0x6fffffff,
   DT_PPC_GOT = 0x70000000,
   DT_PPC64_GLINK = 0x70000000,
+  DT_AARCH64_VARIANT_PCS = 0x70000005,
   DT_AUXILIARY = 0x7ffffffd,
   DT_FILTER = 0x7fffffff,
 };
@@ -774,6 +775,9 @@ enum : u32 {
   R_RISCV_RVC_BRANCH = 44,
   R_RISCV_RVC_JUMP = 45,
   R_RISCV_RVC_LUI = 46,
+  R_RISCV_GPREL_LO12_I = 47,
+  R_RISCV_GPREL_LO12_S = 48,
+  R_RISCV_GPREL_HI20 = 49,
   R_RISCV_RELAX = 51,
   R_RISCV_SUB6 = 52,
   R_RISCV_SET6 = 53,
@@ -1638,6 +1642,16 @@ struct ElfRel<E> {
   std::conditional_t<E::is_64, U32<E>, u8> r_type;
 };
 
+// Returns true if a given relocation is of type used for direct
+// function call.
+template <typename E>
+inline bool is_func_call_rel(const ElfRel<E> &r) {
+  for (u32 r_type : E::R_FUNCALL)
+    if (r.r_type == r_type)
+      return true;
+  return false;
+}
+
 template <typename E>
 struct ElfDyn {
   Word<E> d_tag;
@@ -1704,6 +1718,35 @@ struct ElfNhdr {
 //
 // Target-specific ELF data types
 //
+
+template <>
+struct ElfSym<ARM64> {
+  bool is_undef() const { return st_shndx == SHN_UNDEF; }
+  bool is_abs() const { return st_shndx == SHN_ABS; }
+  bool is_common() const { return st_shndx == SHN_COMMON; }
+  bool is_weak() const { return st_bind == STB_WEAK; }
+  bool is_undef_weak() const { return is_undef() && is_weak(); }
+
+  ul32 st_name;
+
+#ifdef __LITTLE_ENDIAN__
+  u8 st_type : 4;
+  u8 st_bind : 4;
+  u8 st_visibility : 2;
+  u8 : 5;
+  u8 arm64_variant_pcs : 1; // ARM64-specific
+#else
+  u8 st_bind : 4;
+  u8 st_type : 4;
+  u8 arm64_variant_pcs : 1;
+  u8 : 6;
+  u8 st_visibility : 2;
+#endif
+
+  ul16 st_shndx;
+  ul64 st_value;
+  ul64 st_size;
+};
 
 template <>
 struct ElfSym<PPC64V2> {
@@ -1824,19 +1867,19 @@ struct X86_64 {
   static constexpr u32 e_machine = EM_X86_64;
   static constexpr u32 plt_hdr_size = 32;
   static constexpr u32 plt_size = 16;
-  static constexpr u32 pltgot_size = 16;
+  static constexpr u32 pltgot_size = 8;
 
   static constexpr u32 R_COPY = R_X86_64_COPY;
   static constexpr u32 R_GLOB_DAT = R_X86_64_GLOB_DAT;
   static constexpr u32 R_JUMP_SLOT = R_X86_64_JUMP_SLOT;
   static constexpr u32 R_ABS = R_X86_64_64;
-  static constexpr u32 R_DYNAMIC = R_X86_64_64;
   static constexpr u32 R_RELATIVE = R_X86_64_RELATIVE;
   static constexpr u32 R_IRELATIVE = R_X86_64_IRELATIVE;
   static constexpr u32 R_DTPOFF = R_X86_64_DTPOFF64;
   static constexpr u32 R_TPOFF = R_X86_64_TPOFF64;
   static constexpr u32 R_DTPMOD = R_X86_64_DTPMOD64;
   static constexpr u32 R_TLSDESC = R_X86_64_TLSDESC;
+  static constexpr u32 R_FUNCALL[] = { R_X86_64_PLT32, R_X86_64_PLTOFF64 };
 };
 
 struct I386 {
@@ -1854,13 +1897,13 @@ struct I386 {
   static constexpr u32 R_GLOB_DAT = R_386_GLOB_DAT;
   static constexpr u32 R_JUMP_SLOT = R_386_JUMP_SLOT;
   static constexpr u32 R_ABS = R_386_32;
-  static constexpr u32 R_DYNAMIC = R_386_32;
   static constexpr u32 R_RELATIVE = R_386_RELATIVE;
   static constexpr u32 R_IRELATIVE = R_386_IRELATIVE;
   static constexpr u32 R_DTPOFF = R_386_TLS_DTPOFF32;
   static constexpr u32 R_TPOFF = R_386_TLS_TPOFF;
   static constexpr u32 R_DTPMOD = R_386_TLS_DTPMOD32;
   static constexpr u32 R_TLSDESC = R_386_TLS_DESC;
+  static constexpr u32 R_FUNCALL[] = { R_386_PLT32 };
 };
 
 struct ARM64 {
@@ -1880,13 +1923,13 @@ struct ARM64 {
   static constexpr u32 R_GLOB_DAT = R_AARCH64_GLOB_DAT;
   static constexpr u32 R_JUMP_SLOT = R_AARCH64_JUMP_SLOT;
   static constexpr u32 R_ABS = R_AARCH64_ABS64;
-  static constexpr u32 R_DYNAMIC = R_AARCH64_ABS64;
   static constexpr u32 R_RELATIVE = R_AARCH64_RELATIVE;
   static constexpr u32 R_IRELATIVE = R_AARCH64_IRELATIVE;
   static constexpr u32 R_DTPOFF = R_AARCH64_TLS_DTPREL64;
   static constexpr u32 R_TPOFF = R_AARCH64_TLS_TPREL64;
   static constexpr u32 R_DTPMOD = R_AARCH64_TLS_DTPMOD64;
   static constexpr u32 R_TLSDESC = R_AARCH64_TLSDESC;
+  static constexpr u32 R_FUNCALL[] = { R_AARCH64_JUMP26, R_AARCH64_CALL26 };
 };
 
 struct ARM32 {
@@ -1906,13 +1949,16 @@ struct ARM32 {
   static constexpr u32 R_GLOB_DAT = R_ARM_GLOB_DAT;
   static constexpr u32 R_JUMP_SLOT = R_ARM_JUMP_SLOT;
   static constexpr u32 R_ABS = R_ARM_ABS32;
-  static constexpr u32 R_DYNAMIC = R_ARM_ABS32;
   static constexpr u32 R_RELATIVE = R_ARM_RELATIVE;
   static constexpr u32 R_IRELATIVE = R_ARM_IRELATIVE;
   static constexpr u32 R_DTPOFF = R_ARM_TLS_DTPOFF32;
   static constexpr u32 R_TPOFF = R_ARM_TLS_TPOFF32;
   static constexpr u32 R_DTPMOD = R_ARM_TLS_DTPMOD32;
   static constexpr u32 R_TLSDESC = R_ARM_TLS_DESC;
+
+  static constexpr u32 R_FUNCALL[] = {
+    R_ARM_JUMP24, R_ARM_THM_JUMP24, R_ARM_CALL, R_ARM_THM_CALL, R_ARM_PLT32,
+  };
 };
 
 struct RV64 {
@@ -1928,13 +1974,13 @@ struct RV64 {
   static constexpr u32 R_GLOB_DAT = R_RISCV_64;
   static constexpr u32 R_JUMP_SLOT = R_RISCV_JUMP_SLOT;
   static constexpr u32 R_ABS = R_RISCV_64;
-  static constexpr u32 R_DYNAMIC = R_RISCV_64;
   static constexpr u32 R_RELATIVE = R_RISCV_RELATIVE;
   static constexpr u32 R_IRELATIVE = R_RISCV_IRELATIVE;
   static constexpr u32 R_DTPOFF = R_RISCV_TLS_DTPREL64;
   static constexpr u32 R_TPOFF = R_RISCV_TLS_TPREL64;
   static constexpr u32 R_DTPMOD = R_RISCV_TLS_DTPMOD64;
   static constexpr u32 R_TLSDESC = R_RISCV_TLSDESC;
+  static constexpr u32 R_FUNCALL[] = { R_RISCV_CALL, R_RISCV_CALL_PLT };
 };
 
 struct RV64LE : RV64 {
@@ -1960,13 +2006,13 @@ struct RV32 {
   static constexpr u32 R_GLOB_DAT = R_RISCV_32;
   static constexpr u32 R_JUMP_SLOT = R_RISCV_JUMP_SLOT;
   static constexpr u32 R_ABS = R_RISCV_32;
-  static constexpr u32 R_DYNAMIC = R_RISCV_32;
   static constexpr u32 R_RELATIVE = R_RISCV_RELATIVE;
   static constexpr u32 R_IRELATIVE = R_RISCV_IRELATIVE;
   static constexpr u32 R_DTPOFF = R_RISCV_TLS_DTPREL32;
   static constexpr u32 R_TPOFF = R_RISCV_TLS_TPREL32;
   static constexpr u32 R_DTPMOD = R_RISCV_TLS_DTPMOD32;
   static constexpr u32 R_TLSDESC = R_RISCV_TLSDESC;
+  static constexpr u32 R_FUNCALL[] = { R_RISCV_CALL, R_RISCV_CALL_PLT };
 };
 
 struct RV32LE : RV32 {
@@ -1992,16 +2038,20 @@ struct PPC32 {
   static constexpr u32 thunk_hdr_size = 0;
   static constexpr u32 thunk_size = 36;
 
+
   static constexpr u32 R_COPY = R_PPC_COPY;
   static constexpr u32 R_GLOB_DAT = R_PPC_GLOB_DAT;
   static constexpr u32 R_JUMP_SLOT = R_PPC_JMP_SLOT;
   static constexpr u32 R_ABS = R_PPC_ADDR32;
-  static constexpr u32 R_DYNAMIC = R_PPC_ADDR32;
   static constexpr u32 R_RELATIVE = R_PPC_RELATIVE;
   static constexpr u32 R_IRELATIVE = R_PPC_IRELATIVE;
   static constexpr u32 R_DTPOFF = R_PPC_DTPREL32;
   static constexpr u32 R_TPOFF = R_PPC_TPREL32;
   static constexpr u32 R_DTPMOD = R_PPC_DTPMOD32;
+
+  static constexpr u32 R_FUNCALL[] = {
+    R_PPC_REL24, R_PPC_PLTREL24, R_PPC_LOCAL24PC,
+  };
 };
 
 struct PPC64 {
@@ -2014,12 +2064,12 @@ struct PPC64 {
   static constexpr u32 R_GLOB_DAT = R_PPC64_GLOB_DAT;
   static constexpr u32 R_JUMP_SLOT = R_PPC64_JMP_SLOT;
   static constexpr u32 R_ABS = R_PPC64_ADDR64;
-  static constexpr u32 R_DYNAMIC = R_PPC64_ADDR64;
   static constexpr u32 R_RELATIVE = R_PPC64_RELATIVE;
   static constexpr u32 R_IRELATIVE = R_PPC64_IRELATIVE;
   static constexpr u32 R_DTPOFF = R_PPC64_DTPREL64;
   static constexpr u32 R_TPOFF = R_PPC64_TPREL64;
   static constexpr u32 R_DTPMOD = R_PPC64_DTPMOD64;
+  static constexpr u32 R_FUNCALL[] = { R_PPC64_REL24, R_PPC64_REL24_NOTOC };
 };
 
 struct PPC64V1 : PPC64 {
@@ -2038,7 +2088,7 @@ struct PPC64V2 : PPC64 {
   static constexpr u32 plt_size = 4;
   static constexpr u32 pltgot_size = 0;
   static constexpr u32 thunk_hdr_size = 0;
-  static constexpr u32 thunk_size = 20;
+  static constexpr u32 thunk_size = 24;
 };
 
 struct S390X {
@@ -2056,12 +2106,12 @@ struct S390X {
   static constexpr u32 R_GLOB_DAT = R_390_GLOB_DAT;
   static constexpr u32 R_JUMP_SLOT = R_390_JMP_SLOT;
   static constexpr u32 R_ABS = R_390_64;
-  static constexpr u32 R_DYNAMIC = R_390_64;
   static constexpr u32 R_RELATIVE = R_390_RELATIVE;
   static constexpr u32 R_IRELATIVE = R_390_IRELATIVE;
   static constexpr u32 R_DTPOFF = R_390_TLS_DTPOFF;
   static constexpr u32 R_TPOFF = R_390_TLS_TPOFF;
   static constexpr u32 R_DTPMOD = R_390_TLS_DTPMOD;
+  static constexpr u32 R_FUNCALL[] = { R_390_PLT32DBL };
 };
 
 struct SPARC64 {
@@ -2079,12 +2129,12 @@ struct SPARC64 {
   static constexpr u32 R_GLOB_DAT = R_SPARC_GLOB_DAT;
   static constexpr u32 R_JUMP_SLOT = R_SPARC_JMP_SLOT;
   static constexpr u32 R_ABS = R_SPARC_64;
-  static constexpr u32 R_DYNAMIC = R_SPARC_64;
   static constexpr u32 R_RELATIVE = R_SPARC_RELATIVE;
   static constexpr u32 R_IRELATIVE = R_SPARC_IRELATIVE;
   static constexpr u32 R_DTPOFF = R_SPARC_TLS_DTPOFF64;
   static constexpr u32 R_TPOFF = R_SPARC_TLS_TPOFF64;
   static constexpr u32 R_DTPMOD = R_SPARC_TLS_DTPMOD64;
+  static constexpr u32 R_FUNCALL[] = { R_SPARC_WPLT30, R_SPARC_WDISP30 };
 };
 
 struct M68K {
@@ -2102,11 +2152,11 @@ struct M68K {
   static constexpr u32 R_GLOB_DAT = R_68K_GLOB_DAT;
   static constexpr u32 R_JUMP_SLOT = R_68K_JMP_SLOT;
   static constexpr u32 R_ABS = R_68K_32;
-  static constexpr u32 R_DYNAMIC = R_68K_32;
   static constexpr u32 R_RELATIVE = R_68K_RELATIVE;
   static constexpr u32 R_DTPOFF = R_68K_TLS_DTPREL32;
   static constexpr u32 R_TPOFF = R_68K_TLS_TPREL32;
   static constexpr u32 R_DTPMOD = R_68K_TLS_DTPMOD32;
+  static constexpr u32 R_FUNCALL[] = { R_68K_PLT32 };
 };
 
 struct SH4 {
@@ -2124,11 +2174,11 @@ struct SH4 {
   static constexpr u32 R_GLOB_DAT = R_SH_GLOB_DAT;
   static constexpr u32 R_JUMP_SLOT = R_SH_JMP_SLOT;
   static constexpr u32 R_ABS = R_SH_DIR32;
-  static constexpr u32 R_DYNAMIC = R_SH_DIR32;
   static constexpr u32 R_RELATIVE = R_SH_RELATIVE;
   static constexpr u32 R_DTPOFF = R_SH_TLS_DTPOFF32;
   static constexpr u32 R_TPOFF = R_SH_TLS_TPOFF32;
   static constexpr u32 R_DTPMOD = R_SH_TLS_DTPMOD32;
+  static constexpr u32 R_FUNCALL[] = { R_SH_PLT32 };
 };
 
 struct ALPHA {
@@ -2146,11 +2196,11 @@ struct ALPHA {
   static constexpr u32 R_GLOB_DAT = R_ALPHA_GLOB_DAT;
   static constexpr u32 R_JUMP_SLOT = R_ALPHA_JMP_SLOT;
   static constexpr u32 R_ABS = R_ALPHA_REFQUAD;
-  static constexpr u32 R_DYNAMIC = R_ALPHA_REFQUAD;
   static constexpr u32 R_RELATIVE = R_ALPHA_RELATIVE;
   static constexpr u32 R_DTPOFF = R_ALPHA_DTPREL64;
   static constexpr u32 R_TPOFF = R_ALPHA_TPREL64;
   static constexpr u32 R_DTPMOD = R_ALPHA_DTPMOD64;
+  static constexpr u32 R_FUNCALL[] = {};
 };
 
 struct LOONGARCH64 {
@@ -2170,12 +2220,12 @@ struct LOONGARCH64 {
   static constexpr u32 R_GLOB_DAT = R_LARCH_64;
   static constexpr u32 R_JUMP_SLOT = R_LARCH_JUMP_SLOT;
   static constexpr u32 R_ABS = R_LARCH_64;
-  static constexpr u32 R_DYNAMIC = R_LARCH_64;
   static constexpr u32 R_RELATIVE = R_LARCH_RELATIVE;
   static constexpr u32 R_IRELATIVE = R_LARCH_IRELATIVE;
   static constexpr u32 R_DTPOFF = R_LARCH_TLS_DTPREL64;
   static constexpr u32 R_TPOFF = R_LARCH_TLS_TPREL64;
   static constexpr u32 R_DTPMOD = R_LARCH_TLS_DTPMOD64;
+  static constexpr u32 R_FUNCALL[] = { R_LARCH_B26 };
 };
 
 struct LOONGARCH32 {
@@ -2195,12 +2245,12 @@ struct LOONGARCH32 {
   static constexpr u32 R_GLOB_DAT = R_LARCH_32;
   static constexpr u32 R_JUMP_SLOT = R_LARCH_JUMP_SLOT;
   static constexpr u32 R_ABS = R_LARCH_32;
-  static constexpr u32 R_DYNAMIC = R_LARCH_32;
   static constexpr u32 R_RELATIVE = R_LARCH_RELATIVE;
   static constexpr u32 R_IRELATIVE = R_LARCH_IRELATIVE;
   static constexpr u32 R_DTPOFF = R_LARCH_TLS_DTPREL32;
   static constexpr u32 R_TPOFF = R_LARCH_TLS_TPREL32;
   static constexpr u32 R_DTPMOD = R_LARCH_TLS_DTPMOD32;
+  static constexpr u32 R_FUNCALL[] = { R_LARCH_B26 };
 };
 
 } // namespace mold::elf

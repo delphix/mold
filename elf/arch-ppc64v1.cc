@@ -465,7 +465,6 @@ void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
   static_assert(E::thunk_size == sizeof(local_thunk));
 
   u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
-  u64 P = output_section.shdr.sh_addr + offset;
 
   for (Symbol<E> *sym : symbols) {
     if (sym->has_got(ctx)) {
@@ -486,7 +485,6 @@ void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
     }
 
     buf += E::thunk_size;
-    P += E::thunk_size;
   }
 }
 
@@ -521,7 +519,7 @@ struct OpdSymbol {
 };
 
 static Symbol<E> *
-get_opd_sym_at(Context<E> &ctx, std::span<OpdSymbol> syms, u64 offset) {
+get_opd_sym_at(std::span<OpdSymbol> syms, u64 offset) {
   auto it = std::lower_bound(syms.begin(), syms.end(), OpdSymbol{offset});
   if (it == syms.end())
     return nullptr;
@@ -616,7 +614,7 @@ void ppc64v1_rewrite_opd(Context<E> &ctx) {
         if (sym.get_input_section() != opd)
           continue;
 
-        Symbol<E> *real_sym = get_opd_sym_at(ctx, opd_syms, r.r_addend);
+        Symbol<E> *real_sym = get_opd_sym_at(opd_syms, r.r_addend);
         if (!real_sym)
           Fatal(ctx) << *isec << ": cannot find a symbol in .opd for " << r
                      << " at offset 0x" << std::hex << (u64)r.r_addend;

@@ -64,28 +64,41 @@ void write_plt_header(Context<E> &ctx, u8 *buf) {
 
 template <>
 void write_plt_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
-  static const u8 insn[] = {
-    0xf3, 0x0f, 0x1e, 0xfa, // endbr64
-    0x41, 0xbb, 0, 0, 0, 0, // mov $index_in_relplt, %r11d
-    0xff, 0x25, 0, 0, 0, 0, // jmp *foo@GOTPLT
-  };
+  // Only a canonical PLT can be address-taken; there's no way to take
+  // an address of a non-canonical PLT. Therefore, a non-canonical PLT
+  // doesn't have to start with an endbr64.
+  if (sym.is_canonical) {
+    static const u8 insn[] = {
+      0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+      0x41, 0xbb, 0, 0, 0, 0, // mov $index_in_relplt, %r11d
+      0xff, 0x25, 0, 0, 0, 0, // jmp *foo@GOTPLT
+    };
 
-  memcpy(buf, insn, sizeof(insn));
-  *(ul32 *)(buf + 6) = sym.get_plt_idx(ctx);
-  *(ul32 *)(buf + 12) = sym.get_gotplt_addr(ctx) - sym.get_plt_addr(ctx) - 16;
+    memcpy(buf, insn, sizeof(insn));
+    *(ul32 *)(buf + 6) = sym.get_plt_idx(ctx);
+    *(ul32 *)(buf + 12) = sym.get_gotplt_addr(ctx) - sym.get_plt_addr(ctx) - 16;
+  } else {
+    static const u8 insn[] = {
+      0x41, 0xbb, 0, 0, 0, 0, // mov $index_in_relplt, %r11d
+      0xff, 0x25, 0, 0, 0, 0, // jmp *foo@GOTPLT
+      0xcc, 0xcc, 0xcc, 0xcc, // (padding)
+    };
+
+    memcpy(buf, insn, sizeof(insn));
+    *(ul32 *)(buf + 2) = sym.get_plt_idx(ctx);
+    *(ul32 *)(buf + 8) = sym.get_gotplt_addr(ctx) - sym.get_plt_addr(ctx) - 12;
+  }
 }
 
 template <>
 void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
   static const u8 insn[] = {
-    0xf3, 0x0f, 0x1e, 0xfa, // endbr64
     0xff, 0x25, 0, 0, 0, 0, // jmp *foo@GOT
-    0xcc, 0xcc, 0xcc, 0xcc, // (padding)
     0xcc, 0xcc,             // (padding)
   };
 
   memcpy(buf, insn, sizeof(insn));
-  *(ul32 *)(buf + 6) = sym.get_got_addr(ctx) - sym.get_plt_addr(ctx) - 10;
+  *(ul32 *)(buf + 2) = sym.get_got_addr(ctx) - sym.get_plt_addr(ctx) - 6;
 }
 
 template <>
@@ -345,7 +358,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     u64 A = rel.r_addend;
     u64 P = get_addr() + rel.r_offset;
     u64 G = sym.get_got_addr(ctx) - ctx.gotplt->shdr.sh_addr;
-    u64 GOTPLT = ctx.gotplt->shdr.sh_addr;
+    u64 GOT = ctx.gotplt->shdr.sh_addr;
 
     switch (rel.r_type) {
     case R_X86_64_8:
@@ -388,19 +401,19 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       break;
     case R_X86_64_GOTOFF64:
     case R_X86_64_PLTOFF64:
-      *(ul64 *)loc = S + A - GOTPLT;
+      *(ul64 *)loc = S + A - GOT;
       break;
     case R_X86_64_GOTPC32:
-      write32s(GOTPLT + A - P);
+      write32s(GOT + A - P);
       break;
     case R_X86_64_GOTPC64:
-      *(ul64 *)loc = GOTPLT + A - P;
+      *(ul64 *)loc = GOT + A - P;
       break;
     case R_X86_64_GOTPCREL:
-      write32s(G + GOTPLT + A - P);
+      write32s(G + GOT + A - P);
       break;
     case R_X86_64_GOTPCREL64:
-      *(ul64 *)loc = G + GOTPLT + A - P;
+      *(ul64 *)loc = G + GOT + A - P;
       break;
     case R_X86_64_GOTPCRELX:
       // We always want to relax GOTPCRELX relocs even if --no-relax
@@ -416,7 +429,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
           break;
         }
       }
-      write32s(G + GOTPLT + A - P);
+      write32s(G + GOT + A - P);
       break;
     case R_X86_64_REX_GOTPCRELX:
       if (sym.is_pcrel_linktime_const(ctx)) {
@@ -430,7 +443,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
           break;
         }
       }
-      write32s(G + GOTPLT + A - P);
+      write32s(G + GOT + A - P);
       break;
     case R_X86_64_TLSGD:
       if (sym.has_tlsgd(ctx))

@@ -314,7 +314,7 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
       if (ctx.arg.oformat_binary && !(shdr.sh_flags & SHF_ALLOC))
         continue;
 
-      this->sections[i] = std::make_unique<InputSection<E>>(ctx, *this, name, i);
+      this->sections[i] = std::make_unique<InputSection<E>>(ctx, *this, i);
 
       // Save .llvm_addrsig for --icf=safe.
       if (shdr.sh_type == SHT_LLVM_ADDRSIG && !ctx.arg.relocatable) {
@@ -335,10 +335,6 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
 
         if (name == ".debug_info")
           debug_info = isec;
-        if (name == ".debug_ranges")
-          debug_ranges = isec;
-        if (name == ".debug_rnglists")
-          debug_rnglists = isec;
 
         // If --gdb-index is given, contents of .debug_gnu_pubnames and
         // .debug_gnu_pubtypes are copied to .gdb_index, so keeping them
@@ -867,33 +863,6 @@ void ObjectFile<E>::resolve_section_pieces(Context<E> &ctx) {
 }
 
 template <typename E>
-void ObjectFile<E>::mark_addrsig(Context<E> &ctx) {
-  // Parse a .llvm_addrsig section.
-  if (llvm_addrsig) {
-    u8 *cur = (u8 *)llvm_addrsig->contents.data();
-    u8 *end = cur + llvm_addrsig->contents.size();
-
-    while (cur != end) {
-      Symbol<E> &sym = *this->symbols[read_uleb(&cur)];
-      if (sym.file == this)
-        if (InputSection<E> *isec = sym.get_input_section())
-          isec->address_significant = true;
-    }
-  }
-
-  // We treat a symbol's address as significant if
-  //
-  // 1. we have no address significance information for the symbol, or
-  // 2. the symbol can be referenced from the outside in an address-
-  //    significant manner.
-  for (Symbol<E> *sym : this->symbols)
-    if (sym->file == this)
-      if (InputSection<E> *isec = sym->get_input_section())
-        if (!llvm_addrsig || sym->is_exported)
-          isec->address_significant = true;
-}
-
-template <typename E>
 void ObjectFile<E>::parse(Context<E> &ctx) {
   sections.resize(this->elf_sections.size());
   symtab_sec = this->find_section(SHT_SYMTAB);
@@ -1124,13 +1093,9 @@ void ObjectFile<E>::convert_common_symbols(Context<E> &ctx) {
     ElfShdr<E> &shdr = elf_sections2.back();
     memset(&shdr, 0, sizeof(shdr));
 
-    std::string_view name;
-
     if (sym.get_type() == STT_TLS) {
-      name = ".tls_common";
       shdr.sh_flags = SHF_ALLOC | SHF_WRITE | SHF_TLS;
     } else {
-      name = ".common";
       shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
     }
 
@@ -1140,7 +1105,7 @@ void ObjectFile<E>::convert_common_symbols(Context<E> &ctx) {
 
     i64 idx = this->elf_sections.size() + elf_sections2.size() - 1;
     std::unique_ptr<InputSection<E>> isec =
-      std::make_unique<InputSection<E>>(ctx, *this, name, idx);
+      std::make_unique<InputSection<E>>(ctx, *this, idx);
 
     sym.file = this;
     sym.set_input_section(isec.get());

@@ -59,6 +59,13 @@ elif [ $MACHINE = aarch64 ]; then
   tlsdesc_opt=-mtls-dialect=desc
 fi
 
+if [ $MACHINE = ppc64le -a -e /proc/cpuinfo ] && grep -q POWER10 /proc/cpuinfo; then
+  CC="$CC -mcpu=power10"
+  CXX="$CXX -mcpu=power10"
+  GCC="$GCC -mcpu=power10"
+  GXX="$GXX -mcpu=power10"
+fi
+
 # Common functions
 test_cflags() {
   echo 'int main() {}' | $CC "$@" -o /dev/null -xc - >& /dev/null
@@ -69,7 +76,14 @@ supports_ifunc() {
     $CC -c -o /dev/null -xc - >& /dev/null
 }
 
+is_musl() {
+  ldd --help 2>&1 | grep -q musl
+}
+
 supports_tlsdesc() {
+  # musl's tlsdesc on arm32 seems to be broken
+  [ $MACHINE = arm ] && is_musl && return 1
+
   [ -n "$tlsdesc_opt" ]
 }
 

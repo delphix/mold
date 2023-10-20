@@ -224,8 +224,7 @@ struct InputSectionExtras<E> {
 template <typename E>
 class InputSection {
 public:
-  InputSection(Context<E> &ctx, ObjectFile<E> &file, std::string_view name,
-               i64 shndx);
+  InputSection(Context<E> &ctx, ObjectFile<E> &file, i64 shndx);
 
   void uncompress(Context<E> &ctx);
   void uncompress_to(Context<E> &ctx, u8 *buf);
@@ -258,17 +257,19 @@ public:
   i32 fde_begin = -1;
   i32 fde_end = -1;
 
-  u32 offset = -1;
+  u64 offset = -1;
   u32 shndx = -1;
   u32 relsec_idx = -1;
   u32 reldyn_offset = 0;
+
+  bool uncompressed = false;
 
   // For COMDAT de-duplication and garbage collection
   std::atomic_bool is_alive = true;
   u8 p2align = 0;
 
-  bool address_significant : 1 = false;
-  bool uncompressed : 1 = false;
+  // For ICF
+  Atomic<bool> address_taken = false;
 
   // For garbage collection
   Atomic<bool> is_visited = false;
@@ -354,13 +355,14 @@ public:
   virtual void write_to(Context<E> &ctx, u8 *buf) { unreachable(); }
   virtual void update_shdr(Context<E> &ctx) {}
 
-  // For --gdb-index
-  virtual u8 *get_uncompressed_data() { return nullptr; }
-
   std::string_view name;
   ElfShdr<E> shdr = { .sh_addralign = 1 };
   i64 shndx = 0;
   bool is_relro = false;
+
+  // For --gdb-index
+  bool is_compressed = false;
+  std::vector<u8> uncompressed_data;
 
   // Some synethetic sections add local symbols to the output.
   // For example, range extension thunks adds function_name@thunk
@@ -948,13 +950,6 @@ private:
   std::map<u32, u32> properties;
 };
 
-struct GdbIndexName {
-  std::string_view name;
-  u32 hash = 0;
-  u32 attr = 0;
-  u32 entry_idx = 0;
-};
-
 template <typename E>
 class GdbIndexSection : public Chunk<E> {
 public:
@@ -963,38 +958,6 @@ public:
     this->shdr.sh_type = SHT_PROGBITS;
     this->shdr.sh_addralign = 4;
   }
-
-  void construct(Context<E> &ctx);
-  void copy_buf(Context<E> &ctx) override;
-  void write_address_areas(Context<E> &ctx);
-
-private:
-  struct SectionHeader {
-    ul32 version = 7;
-    ul32 cu_list_offset = 0;
-    ul32 cu_types_offset = 0;
-    ul32 areas_offset = 0;
-    ul32 symtab_offset = 0;
-    ul32 const_pool_offset = 0;
-  };
-
-  struct MapEntry {
-    MapEntry(ObjectFile<E> *owner, u32 hash) : owner(owner), hash(hash) {}
-
-    MapEntry(const MapEntry &other)
-      : owner(other.owner.load()), num_attrs(other.num_attrs.load()),
-        hash(other.hash), name_offset(other.name_offset),
-        attr_offset(other.attr_offset) {}
-
-    std::atomic<ObjectFile<E> *> owner;
-    std::atomic_uint32_t num_attrs = 0;
-    u32 hash = 0;
-    u32 name_offset = -1;
-    u32 attr_offset = -1;
-  };
-
-  SectionHeader header;
-  ConcurrentMap<MapEntry> map;
 };
 
 template <typename E>
@@ -1002,12 +965,10 @@ class CompressedSection : public Chunk<E> {
 public:
   CompressedSection(Context<E> &ctx, Chunk<E> &chunk);
   void copy_buf(Context<E> &ctx) override;
-  u8 *get_uncompressed_data() override { return uncompressed.get(); }
 
 private:
   ElfChdr<E> chdr = {};
   std::unique_ptr<Compressor> compressed;
-  std::unique_ptr<u8[]> uncompressed;
 };
 
 template <typename E>
@@ -1059,22 +1020,10 @@ private:
 };
 
 //
-// dwarf.cc
+// gdb-index.cc
 //
 
-template <typename E>
-std::vector<std::string_view>
-read_compunits(Context<E> &ctx, ObjectFile<E> &file);
-
-template <typename E>
-std::vector<GdbIndexName> read_pubnames(Context<E> &ctx, ObjectFile<E> &file);
-
-template <typename E>
-i64 estimate_address_areas(Context<E> &ctx, ObjectFile<E> &file);
-
-template <typename E>
-std::vector<u64>
-read_address_areas(Context<E> &ctx, ObjectFile<E> &file, i64 offset);
+template <typename E> void write_gdb_index(Context<E> &ctx);
 
 //
 // input-files.cc
@@ -1210,7 +1159,6 @@ public:
   void mark_live_objects(Context<E> &ctx,
                          std::function<void(InputFile<E> *)> feeder) override;
   void convert_undefined_weak_symbols(Context<E> &ctx);
-  void mark_addrsig(Context<E> &ctx);
   void scan_relocations(Context<E> &ctx);
   void convert_common_symbols(Context<E> &ctx);
   void compute_symtab_size(Context<E> &ctx);
@@ -1246,19 +1194,8 @@ public:
 
   // For .gdb_index
   InputSection<E> *debug_info = nullptr;
-  InputSection<E> *debug_ranges = nullptr;
-  InputSection<E> *debug_rnglists = nullptr;
   InputSection<E> *debug_pubnames = nullptr;
   InputSection<E> *debug_pubtypes = nullptr;
-  std::vector<std::string_view> compunits;
-  std::vector<GdbIndexName> gdb_names;
-  i64 compunits_idx = 0;
-  i64 attrs_size = 0;
-  i64 attrs_offset = 0;
-  i64 names_size = 0;
-  i64 names_offset = 0;
-  i64 num_areas = 0;
-  i64 area_offset = 0;
 
   // For LTO
   std::vector<std::string_view> lto_symbol_versions;
@@ -1409,6 +1346,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx);
 // passes.cc
 //
 
+template <typename E> int redo_main(Context<E> &, int argc, char **argv);
 template <typename E> void create_internal_file(Context<E> &);
 template <typename E> void apply_exclude_libs(Context<E> &);
 template <typename E> void create_synthetic_sections(Context<E> &);
@@ -1440,7 +1378,7 @@ template <typename E> void copy_chunks(Context<E> &);
 template <typename E> void apply_version_script(Context<E> &);
 template <typename E> void parse_symbol_version(Context<E> &);
 template <typename E> void compute_import_export(Context<E> &);
-template <typename E> void mark_addrsig(Context<E> &);
+template <typename E> void compute_address_significance(Context<E> &);
 template <typename E> void clear_padding(Context<E> &);
 template <typename E> void compute_section_headers(Context<E> &);
 template <typename E> i64 set_osec_offsets(Context<E> &);
@@ -1741,6 +1679,7 @@ struct Context {
     bool z_now = false;
     bool z_origin = false;
     bool z_relro = true;
+    bool z_rewrite_endbr = false;
     bool z_sectionheader = true;
     bool z_shstk = false;
     bool z_text = false;
@@ -1883,11 +1822,11 @@ struct Context {
   [[no_unique_address]] ContextExtras<E> extra;
 
   // For --gdb-index
-  Chunk<E> *debug_info = nullptr;
-  Chunk<E> *debug_abbrev = nullptr;
-  Chunk<E> *debug_ranges = nullptr;
-  Chunk<E> *debug_addr = nullptr;
-  Chunk<E> *debug_rnglists = nullptr;
+  std::span<u8> debug_info;
+  std::span<u8> debug_abbrev;
+  std::span<u8> debug_ranges;
+  std::span<u8> debug_addr;
+  std::span<u8> debug_rnglists;
 
   // For thread-local variables
   u64 tls_begin = 0;

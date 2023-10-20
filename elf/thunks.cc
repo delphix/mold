@@ -68,27 +68,6 @@ static constexpr i64 max_thunk_size = 102400;
 
 static_assert(max_thunk_size / E::thunk_size < INT16_MAX);
 
-// Returns true if a given relocation is of type used for function calls.
-template <typename E>
-static bool needs_thunk_rel(const ElfRel<E> &r) {
-  u32 ty = r.r_type;
-
-  if constexpr (is_arm64<E>) {
-    return ty == R_AARCH64_JUMP26 || ty == R_AARCH64_CALL26;
-  } else if constexpr (is_arm32<E>) {
-    return ty == R_ARM_JUMP24 || ty == R_ARM_THM_JUMP24 ||
-           ty == R_ARM_CALL   || ty == R_ARM_THM_CALL   ||
-           ty == R_ARM_PLT32;
-  } else if constexpr (is_ppc32<E>) {
-    return ty == R_PPC_REL24  || ty == R_PPC_PLTREL24 || ty == R_PPC_LOCAL24PC;
-  } else if constexpr (is_ppc64<E>) {
-    return ty == R_PPC64_REL24 || ty == R_PPC64_REL24_NOTOC;
-  } else {
-    static_assert(is_loongarch<E>);
-    return ty == R_LARCH_B26;
-  }
-}
-
 template <typename E>
 static bool is_reachable(Context<E> &ctx, InputSection<E> &isec,
                          Symbol<E> &sym, const ElfRel<E> &rel) {
@@ -157,7 +136,7 @@ static void scan_rels(Context<E> &ctx, InputSection<E> &isec,
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (!needs_thunk_rel(rel))
+    if (!is_func_call_rel(rel))
       continue;
 
     // Skip if the symbol is undefined. apply_reloc() will report an error.
@@ -191,17 +170,17 @@ static void scan_rels(Context<E> &ctx, InputSection<E> &isec,
 
 template <>
 void OutputSection<E>::create_range_extension_thunks(Context<E> &ctx) {
+  using Thunk = RangeExtensionThunk<E>;
+
   std::span<InputSection<E> *> m = members;
   if (m.empty())
     return;
 
-  m[0]->offset = 0;
-
   // Initialize input sections with a dummy offset so that we can
   // distinguish sections that have got an address with the one who
   // haven't.
-  tbb::parallel_for((i64)1, (i64)m.size(), [&](i64 i) {
-    m[i]->offset = -1;
+  tbb::parallel_for_each(m, [](InputSection<E> *isec) {
+    isec->offset = -1;
   });
 
   // We create thunks from the beginning of the section to the end.
@@ -211,7 +190,7 @@ void OutputSection<E>::create_range_extension_thunks(Context<E> &ctx) {
   // Input sections between B and C are in the current batch.
   //
   // A is the input section with the smallest address than can reach
-  // anywhere from the current batch.
+  // from the current batch.
   //
   // D is the input section with the largest address such that the thunk
   // is reachable from the current batch if it's inserted right before D.
@@ -219,9 +198,9 @@ void OutputSection<E>::create_range_extension_thunks(Context<E> &ctx) {
   //  ................................ <input sections> ............
   //     A    B    C    D
   //                    ^ We insert a thunk for the current batch just before D
-  //          <--->       The current batch, which is smaller than batch_size
-  //     <-------->       Smaller than max_distance
-  //          <-------->  Smaller than max_distance
+  //          <--->       The current batch, which is smaller than BATCH_SIZE
+  //     <-------->       Smaller than MAX_DISTANCE
+  //          <-------->  Smaller than MAX_DISTANCE
   //     <------------->  Reachable from the current batch
   i64 a = 0;
   i64 b = 0;
@@ -233,10 +212,14 @@ void OutputSection<E>::create_range_extension_thunks(Context<E> &ctx) {
   i64 t = 0;
 
   while (b < m.size()) {
-    // Move D foward as far as we can jump from B to anywhere in a thunk at D.
+    // Move D foward as far as we can jump from B to a thunk at D.
+    auto d_thunk_end = [&] {
+      u64 d_end = align_to(offset, 1 << m[d]->p2align) + m[d]->sh_size;
+      return align_to(d_end, Thunk::alignment) + max_thunk_size;
+    };
+
     while (d < m.size() &&
-           align_to(offset, 1 << m[d]->p2align) + m[d]->sh_size + max_thunk_size <
-           m[b]->offset + max_distance()) {
+           (b == d || d_thunk_end() <= m[b]->offset + max_distance())) {
       offset = align_to(offset, 1 << m[d]->p2align);
       m[d]->offset = offset;
       offset += m[d]->sh_size;
@@ -247,13 +230,12 @@ void OutputSection<E>::create_range_extension_thunks(Context<E> &ctx) {
     // to make sure that there's at least one section between B and C
     // to ensure progress.
     c = b + 1;
-    while (c < m.size() &&
-           m[c]->offset + m[c]->sh_size < m[b]->offset + batch_size)
+    while (c < d && m[c]->offset + m[c]->sh_size < m[b]->offset + batch_size)
       c++;
 
     // Move A forward so that A is reachable from C.
     i64 c_offset = (c == m.size()) ? offset : m[c]->offset;
-    while (a < m.size() && m[a]->offset + max_distance() < c_offset)
+    while (a < b && a < m.size() && m[a]->offset + max_distance() < c_offset)
       a++;
 
     // Erase references to out-of-range thunks.
@@ -261,9 +243,9 @@ void OutputSection<E>::create_range_extension_thunks(Context<E> &ctx) {
       reset_thunk(*thunks[t++]);
 
     // Create a new thunk and place it at D.
-    offset = align_to(offset, RangeExtensionThunk<E>::alignment);
+    offset = align_to(offset, Thunk::alignment);
     i64 thunk_idx = thunks.size();
-    RangeExtensionThunk<E> *thunk = new RangeExtensionThunk<E>(*this, offset);
+    Thunk *thunk = new Thunk(*this, offset);
     thunks.emplace_back(thunk);
 
     // Scan relocations between B and C to collect symbols that need
