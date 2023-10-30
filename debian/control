@@ -8,7 +8,6 @@ Build-Depends:
  dwarfdump,
  libmimalloc-dev,
  libssl-dev,
- libtbb-dev,
  libxxhash-dev,
  pkg-config,
  zlib1g-dev,

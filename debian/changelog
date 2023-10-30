@@ -1,6 +1,8 @@
 mold (2.3.1+dfsg-4) UNRELEASED; urgency=medium
 
-  * Fix the license (AGPL => MIT) .
+  * Fix the license (AGPL => MIT)
+  * Drop build-dependency on libtbb-dev.
+    Thanks to Steve Langasek for the patch
 
  -- Sylvestre Ledru <sylvestre@debian.org>  Mon, 30 Oct 2023 08:53:31 +0100
 
