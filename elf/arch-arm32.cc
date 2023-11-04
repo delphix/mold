@@ -200,9 +200,9 @@ void write_plt_header(Context<E> &ctx, u8 *buf) {
     0xe08f'e00e, // 1: add lr, pc, lr
     0xe5be'f008, //    ldr pc, [lr, #8]!
     0x0000'0000, // 2: .word .got.plt - 1b - 8
-    0xe320'f000, //    nop
-    0xe320'f000, //    nop
-    0xe320'f000, //    nop
+    0x0000'0000, //    (padding)
+    0x0000'0000, //    (padding)
+    0x0000'0000, //    (padding)
   };
 
   memcpy(buf, insn, sizeof(insn));
@@ -225,7 +225,7 @@ void write_plt_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
 template <>
 void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
   memcpy(buf, plt_entry, sizeof(plt_entry));
-  *(ul32 *)(buf + 12) = sym.get_got_addr(ctx) - sym.get_plt_addr(ctx) - 12;
+  *(ul32 *)(buf + 12) = sym.get_got_pltgot_addr(ctx) - sym.get_plt_addr(ctx) - 12;
 }
 
 // ARM does not use .eh_frame for exception handling. Instead, it uses

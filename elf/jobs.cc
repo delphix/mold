@@ -1,3 +1,14 @@
+// Many build systems attempt to invoke as many linker processes as there
+// are cores, based on the assumption that the linker is single-threaded.
+// However, since mold is multi-threaded, such build systems' behavior is
+// not beneficial and just increases the overall peak memory usage.
+// On machines with limited memory, this could lead to an out-of-memory
+// error.
+//
+// This file implements a feature that limits the number of concurrent
+// mold processes to just 1 for each user. It is intended to be used as
+// `MOLD_JOBS=1 ninja` or `MOLD_JOBS=1 make -j$(nproc)`.
+
 #include "mold.h"
 
 #ifndef _WIN32
@@ -14,14 +25,15 @@ template <typename E>
 void acquire_global_lock(Context<E> &ctx) {
 #ifndef _WIN32
   char *jobs = getenv("MOLD_JOBS");
-  if (!jobs || std::string(jobs) != "1")
+  if (!jobs || jobs != "1"s)
     return;
 
-  char *home = getenv("HOME");
-  if (!home)
-    home = getpwuid(getuid())->pw_dir;
+  std::string path;
+  if (char *dir = getenv("XDG_RUNTIME_DIR"))
+    path = dir + "/mold-lock"s;
+  else
+    path = "/tmp/mold-lock-"s + getpwuid(getuid())->pw_name;
 
-  std::string path = std::string(home) + "/.mold-lock";
   int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
   if (fd == -1)
     return;

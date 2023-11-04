@@ -172,7 +172,7 @@ void write_plt_entry<E>(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
 
 template <>
 void write_pltgot_entry<E>(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
-  u64 got = sym.get_got_addr(ctx);
+  u64 got = sym.get_got_pltgot_addr(ctx);
   u64 plt = sym.get_plt_addr(ctx);
 
   memcpy(buf, E::is_64 ? plt_entry_64 : plt_entry_32, E::plt_size);
@@ -323,7 +323,14 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       write_k12(loc, (S + A) >> 52);
       break;
     case R_LARCH_PCALA_LO12:
-      write_k12(loc, S + A);
+      // It looks like R_LARCH_PCALA_LO12 is sometimes used for JIRL even
+      // though the instruction takes a 16 bit immediate rather than 12 bits.
+      // It is contrary to the psABI document, but GNU ld has special
+      // code to handle it, so we accept it too.
+      if ((*(ul32 *)loc & 0xfc00'0000) == 0x4c00'0000)
+        write_k16(loc, sign_extend(S + A, 11) >> 2);
+      else
+        write_k12(loc, S + A);
       break;
     case R_LARCH_PCALA_HI20:
       write_j20(loc, hi20(S + A, P));
@@ -653,10 +660,8 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 template <>
 void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
   static const ul32 insn[] = {
-    0x1a00'000c, // pcalau12i $t0, 0
-    0x02c0'018c, // addi.d    $t0, $t0, 0
+    0x1e00'000c, // pcaddu18i $t0, 0
     0x4c00'0180, // jirl      $zero, $t0, 0
-    0x0340'0000, // nop
   };
 
   static_assert(E::thunk_size == sizeof(insn));
@@ -668,8 +673,8 @@ void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
     u64 S = sym->get_addr(ctx);
 
     memcpy(buf, insn, sizeof(insn));
-    write_j20(buf, hi20(S, P));
-    write_k12(buf + 4, S);
+    write_j20(buf, (S - P + 0x20000) >> 18);
+    write_k16(buf + 4, (S - P) >> 2);
 
     buf += sizeof(insn);
     P += sizeof(insn);

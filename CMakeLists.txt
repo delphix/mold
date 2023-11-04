@@ -44,7 +44,7 @@
 # features and behave exactly the same.
 
 cmake_minimum_required(VERSION 3.14)
-project(mold VERSION 2.3.1)
+project(mold VERSION 2.3.2)
 
 include(CMakeDependentOption)
 include(GNUInstallDirs)
@@ -160,12 +160,10 @@ endif()
 #
 # We enable mimalloc by default for 64-bit targets. It doesn't seem to
 # be stable on 32-bit targets.
-include(CheckCXXSourceCompiles)
-check_cxx_source_compiles(
-  "static_assert(sizeof(void *) == 4); int main() {}" P32)
+cmake_dependent_option(
+  MOLD_USE_MIMALLOC "Use mimalloc" ON
+  "CMAKE_SIZEOF_VOID_P EQUAL 8; NOT APPLE; NOT ANDROID; NOT OPENBSD" OFF)
 
-cmake_dependent_option(MOLD_USE_MIMALLOC "Use mimalloc" ON
-  "NOT APPLE; NOT ANDROID; NOT OPENBSD; NOT P32" OFF)
 cmake_dependent_option(
   MOLD_USE_SYSTEM_MIMALLOC "Use system or vendored mimalloc" OFF
   MOLD_USE_MIMALLOC OFF)
