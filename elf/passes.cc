@@ -397,7 +397,7 @@ template <typename E>
 void add_comment_string(Context<E> &ctx, std::string str) {
   MergedSection<E> *sec =
     MergedSection<E>::get_instance(ctx, ".comment", SHT_PROGBITS,
-                                   SHF_MERGE | SHF_STRINGS);
+                                   SHF_MERGE | SHF_STRINGS, 1);
 
   std::string_view buf = save_string(ctx, str);
   std::string_view data(buf.data(), buf.size() + 1);
@@ -1250,12 +1250,15 @@ void compute_section_sizes(Context<E> &ctx) {
   // inserting thunks. This pass cannot be parallelized. That is,
   // create_range_extension_thunks is parallelized internally, but the
   // function itself is not thread-safe.
-  if constexpr (needs_thunk<E>)
+  if constexpr (needs_thunk<E>) {
+    Timer t2(ctx, "create_range_extension_thunks");
+
     if (!ctx.arg.relocatable)
       for (Chunk<E> *chunk : ctx.chunks)
         if (OutputSection<E> *osec = chunk->to_osec())
           if (osec->shdr.sh_flags & SHF_EXECINSTR)
             osec->create_range_extension_thunks(ctx);
+  }
 }
 
 // Find all unresolved symbols and attach them to the most appropriate files.
@@ -1532,9 +1535,11 @@ template <typename E>
 void create_output_symtab(Context<E> &ctx) {
   Timer t(ctx, "compute_symtab_size");
 
-  tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
-    chunk->compute_symtab_size(ctx);
-  });
+  if (!ctx.arg.strip_all && !ctx.arg.retain_symbols_file) {
+    tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
+      chunk->compute_symtab_size(ctx);
+    });
+  }
 
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     file->compute_symtab_size(ctx);
@@ -1932,23 +1937,31 @@ void sort_output_sections_regular(Context<E> &ctx) {
 
   // Ties are broken by additional rules
   auto get_rank2 = [&](Chunk<E> *chunk) -> i64 {
-    if (chunk->shdr.sh_type == SHT_NOTE)
-      return -chunk->shdr.sh_addralign;
+    ElfShdr<E> &shdr = chunk->shdr;
+    if (shdr.sh_type == SHT_NOTE)
+      return -shdr.sh_addralign;
 
     if (chunk == ctx.got)
-      return 1;
-    if (chunk->name == ".toc")
       return 2;
-    if (chunk->name == ".alpha_got")
+    if (chunk->name == ".toc")
       return 3;
+    if (chunk->name == ".alpha_got")
+      return 4;
+
+    if (shdr.sh_flags & SHF_MERGE) {
+      if (shdr.sh_flags & SHF_STRINGS)
+        return (5LL << 32) | shdr.sh_entsize;
+      return (6LL << 32) | shdr.sh_entsize;
+    }
+
     if (chunk == ctx.relro_padding)
-      return INT_MAX;
+      return INT64_MAX;
     return 0;
   };
 
   sort(ctx.chunks, [&](Chunk<E> *a, Chunk<E> *b) {
-    return std::tuple{get_rank1(a), get_rank2(a)} <
-           std::tuple{get_rank1(b), get_rank2(b)};
+    return std::tuple{get_rank1(a), get_rank2(a), a->name} <
+           std::tuple{get_rank1(b), get_rank2(b), b->name};
   });
 }
 

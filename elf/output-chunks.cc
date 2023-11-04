@@ -462,6 +462,14 @@ template <typename E>
 void StrtabSection<E>::update_shdr(Context<E> &ctx) {
   i64 offset = 1;
 
+  // ARM32 uses $a, $t and $t mapping symbols to mark the beginning of
+  // ARM, Thumb and data in text, respectively. These symbols don't
+  // affect correctness of the program but helps disassembler to
+  // disassemble machine code appropriately.
+  if constexpr (is_arm32<E>)
+    if (!ctx.arg.strip_all && !ctx.arg.retain_symbols_file)
+      offset += sizeof("$a\0$t\0$d");
+
   for (Chunk<E> *chunk : ctx.chunks) {
     chunk->strtab_offset = offset;
     offset += chunk->strtab_size;
@@ -478,6 +486,16 @@ void StrtabSection<E>::update_shdr(Context<E> &ctx) {
   }
 
   this->shdr.sh_size = (offset == 1) ? 0 : offset;
+}
+
+template <typename E>
+void StrtabSection<E>::copy_buf(Context<E> &ctx) {
+  u8 *buf = ctx.buf + this->shdr.sh_offset;
+  buf[0] = '\0';
+
+  if constexpr (is_arm32<E>)
+    if (!ctx.arg.strip_all && !ctx.arg.retain_symbols_file)
+      memcpy(buf + 1, "$a\0$t\0$d", 9);
 }
 
 template <typename E>
@@ -590,9 +608,6 @@ template <typename E>
 void SymtabSection<E>::copy_buf(Context<E> &ctx) {
   ElfSym<E> *buf = (ElfSym<E> *)(ctx.buf + this->shdr.sh_offset);
   memset(buf, 0, sizeof(ElfSym<E>));
-
-  // Write the initial NUL byte to .strtab.
-  ctx.buf[ctx.strtab->shdr.sh_offset] = '\0';
 
   if (ctx.symtab_shndx) {
     ElfShdr<E> &shdr = ctx.symtab_shndx->shdr;
@@ -850,7 +865,7 @@ OutputSection<E>::OutputSection(Context<E> &ctx, std::string_view name,
                                 u32 type, u64 flags) {
   this->name = name;
   this->shdr.sh_type = type;
-  this->shdr.sh_flags = flags;
+  this->shdr.sh_flags = flags & ~SHF_MERGE & ~SHF_STRINGS;
 
   if (auto it = ctx.arg.section_align.find(name);
       it != ctx.arg.section_align.end())
@@ -883,31 +898,30 @@ void OutputSection<E>::copy_buf(Context<E> &ctx) {
 
 template <typename E>
 void OutputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
-  auto clear = [&](u8 *loc, i64 size) {
-    // As a special case, .init and .fini are filled with NOPs for s390x
-    // because the runtime executes the sections as if they were a single
-    // function. .init and .fini are superceded by .init_array and
-    // .fini_array but being actively used only on s390x.
-    if constexpr (is_s390x<E>) {
-      if (this->name == ".init" || this->name == ".fini") {
-        for (i64 i = 0; i < size; i += 2)
-          *(ub16 *)(loc + i) = 0x0700; // nop
-        return;
-      }
-    }
-    memset(loc, 0, size);
-  };
-
   tbb::parallel_for((i64)0, (i64)members.size(), [&](i64 i) {
-    // Copy section contents to an output file
+    // Copy section contents to an output file.
     InputSection<E> &isec = *members[i];
     isec.write_to(ctx, buf + isec.offset);
 
-    // Clear trailing padding
+    // Clear trailing padding. We write trap or nop instructions for
+    // an executable segment so that a disassembler wouldn't try to
+    // disassemble garbage as instructions.
     u64 this_end = isec.offset + isec.sh_size;
-    u64 next_start = (i == members.size() - 1) ?
-      (u64)this->shdr.sh_size : members[i + 1]->offset;
-    clear(buf + this_end, next_start - this_end);
+    u64 next_start;
+    if (i + 1 < members.size())
+      next_start = members[i + 1]->offset;
+    else
+      next_start = this->shdr.sh_size;
+
+    u8 *loc = buf + this_end;
+    i64 size = next_start - this_end;
+
+    if (this->shdr.sh_flags & SHF_EXECINSTR) {
+      for (i64 i = 0; i + sizeof(E::filler) <= size; i += sizeof(E::filler))
+        memcpy(loc + i, E::filler, sizeof(E::filler));
+    } else {
+      memset(loc, 0, size);
+    }
   });
 
   if constexpr (needs_thunk<E>) {
@@ -1001,15 +1015,9 @@ void OutputSection<E>::construct_relr(Context<E> &ctx) {
 // Compute spaces needed for thunk symbols
 template <typename E>
 void OutputSection<E>::compute_symtab_size(Context<E> &ctx) {
-  if (ctx.arg.strip_all || ctx.arg.retain_symbols_file || ctx.arg.relocatable)
-    return;
-
   if constexpr (needs_thunk<E>) {
     this->strtab_size = 0;
     this->num_local_symtab = 0;
-
-    if constexpr (is_arm32<E>)
-      this->strtab_size = 9; // for "$t", "$a" and "$d" symbols
 
     for (std::unique_ptr<RangeExtensionThunk<E>> &thunk : thunks) {
       // For ARM32, we emit additional symbol "$t", "$a" and "$d" for
@@ -1031,7 +1039,7 @@ void OutputSection<E>::compute_symtab_size(Context<E> &ctx) {
 // disassembling and/or debugging our output.
 template <typename E>
 void OutputSection<E>::populate_symtab(Context<E> &ctx) {
-  if (this->strtab_size == 0)
+  if (this->num_local_symtab == 0)
     return;
 
   if constexpr (needs_thunk<E>) {
@@ -1041,37 +1049,30 @@ void OutputSection<E>::populate_symtab(Context<E> &ctx) {
     u8 *strtab_base = ctx.buf + ctx.strtab->shdr.sh_offset;
     u8 *strtab = strtab_base + this->strtab_offset;
 
-    if constexpr (is_arm32<E>) {
-      // ARM uses these symbols to mark the begining of Thumb code, ARM
-      // code and data, respectively. Our thunk contains all of them.
-      strtab += write_string(strtab, "$t");
-      strtab += write_string(strtab, "$a");
-      strtab += write_string(strtab, "$d");
-    }
+    auto write_esym = [&](u64 addr, i64 st_name) {
+      memset(esym, 0, sizeof(*esym));
+      esym->st_name = st_name;
+      esym->st_type = STT_FUNC;
+      esym->st_shndx = this->shndx;
+      esym->st_value = addr;
+      esym++;
+    };
 
     for (std::unique_ptr<RangeExtensionThunk<E>> &thunk : thunks) {
       for (i64 i = 0; i < thunk->symbols.size(); i++) {
         Symbol<E> &sym = *thunk->symbols[i];
+        u64 addr = thunk->get_addr(i);
 
-        auto write_esym = [&](i64 st_name, i64 off) {
-          memset(esym, 0, sizeof(*esym));
-          esym->st_name = st_name;
-          esym->st_type = STT_FUNC;
-          esym->st_shndx = this->shndx;
-          esym->st_value = thunk->get_addr(i) + off;
-          esym++;
-        };
-
-        write_esym(strtab - strtab_base, 0);
+        write_esym(addr, strtab - strtab_base);
 
         strtab += write_string(strtab, sym.name()) - 1;
         strtab += write_string(strtab, "$thunk");
 
         // Emit "$t", "$a" and "$d" if ARM32.
         if constexpr (is_arm32<E>) {
-          write_esym(this->strtab_offset, 0);
-          write_esym(this->strtab_offset + 3, 4);
-          write_esym(this->strtab_offset + 6, 12);
+          write_esym(addr, ctx.strtab->THUMB);
+          write_esym(addr + 4, ctx.strtab->ARM);
+          write_esym(addr + 12, ctx.strtab->DATA);
         }
       }
     }
@@ -1081,7 +1082,14 @@ void OutputSection<E>::populate_symtab(Context<E> &ctx) {
 template <typename E>
 void GotSection<E>::add_got_symbol(Context<E> &ctx, Symbol<E> *sym) {
   sym->set_got_idx(ctx, this->shdr.sh_size / sizeof(Word<E>));
-  this->shdr.sh_size += sizeof(Word<E>);
+
+  // An IFUNC symbol uses two GOT slots in a position-dependent
+  // executable.
+  if (sym->is_pde_ifunc(ctx))
+    this->shdr.sh_size += sizeof(Word<E>) * 2;
+  else
+    this->shdr.sh_size += sizeof(Word<E>);
+
   got_syms.push_back(sym);
 }
 
@@ -1105,10 +1113,10 @@ void GotSection<E>::add_tlsdesc_symbol(Context<E> &ctx, Symbol<E> *sym) {
   // always emit a dynamic relocation for each TLSDESC entry.
   //
   // If dynamic relocation is not available (i.e. if we are creating a
-  // non-PIC executable), we always relax TLSDESC relocations so that
-  // no TLSDESC relocation exist at runtime.
+  // statically-linked executable), we always relax TLSDESC relocations
+  // so that no TLSDESC relocation exist at runtime.
   assert(supports_tlsdesc<E>);
-  assert(ctx.arg.pic);
+  assert(!ctx.arg.is_static);
 
   sym->set_tlsdesc_idx(ctx, this->shdr.sh_size / sizeof(Word<E>));
   this->shdr.sh_size += sizeof(Word<E>) * 2;
@@ -1175,7 +1183,12 @@ static std::vector<GotEntry<E>> get_got_entries(Context<E> &ctx) {
     // IFUNC always needs to be fixed up by the dynamic linker.
     if constexpr (supports_ifunc<E>) {
       if (sym->is_ifunc()) {
-        add({idx, sym->get_addr(ctx, NO_PLT), E::R_IRELATIVE});
+        if (sym->is_pde_ifunc(ctx)) {
+          add({idx, sym->get_plt_addr(ctx)});
+          add({idx + 1, sym->get_addr(ctx, NO_PLT), E::R_IRELATIVE});
+        } else {
+          add({idx, sym->get_addr(ctx, NO_PLT), E::R_IRELATIVE});
+        }
         continue;
       }
     }
@@ -1330,9 +1343,6 @@ void GotSection<E>::construct_relr(Context<E> &ctx) {
 
 template <typename E>
 void GotSection<E>::compute_symtab_size(Context<E> &ctx) {
-  if (ctx.arg.strip_all || ctx.arg.retain_symbols_file)
-    return;
-
   this->strtab_size = 0;
   this->num_local_symtab = 0;
 
@@ -1364,7 +1374,7 @@ void GotSection<E>::compute_symtab_size(Context<E> &ctx) {
 
 template <typename E>
 void GotSection<E>::populate_symtab(Context<E> &ctx) {
-  if (this->strtab_size == 0)
+  if (this->num_local_symtab == 0)
     return;
 
   ElfSym<E> *esym =
@@ -1455,19 +1465,19 @@ void PltSection<E>::copy_buf(Context<E> &ctx) {
 
 template <typename E>
 void PltSection<E>::compute_symtab_size(Context<E> &ctx) {
-  if (ctx.arg.strip_all || ctx.arg.retain_symbols_file)
-    return;
-
   this->num_local_symtab = symbols.size();
   this->strtab_size = 0;
 
   for (Symbol<E> *sym : symbols)
     this->strtab_size += sym->name().size() + sizeof("$plt");
+
+  if constexpr (is_arm32<E>)
+    this->num_local_symtab += symbols.size() * 2 + 2;
 }
 
 template <typename E>
 void PltSection<E>::populate_symtab(Context<E> &ctx) {
-  if (this->strtab_size == 0)
+  if (this->num_local_symtab == 0)
     return;
 
   ElfSym<E> *esym =
@@ -1476,16 +1486,30 @@ void PltSection<E>::populate_symtab(Context<E> &ctx) {
   u8 *strtab_base = ctx.buf + ctx.strtab->shdr.sh_offset;
   u8 *strtab = strtab_base + this->strtab_offset;
 
-  for (Symbol<E> *sym : symbols) {
+  auto write_esym = [&](u64 addr, i64 st_name) {
     memset(esym, 0, sizeof(*esym));
-    esym->st_name = strtab - strtab_base;
+    esym->st_name = st_name;
     esym->st_type = STT_FUNC;
     esym->st_shndx = this->shndx;
-    esym->st_value = sym->get_plt_addr(ctx);
+    esym->st_value = addr;
     esym++;
+  };
 
+  if constexpr (is_arm32<E>) {
+    write_esym(this->shdr.sh_addr, ctx.strtab->ARM);
+    write_esym(this->shdr.sh_addr + 16, ctx.strtab->DATA);
+  }
+
+  for (Symbol<E> *sym : symbols) {
+    u64 addr = sym->get_plt_addr(ctx);
+    write_esym(addr, strtab - strtab_base);
     strtab += write_string(strtab, sym->name()) - 1;
     strtab += write_string(strtab, "$plt");
+
+    if constexpr (is_arm32<E>) {
+      write_esym(addr, ctx.strtab->ARM);
+      write_esym(addr + 12, ctx.strtab->DATA);
+    }
   }
 }
 
@@ -1508,19 +1532,19 @@ void PltGotSection<E>::copy_buf(Context<E> &ctx) {
 
 template <typename E>
 void PltGotSection<E>::compute_symtab_size(Context<E> &ctx) {
-  if (ctx.arg.strip_all || ctx.arg.retain_symbols_file)
-    return;
-
   this->num_local_symtab = symbols.size();
   this->strtab_size = 0;
 
   for (Symbol<E> *sym : symbols)
     this->strtab_size += sym->name().size() + sizeof("$pltgot");
+
+  if constexpr (is_arm32<E>)
+    this->num_local_symtab += symbols.size() * 2;
 }
 
 template <typename E>
 void PltGotSection<E>::populate_symtab(Context<E> &ctx) {
-  if (this->strtab_size == 0)
+  if (this->num_local_symtab == 0)
     return;
 
   ElfSym<E> *esym =
@@ -1529,16 +1553,25 @@ void PltGotSection<E>::populate_symtab(Context<E> &ctx) {
   u8 *strtab_base = ctx.buf + ctx.strtab->shdr.sh_offset;
   u8 *strtab = strtab_base + this->strtab_offset;
 
-  for (Symbol<E> *sym : symbols) {
+  auto write_esym = [&](u64 addr, i64 st_name) {
     memset(esym, 0, sizeof(*esym));
-    esym->st_name = strtab - strtab_base;
+    esym->st_name = st_name;
     esym->st_type = STT_FUNC;
     esym->st_shndx = this->shndx;
-    esym->st_value = sym->get_plt_addr(ctx);
+    esym->st_value = addr;
     esym++;
+  };
 
+  for (Symbol<E> *sym : symbols) {
+    u64 addr = sym->get_plt_addr(ctx);
+    write_esym(addr, strtab - strtab_base);
     strtab += write_string(strtab, sym->name()) - 1;
     strtab += write_string(strtab, "$pltgot");
+
+    if constexpr (is_arm32<E>) {
+      write_esym(addr, ctx.strtab->ARM);
+      write_esym(addr + 12, ctx.strtab->DATA);
+    }
   }
 }
 
@@ -1635,8 +1668,15 @@ ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym, u32 st_name,
     esym.st_shndx = SHN_ABS;
     esym.st_value = sym.get_addr(ctx);
   } else if (sym.get_type() == STT_TLS) {
+    // TLS symbol
     shndx = get_st_shndx(sym);
     esym.st_value = sym.get_addr(ctx) - ctx.tls_begin;
+  } else if (sym.is_pde_ifunc(ctx)) {
+    // IFUNC symbol in PDE that uses two GOT slots
+    shndx = get_st_shndx(sym);
+    esym.st_type = STT_FUNC;
+    esym.st_visibility = sym.visibility;
+    esym.st_value = sym.get_addr(ctx);
   } else {
     shndx = get_st_shndx(sym);
     esym.st_visibility = sym.visibility;
@@ -1877,29 +1917,30 @@ get_merged_output_name(Context<E> &ctx, std::string_view name, u64 flags) {
     return name;
   if (ctx.arg.unique && ctx.arg.unique->match(name))
     return name;
-  if (name == ".rodata" || name.starts_with(".rodata."))
-    return (flags & SHF_STRINGS) ? ".rodata.str" : ".rodata.cst";
   return name;
 }
 
 template <typename E>
-MergedSection<E>::MergedSection(std::string_view name, u64 flags, u32 type) {
+MergedSection<E>::MergedSection(std::string_view name, i64 flags, i64 type,
+                                i64 entsize) {
   this->name = name;
   this->shdr.sh_flags = flags;
   this->shdr.sh_type = type;
+  this->shdr.sh_entsize = entsize;
 }
 
 template <typename E>
 MergedSection<E> *
 MergedSection<E>::get_instance(Context<E> &ctx, std::string_view name,
-                               u64 type, u64 flags) {
+                               i64 type, i64 flags, i64 entsize) {
   name = get_merged_output_name(ctx, name, flags);
   flags = flags & ~(u64)SHF_GROUP & ~(u64)SHF_COMPRESSED;
 
   auto find = [&]() -> MergedSection * {
     for (std::unique_ptr<MergedSection<E>> &osec : ctx.merged_sections)
-      if (std::tuple(name, flags, type) ==
-          std::tuple(osec->name, osec->shdr.sh_flags, osec->shdr.sh_type))
+      if (std::tuple(name, flags, type, entsize) ==
+          std::tuple(osec->name, osec->shdr.sh_flags, osec->shdr.sh_type,
+                     osec->shdr.sh_entsize))
         return osec.get();
     return nullptr;
   };
@@ -1917,7 +1958,7 @@ MergedSection<E>::get_instance(Context<E> &ctx, std::string_view name,
   if (MergedSection *osec = find())
     return osec;
 
-  MergedSection *osec = new MergedSection(name, flags, type);
+  MergedSection *osec = new MergedSection(name, flags, type, entsize);
   ctx.merged_sections.emplace_back(osec);
   return osec;
 }
@@ -1947,67 +1988,49 @@ MergedSection<E>::insert(Context<E> &ctx, std::string_view data, u64 hash,
 template <typename E>
 void MergedSection<E>::assign_offsets(Context<E> &ctx) {
   std::vector<i64> sizes(map.NUM_SHARDS);
-  std::vector<i64> max_p2aligns(map.NUM_SHARDS);
-  shard_offsets.resize(map.NUM_SHARDS + 1);
-
-  i64 shard_size = map.nbuckets / map.NUM_SHARDS;
+  Atomic<i64> alignment = 1;
 
   tbb::parallel_for((i64)0, map.NUM_SHARDS, [&](i64 i) {
-    struct KeyVal {
-      std::string_view key;
-      SectionFragment<E> *val;
-    };
+    using Entry = typename decltype(map)::Entry;
+    std::vector<Entry *> entries = map.get_sorted_entries(i);
 
-    std::vector<KeyVal> fragments;
-    fragments.reserve(shard_size);
-
-    for (i64 j = shard_size * i; j < shard_size * (i + 1); j++)
-      if (const char *key = map.get_key(j))
-        if (SectionFragment<E> &frag = map.entries[j].value; frag.is_alive)
-          fragments.push_back({{key, map.entries[j].keylen}, &frag});
-
-    // Sort fragments to make output deterministic.
-    tbb::parallel_sort(fragments.begin(), fragments.end(),
-                       [](const KeyVal &a, const KeyVal &b) {
-      return std::tuple{(u32)a.val->p2align, a.key.size(), a.key} <
-             std::tuple{(u32)b.val->p2align, b.key.size(), b.key};
-    });
-
-    // Assign offsets.
     i64 offset = 0;
     i64 p2align = 0;
 
-    for (KeyVal &kv : fragments) {
-      SectionFragment<E> &frag = *kv.val;
-      offset = align_to(offset, 1 << frag.p2align);
-      frag.offset = offset;
-      offset += kv.key.size();
-      p2align = std::max<i64>(p2align, frag.p2align);
+    for (Entry *ent : entries) {
+      SectionFragment<E> &frag = ent->value;
+      if (frag.is_alive) {
+        offset = align_to(offset, 1 << frag.p2align);
+        frag.offset = offset;
+        offset += ent->keylen;
+        p2align = std::max<i64>(p2align, frag.p2align);
+      }
     }
 
     sizes[i] = offset;
-    max_p2aligns[i] = p2align;
+    update_maximum(alignment, 1 << p2align);
 
     static Counter merged_strings("merged_strings");
-    merged_strings += fragments.size();
+    merged_strings += entries.size();
   });
 
-  i64 p2align = 0;
-  for (i64 x : max_p2aligns)
-    p2align = std::max(p2align, x);
+  i64 shard_size = map.nbuckets / map.NUM_SHARDS;
+  shard_offsets.resize(map.NUM_SHARDS + 1);
 
   for (i64 i = 1; i < map.NUM_SHARDS + 1; i++)
     shard_offsets[i] =
-      align_to(shard_offsets[i - 1] + sizes[i - 1], 1 << p2align);
+      align_to(shard_offsets[i - 1] + sizes[i - 1], alignment);
 
   tbb::parallel_for((i64)1, map.NUM_SHARDS, [&](i64 i) {
-    for (i64 j = shard_size * i; j < shard_size * (i + 1); j++)
-      if (SectionFragment<E> &frag = map.entries[j].value; frag.is_alive)
+    for (i64 j = shard_size * i; j < shard_size * (i + 1); j++) {
+      SectionFragment<E> &frag = map.entries[j].value;
+      if (frag.is_alive)
         frag.offset += shard_offsets[i];
+    }
   });
 
   this->shdr.sh_size = shard_offsets[map.NUM_SHARDS];
-  this->shdr.sh_addralign = 1 << p2align;
+  this->shdr.sh_addralign = alignment;
 }
 
 template <typename E>
@@ -2023,9 +2046,11 @@ void MergedSection<E>::write_to(Context<E> &ctx, u8 *buf) {
     memset(buf + shard_offsets[i], 0, shard_offsets[i + 1] - shard_offsets[i]);
 
     for (i64 j = shard_size * i; j < shard_size * (i + 1); j++)
-      if (const char *key = map.get_key(j))
-        if (SectionFragment<E> &frag = map.entries[j].value; frag.is_alive)
+      if (const char *key = map.entries[j].key) {
+        SectionFragment<E> &frag = map.entries[j].value;
+        if (frag.is_alive)
           memcpy(buf + frag.offset, key, map.entries[j].keylen);
+      }
   });
 }
 
@@ -2033,7 +2058,7 @@ template <typename E>
 void MergedSection<E>::print_stats(Context<E> &ctx) {
   i64 used = 0;
   for (i64 i = 0; i < map.nbuckets; i++)
-    if (map.get_key(i))
+    if (map.entries[i].key)
       used++;
 
   SyncOut(ctx) << this->name
@@ -2315,8 +2340,7 @@ void CopyrelSection<E>::update_shdr(Context<E> &ctx) {
   // a segment, so a .copyrel.rel.ro usually requires one extra
   // segment for it. We turn a .copyrel.rel.ro into a regular section
   // if it is very small to avoid the cost of the extra segment.
-  constexpr i64 threshold = 4096;
-  if (this->is_relro && ctx.arg.z_relro && this->shdr.sh_size < threshold)
+  if (this->is_relro && ctx.arg.z_relro && this->shdr.sh_size < E::page_size)
     this->shdr.sh_type = SHT_PROGBITS;
 }
 
