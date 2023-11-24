@@ -63,7 +63,7 @@ void InputFile<E>::clear_symbols() {
       sym->origin = 0;
       sym->value = -1;
       sym->sym_idx = -1;
-      sym->ver_idx = 0;
+      sym->ver_idx = VER_NDX_UNSPECIFIED;
       sym->is_weak = false;
       sym->is_imported = false;
       sym->is_exported = false;
@@ -313,6 +313,15 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
         llvm_addrsig = std::move(this->sections[i]);
         continue;
       }
+
+      if (shdr.sh_type == SHT_INIT_ARRAY ||
+          shdr.sh_type == SHT_FINI_ARRAY ||
+          shdr.sh_type == SHT_PREINIT_ARRAY)
+        ctx.has_init_array = true;
+
+      if (name == ".ctors" || name.starts_with(".ctors.") ||
+          name == ".dtors" || name.starts_with(".dtors."))
+        ctx.has_ctors = true;
 
       if (name == ".eh_frame")
         eh_frame_section = this->sections[i].get();
@@ -644,9 +653,13 @@ split_section(Context<E> &ctx, InputSection<E> &sec) {
   if (entsize == 0)
     return nullptr;
 
+  i64 addralign = shdr.sh_addralign;
+  if (addralign == 0)
+    addralign = 1;
+
   std::unique_ptr<MergeableSection<E>> rec(new MergeableSection<E>);
   rec->parent = MergedSection<E>::get_instance(ctx, sec.name(), shdr.sh_type,
-                                               shdr.sh_flags, entsize);
+                                               shdr.sh_flags, entsize, addralign);
   rec->p2align = sec.p2align;
 
   if (sec.sh_size == 0)
@@ -1277,17 +1290,17 @@ void SharedFile<E>::parse(Context<E> &ctx) {
       continue;
 
     std::string_view name = this->symbol_strtab.data() + esyms[i].st_name;
-    bool is_hidden = (!vers.empty() && (vers[i] & VERSYM_HIDDEN));
+    bool is_default = vers.empty() || !(vers[i] & VERSYM_HIDDEN);
 
     this->elf_syms2.push_back(esyms[i]);
     this->versyms.push_back(ver);
 
-    if (is_hidden) {
+    if (is_default) {
+      this->symbols.push_back(get_symbol(ctx, name));
+    } else {
       std::string_view mangled_name = save_string(
         ctx, std::string(name) + "@" + std::string(version_strings[ver]));
       this->symbols.push_back(get_symbol(ctx, mangled_name, name));
-    } else {
-      this->symbols.push_back(get_symbol(ctx, name));
     }
   }
 
@@ -1342,6 +1355,9 @@ std::vector<std::string_view> SharedFile<E>::read_verdef(Context<E> &ctx) {
   ElfVerdef<E> *ver = (ElfVerdef<E> *)verdef.data();
 
   for (;;) {
+    if (ver->vd_ndx == VER_NDX_UNSPECIFIED)
+      Fatal(ctx) << *this << ": symbol version too large";
+
     if (ret.size() <= ver->vd_ndx)
       ret.resize(ver->vd_ndx + 1);
 

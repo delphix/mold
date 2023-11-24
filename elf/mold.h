@@ -768,7 +768,7 @@ class MergedSection : public Chunk<E> {
 public:
   static MergedSection<E> *
   get_instance(Context<E> &ctx, std::string_view name, i64 type, i64 flags,
-               i64 entsize);
+               i64 entsize, i64 addralign);
 
   SectionFragment<E> *insert(Context<E> &ctx, std::string_view data,
                              u64 hash, i64 p2align);
@@ -1281,8 +1281,15 @@ get_script_output_type(Context<E> &ctx, MappedFile<Context<E>> *mf);
 template <typename E>
 void parse_version_script(Context<E> &ctx, MappedFile<Context<E>> *mf);
 
+struct DynamicPattern {
+  std::string_view pattern;
+  std::string_view source;
+  bool is_cpp = false;
+};
+
 template <typename E>
-void parse_dynamic_list(Context<E> &ctx, MappedFile<Context<E>> *mf);
+std::vector<DynamicPattern>
+parse_dynamic_list(Context<E> &ctx, std::string_view path);
 
 //
 // lto.cc
@@ -1372,6 +1379,7 @@ template <typename E> void check_duplicate_symbols(Context<E> &);
 template <typename E> void check_symbol_types(Context<E> &);
 template <typename E> void sort_init_fini(Context<E> &);
 template <typename E> void sort_ctor_dtor(Context<E> &);
+template <typename E> void fixup_ctors_in_init_array(Context<E> &);
 template <typename E> void shuffle_sections(Context<E> &);
 template <typename E> void compute_section_sizes(Context<E> &);
 template <typename E> void sort_output_sections(Context<E> &);
@@ -1718,6 +1726,8 @@ struct Context {
     std::unordered_set<std::string_view> ignore_ir_file;
     std::unordered_set<std::string_view> wrap;
     std::vector<SectionOrder> section_order;
+    std::vector<Symbol<E> *> require_defined;
+    std::vector<Symbol<E> *> undefined;
     std::vector<std::pair<Symbol<E> *, std::variant<Symbol<E> *, u64>>> defsyms;
     std::vector<std::string> library_paths;
     std::vector<std::string> plugin_opt;
@@ -1725,19 +1735,15 @@ struct Context {
     std::vector<std::string_view> auxiliary;
     std::vector<std::string_view> exclude_libs;
     std::vector<std::string_view> filter;
-    std::vector<std::string_view> require_defined;
     std::vector<std::string_view> trace_symbol;
-    std::vector<std::string_view> undefined;
     u64 image_base = 0x200000;
   } arg;
 
   std::vector<VersionPattern> version_patterns;
-  u16 default_version = VER_NDX_GLOBAL;
+  std::vector<DynamicPattern> dynamic_list_patterns;
+  i64 default_version = VER_NDX_UNSPECIFIED;
   i64 page_size = E::page_size;
   std::optional<int> global_lock_fd;
-
-  // true if default_version is set by a wildcard in version script.
-  bool default_version_from_version_script = false;
 
   // Reader context
   bool as_needed = false;
@@ -1750,6 +1756,8 @@ struct Context {
 
   bool has_error = false;
   bool has_lto_object = false;
+  Atomic<bool> has_init_array = false;
+  Atomic<bool> has_ctors = false;
 
   // Symbol table
   tbb::concurrent_hash_map<std::string_view, Symbol<E>, HashCmp> symbol_map;
@@ -2031,7 +2039,7 @@ public:
   i32 sym_idx = -1;
 
   i32 aux_idx = -1;
-  u16 ver_idx = 0;
+  u16 ver_idx = VER_NDX_UNSPECIFIED;
 
   // `flags` has NEEDS_ flags.
   Atomic<u8> flags = 0;
