@@ -660,9 +660,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       else
         Fatal(ctx) << "unknown --unresolved-symbols argument: " << arg;
     } else if (read_arg("undefined") || read_arg("u")) {
-      ctx.arg.undefined.push_back(arg);
+      ctx.arg.undefined.push_back(get_symbol(ctx, arg));
     } else if (read_arg("require-defined")) {
-      ctx.arg.require_defined.push_back(arg);
+      ctx.arg.require_defined.push_back(get_symbol(ctx, arg));
     } else if (read_arg("init")) {
       ctx.arg.init = arg;
     } else if (read_arg("fini")) {
@@ -1104,21 +1104,21 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("no-keep-memory")) {
     } else if (read_arg("max-cache-size")) {
     } else if (read_arg("version-script")) {
-      // --version-script, --dynamic-list and --export-dynamic-symbol[-list]
-      // are treated as positional arguments even though they are actually not
-      // positional. This is because linker scripts (a positional argument)
-      // can also specify a version script, and it's better to consolidate
-      // parsing in read_input_files. In particular, version scripts can
-      // modify ctx.default_version which we initialize *after* parsing
-      // non-positional args, so the parsing cannot be done right here.
+      // --version-script is treated as positional arguments even though
+      // they are actually not positional. This is because linker scripts
+      // (a positional argument) can also specify a version script, and
+      // it's better to consolidate parsing in read_input_files. In
+      // particular, version scripts can modify ctx.default_version which
+      // we initialize *after* parsing non-positional args, so the parsing
+      // cannot be done right here.
       remaining.push_back("--version-script=" + std::string(arg));
     } else if (read_arg("dynamic-list")) {
       ctx.arg.Bsymbolic = true;
-      remaining.push_back("--dynamic-list=" + std::string(arg));
+      append(ctx.dynamic_list_patterns, parse_dynamic_list(ctx, arg));
     } else if (read_arg("export-dynamic-symbol")) {
-      remaining.push_back("--export-dynamic-symbol=" + std::string(arg));
+      ctx.dynamic_list_patterns.push_back({arg, "<command line>"});
     } else if (read_arg("export-dynamic-symbol-list")) {
-      remaining.push_back("--export-dynamic-symbol-list=" + std::string(arg));
+      append(ctx.dynamic_list_patterns, parse_dynamic_list(ctx, arg));
     } else if (read_flag("as-needed")) {
       remaining.push_back("--as-needed");
     } else if (read_flag("no-as-needed")) {
@@ -1228,11 +1228,6 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if (char *env = getenv("MOLD_REPRO"); env && env[0])
     ctx.arg.repro = true;
 
-  if (ctx.arg.shared || ctx.arg.export_dynamic)
-    ctx.default_version = VER_NDX_GLOBAL;
-  else
-    ctx.default_version = VER_NDX_LOCAL;
-
   if (ctx.arg.default_symver) {
     std::string ver = ctx.arg.soname.empty() ?
       filepath(ctx.arg.output).filename().string() : std::string(ctx.arg.soname);
@@ -1243,7 +1238,13 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if (ctx.arg.shared && warn_shared_textrel)
     ctx.arg.warn_textrel = true;
 
-  ctx.arg.undefined.push_back(ctx.arg.entry);
+  ctx.arg.undefined.push_back(get_symbol(ctx, ctx.arg.entry));
+
+  for (i64 i = 0; i < ctx.arg.defsyms.size(); i++) {
+    std::variant<Symbol<E> *, u64> &val = ctx.arg.defsyms[i].second;
+    if (Symbol<E> **sym = std::get_if<Symbol<E> *>(&val))
+      ctx.arg.undefined.push_back(*sym);
+  }
 
   // --oformat=binary implies --strip-all because without a section
   // header, there's no way to identify the locations of a symbol

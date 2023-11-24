@@ -299,22 +299,6 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
       if (!mf)
         Fatal(ctx) << "--version-script: file not found: " << arg;
       parse_version_script(ctx, mf);
-    } else if (remove_prefix(arg, "--dynamic-list=")) {
-      MappedFile<Context<E>> *mf = find_from_search_paths(ctx, std::string(arg));
-      if (!mf)
-        Fatal(ctx) << "--dynamic-list: file not found: " << arg;
-      parse_dynamic_list(ctx, mf);
-    } else if (remove_prefix(arg, "--export-dynamic-symbol=")) {
-      if (arg == "*")
-        ctx.default_version = VER_NDX_GLOBAL;
-      else
-        ctx.version_patterns.push_back({arg, "--export-dynamic-symbol",
-                                        "global", VER_NDX_GLOBAL, false});
-    } else if (remove_prefix(arg, "--export-dynamic-symbol-list=")) {
-      MappedFile<Context<E>> *mf = find_from_search_paths(ctx, std::string(arg));
-      if (!mf)
-        Fatal(ctx) << "--export-dynamic-symbol-list: file not found: " << arg;
-      parse_dynamic_list(ctx, mf);
     } else if (arg == "--push-state") {
       state.push_back({ctx.as_needed, ctx.whole_archive, ctx.is_static,
                        ctx.in_lib});
@@ -523,9 +507,9 @@ int elf_main(int argc, char **argv) {
     write_repro_file(ctx);
 
   // Handle --require-defined
-  for (std::string_view name : ctx.arg.require_defined)
-    if (!get_symbol(ctx, name)->file)
-      Error(ctx) << "--require-defined: undefined symbol: " << name;
+  for (Symbol<E> *sym : ctx.arg.require_defined)
+    if (!sym->file)
+      Error(ctx) << "--require-defined: undefined symbol: " << *sym;
 
   // .init_array and .fini_array contents have to be sorted by
   // a special rule. Sort them.
@@ -534,6 +518,11 @@ int elf_main(int argc, char **argv) {
   // Likewise, .ctors and .dtors have to be sorted. They are rare
   // because they are superceded by .init_array/.fini_array, though.
   sort_ctor_dtor(ctx);
+
+  // If .ctors/.dtors are to be placed to .init_array/.fini_array,
+  // we need to reverse their contents.
+  if (ctx.has_init_array && ctx.has_ctors)
+    fixup_ctors_in_init_array(ctx);
 
   // Handle --shuffle-sections
   if (ctx.arg.shuffle_sections != SHUFFLE_SECTIONS_NONE)
