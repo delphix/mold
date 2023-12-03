@@ -5,8 +5,8 @@
 //
 // Even though they are similiar, ELFv1 isn't only different from ELFv2 in
 // endianness. The most notable difference is, in ELFv1, a function
-// pointer doesn't directly refer the entry point of a function but
-// instead refers a data structure so-called "function descriptor".
+// pointer doesn't directly refer to the entry point of a function but
+// instead refers to a data structure so-called "function descriptor".
 //
 // The function descriptor is essentially a pair of a function entry point
 // address and a value that should be set to %r2 before calling that
@@ -26,8 +26,8 @@
 //
 // In this way, you can't call a function just by knowing the function's
 // entry point address. You also need to know a proper %r2 value for the
-// function. This is why a function pointer refers a tuple of an address
-// and a %r2 value.
+// function. This is why a function pointer refers to a tuple of an
+// address and a %r2 value.
 //
 // If a function call is made through PLT, PLT takes care of restoring %r2.
 // Therefore, the caller has to restore %r2 only for function calls
@@ -40,7 +40,7 @@
 // few different addresses for different purposes. It may not only have an
 // entry point address but may also have PLT and/or GOT addresses.
 // In PPCV1, it may have an OPD address in addition to these. OPD address
-// is used for relocations that refers the address of a function as a
+// is used for relocations that refers to the address of a function as a
 // function pointer.
 //
 // https://github.com/rui314/psabi/blob/main/ppc64v1.pdf
@@ -72,22 +72,22 @@ void write_plt_header(Context<E> &ctx, u8 *buf) {
     0x7d88'02a6, // mflr    r12
     0x429f'0005, // bcl     20, 31, 4 // obtain PC
     0x7d68'02a6, // mflr    r11
-    0xe84b'0024, // ld      r2,36(r11)
     0x7d88'03a6, // mtlr    r12
-    0x7d62'5a14, // add     r11,r2,r11
+    0x3d6b'0000, // addis   r11, r11, GOTPLT_OFFSET@ha
+    0x396b'0000, // addi    r11, r11, GOTPLT_OFFSET@lo
     0xe98b'0000, // ld      r12,0(r11)
     0xe84b'0008, // ld      r2,8(r11)
     0x7d89'03a6, // mtctr   r12
     0xe96b'0010, // ld      r11,16(r11)
     0x4e80'0420, // bctr
-    // .quad .got.plt - .plt - 8
-    0x0000'0000,
-    0x0000'0000,
   };
 
   static_assert(sizeof(insn) == E::plt_hdr_size);
   memcpy(buf, insn, sizeof(insn));
-  *(ub64 *)(buf + 44) = ctx.gotplt->shdr.sh_addr - ctx.plt->shdr.sh_addr - 8;
+
+  i64 val = ctx.gotplt->shdr.sh_addr - ctx.plt->shdr.sh_addr - 8;
+  *(ub32 *)(buf + 16) |= higha(val);
+  *(ub32 *)(buf + 20) |= lo(val);
 }
 
 template <>
@@ -129,8 +129,8 @@ template <>
 void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {}
 
 template <>
-void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
-                                    u64 offset, u64 val) {
+void EhFrameSection<E>::apply_eh_reloc(Context<E> &ctx, const ElfRel<E> &rel,
+                                       u64 offset, u64 val) {
   u8 *loc = ctx.buf + this->shdr.sh_offset + offset;
 
   switch (rel.r_type) {
@@ -183,10 +183,10 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 
     switch (rel.r_type) {
     case R_PPC64_ADDR64:
-      apply_toc_rel(ctx, sym, rel, loc, S, A, P, dynrel);
+      apply_toc_rel(ctx, sym, rel, loc, S, A, P, &dynrel);
       break;
     case R_PPC64_TOC:
-      apply_toc_rel(ctx, *ctx.extra.TOC, rel, loc, TOC, A, P, dynrel);
+      apply_toc_rel(ctx, *ctx.extra.TOC, rel, loc, TOC, A, P, &dynrel);
       break;
     case R_PPC64_TOC16_HA:
       *(ub16 *)loc = ha(S + A - TOC);
@@ -217,6 +217,9 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         *(ub32 *)(loc + 4) = 0xe841'0028; // ld r2, 40(r1)
       break;
     }
+    case R_PPC64_REL32:
+      *(ub32 *)loc = S + A - P;
+      break;
     case R_PPC64_REL64:
       *(ub64 *)loc = S + A - P;
       break;
@@ -256,11 +259,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_PPC64_DTPREL16_HA:
       *(ub16 *)loc = ha(S + A - ctx.dtp_addr);
       break;
-    case R_PPC64_TPREL16_HA:
-      *(ub16 *)loc = ha(S + A - ctx.tp_addr);
-      break;
     case R_PPC64_DTPREL16_LO:
       *(ub16 *)loc = lo(S + A - ctx.dtp_addr);
+      break;
+    case R_PPC64_TPREL16_HA:
+      *(ub16 *)loc = ha(S + A - ctx.tp_addr);
       break;
     case R_PPC64_TPREL16_LO:
       *(ub16 *)loc = lo(S + A - ctx.tp_addr);
@@ -286,17 +289,11 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_NONE)
+    if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
-    const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
     u8 *loc = base + rel.r_offset;
-
-    if (!is_resolved(sym, esym)) {
-      record_undef_error(ctx, rel);
-      continue;
-    }
 
     auto check = [&](i64 val, i64 lo, i64 hi) {
       if (val < lo || hi <= val)
@@ -345,16 +342,10 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
   // Scan relocations
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_NONE)
+    if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
-    const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
-
-    if (!is_resolved(sym, esym)) {
-      record_undef_error(ctx, rel);
-      continue;
-    }
 
     if (sym.is_ifunc())
       sym.flags |= NEEDS_GOT | NEEDS_PLT | NEEDS_PPC_OPD;
@@ -366,8 +357,6 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 
     switch (rel.r_type) {
     case R_PPC64_ADDR64:
-      scan_toc_rel(ctx, sym, rel);
-      break;
     case R_PPC64_TOC:
       scan_toc_rel(ctx, sym, rel);
       break;
@@ -391,6 +380,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_PPC64_TPREL16_LO:
       check_tlsle(ctx, sym, rel);
       break;
+    case R_PPC64_REL32:
     case R_PPC64_REL64:
     case R_PPC64_TOC16_HA:
     case R_PPC64_TOC16_LO:
@@ -419,9 +409,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 }
 
 template <>
-void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
-
+void Thunk<E>::copy_buf(Context<E> &ctx) {
   // If the destination is .plt.got, we save the current r2, read an
   // address of a function descriptor from .got, restore %r2 and jump
   // to the function.
@@ -476,26 +464,27 @@ void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
   static_assert(E::thunk_size == sizeof(plt_thunk));
   static_assert(E::thunk_size == sizeof(local_thunk));
 
-  for (i64 i = 0; i < symbols.size(); i++) {
-    Symbol<E> &sym = *symbols[i];
-    ub32 *loc = (ub32 *)(buf + i * E::thunk_size);
+  u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
 
-    if (sym.has_got(ctx)) {
-      memcpy(loc, pltgot_thunk, sizeof(pltgot_thunk));
-      i64 val = sym.get_got_addr(ctx) - ctx.extra.TOC->value;
-      loc[1] |= higha(val);
-      loc[2] |= lo(val);
-    } else if(sym.has_plt(ctx)) {
-      memcpy(loc, plt_thunk, sizeof(plt_thunk));
-      i64 val = sym.get_gotplt_addr(ctx) - ctx.extra.TOC->value;
-      loc[1] |= higha(val);
-      loc[2] |= lo(val);
+  for (Symbol<E> *sym : symbols) {
+    if (sym->has_got(ctx)) {
+      i64 val = sym->get_got_addr(ctx) - ctx.extra.TOC->value;
+      memcpy(buf, pltgot_thunk, sizeof(pltgot_thunk));
+      *(ub32 *)(buf + 4) |= higha(val);
+      *(ub32 *)(buf + 8) |= lo(val);
+    } else if(sym->has_plt(ctx)) {
+      i64 val = sym->get_gotplt_addr(ctx) - ctx.extra.TOC->value;
+      memcpy(buf, plt_thunk, sizeof(plt_thunk));
+      *(ub32 *)(buf + 4) |= higha(val);
+      *(ub32 *)(buf + 8) |= lo(val);
     } else {
-      memcpy(loc, local_thunk, sizeof(local_thunk));
-      i64 val = sym.get_addr(ctx, NO_OPD) - ctx.extra.TOC->value;
-      loc[0] |= higha(val);
-      loc[1] |= lo(val);
+      i64 val = sym->get_addr(ctx, NO_OPD) - ctx.extra.TOC->value;
+      memcpy(buf, local_thunk, sizeof(local_thunk));
+      *(ub32 *)buf |= higha(val);
+      *(ub32 *)(buf + 4) |= lo(val);
     }
+
+    buf += E::thunk_size;
   }
 }
 
@@ -530,7 +519,7 @@ struct OpdSymbol {
 };
 
 static Symbol<E> *
-get_opd_sym_at(Context<E> &ctx, std::span<OpdSymbol> syms, u64 offset) {
+get_opd_sym_at(std::span<OpdSymbol> syms, u64 offset) {
   auto it = std::lower_bound(syms.begin(), syms.end(), OpdSymbol{offset});
   if (it == syms.end())
     return nullptr;
@@ -547,10 +536,10 @@ get_opd_sym_at(Context<E> &ctx, std::span<OpdSymbol> syms, u64 offset) {
 // However, in reality, .opd isn't a normal input section. It needs many
 // special treatments as follows:
 //
-// 1. A function symbol refers not a .text but an .opd. Its address works
-//    fine for address-taking relocations such as R_PPC64_ADDR64. However,
-//    R_PPC64_REL24 (which is used for branch instruction) needs a
-//    function's real address instead of the function's .opd address.
+// 1. A function symbol refers to not a .text but an .opd. Its address
+//    works fine for address-taking relocations such as R_PPC64_ADDR64.
+//    However, R_PPC64_REL24 (which is used for branch instruction) needs
+//    a function's real address instead of the function's .opd address.
 //    We need to read .opd contents to find out a function entry point
 //    address to apply R_PPC64_REL24.
 //
@@ -558,9 +547,9 @@ get_opd_sym_at(Context<E> &ctx, std::span<OpdSymbol> syms, u64 offset) {
 //    are taken. Just copying input .opd sections to an output would
 //    produces lots of dead .opd entries.
 //
-// 3. In this design, all function symbols refer an .opd section, and that
-//    doesn't work well with graph traversal optimizations such as garbage
-//    collection or identical comdat folding. For example, garbage
+// 3. In this design, all function symbols refer to an .opd section, and
+//    that doesn't work well with graph traversal optimizations such as
+//    garbage collection or identical comdat folding. For example, garbage
 //    collector would mark an .opd alive which in turn mark all functions
 //    thatare referenced by .opd as alive, effectively keeping all
 //    functions as alive.
@@ -573,9 +562,9 @@ get_opd_sym_at(Context<E> &ctx, std::span<OpdSymbol> syms, u64 offset) {
 //
 // So, in this function, we undo what the compiler did to .opd. We remove
 // function symbols from .opd and reattach them to their function entry
-// points. We also rewrite relocations that directly refer an input .opd
-// section so that they refer function symbols instead. We then mark input
-// .opd sections as dead.
+// points. We also rewrite relocations that directly refer to an input
+// .opd  section so that they refer to function symbols instead. We then
+// mark input .opd sections as dead.
 //
 // After this function, we mark symbols with the NEEDS_PPC_OPD flag if the
 // symbol needs an .opd entry. We then create an output .opd just like we
@@ -625,7 +614,7 @@ void ppc64v1_rewrite_opd(Context<E> &ctx) {
         if (sym.get_input_section() != opd)
           continue;
 
-        Symbol<E> *real_sym = get_opd_sym_at(ctx, opd_syms, r.r_addend);
+        Symbol<E> *real_sym = get_opd_sym_at(opd_syms, r.r_addend);
         if (!real_sym)
           Fatal(ctx) << *isec << ": cannot find a symbol in .opd for " << r
                      << " at offset 0x" << std::hex << (u64)r.r_addend;
@@ -638,8 +627,8 @@ void ppc64v1_rewrite_opd(Context<E> &ctx) {
 }
 
 // When a function is exported, the dynamic symbol for the function should
-// refers the function's .opd entry. This function marks such symbols with
-// NEEDS_PPC_OPD.
+// refers to the function's .opd entry. This function marks such symbols
+// with NEEDS_PPC_OPD.
 void ppc64v1_scan_symbols(Context<E> &ctx) {
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     for (Symbol<E> *sym : file->symbols)
@@ -649,15 +638,14 @@ void ppc64v1_scan_symbols(Context<E> &ctx) {
   });
 
   // Functions referenced by the ELF header also have to have .opd entries.
-  auto mark = [&](std::string_view name) {
-    if (!name.empty())
-      if (Symbol<E> &sym = *get_symbol(ctx, name); !sym.is_imported)
-        sym.flags |= NEEDS_PPC_OPD;
-  };
+  if (!ctx.arg.entry->is_imported)
+    ctx.arg.entry->flags |= NEEDS_PPC_OPD;
 
-  mark(ctx.arg.entry);
-  mark(ctx.arg.init);
-  mark(ctx.arg.fini);
+  if (!ctx.arg.init->is_imported)
+    ctx.arg.init->flags |= NEEDS_PPC_OPD;
+
+  if (!ctx.arg.fini->is_imported)
+    ctx.arg.fini->flags |= NEEDS_PPC_OPD;
 }
 
 void PPC64OpdSection::add_symbol(Context<E> &ctx, Symbol<E> *sym) {

@@ -110,14 +110,26 @@ static void sighandler(int signo, siginfo_t *info, void *ucontext) {
   static std::mutex mu;
   std::scoped_lock lock{mu};
 
-  if ((signo == SIGSEGV || signo == SIGBUS) &&
-      output_buffer_start <= info->si_addr &&
-      info->si_addr < output_buffer_end) {
-    const char msg[] = "mold: failed to write to an output file. Disk full?\n";
+  switch (signo) {
+  case SIGSEGV:
+  case SIGBUS:
+    if (output_buffer_start <= info->si_addr &&
+        info->si_addr < output_buffer_end) {
+      const char msg[] = "mold: failed to write to an output file. Disk full?\n";
+      (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    }
+    break;
+  case SIGABRT: {
+    const char msg[] =
+      "mold: aborted\n"
+      "mold: If mold failed due to a spurious failure of pthread_create, "
+      "it's likely because of https://github.com/oneapi-src/oneTBB/pull/824. "
+      "You should ensure that you are using 2021.9.0 or newer version of libtbb.\n";
     (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    break;
+  }
   }
 
-  cleanup();
   _exit(1);
 }
 
@@ -127,6 +139,7 @@ void install_signal_handler() {
   sigemptyset(&action.sa_mask);
   action.sa_flags = SA_SIGINFO;
 
+  sigaction(SIGABRT, &action, NULL);
   sigaction(SIGINT, &action, NULL);
   sigaction(SIGTERM, &action, NULL);
   sigaction(SIGBUS, &action, NULL);
@@ -148,7 +161,7 @@ int main(int argc, char **argv) {
 
 #if MOLD_IS_SOLD
   std::string cmd = mold::filepath(argv[0]).filename().string();
-  if (cmd == "ld64" || cmd == "ld64.mold")
+  if (cmd == "ld64" || cmd.starts_with("ld64."))
     return mold::macho::main(argc, argv);
 #endif
 

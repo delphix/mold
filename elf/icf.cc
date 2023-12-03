@@ -65,7 +65,7 @@
 // conditions.
 
 #include "mold.h"
-#include "../common/sha.h"
+#include "blake3.h"
 
 #include <array>
 #include <cstdio>
@@ -81,7 +81,7 @@ static constexpr int64_t HASH_SIZE = 16;
 typedef std::array<uint8_t, HASH_SIZE> Digest;
 
 namespace std {
-template<> struct hash<Digest> {
+template <> struct hash<Digest> {
   size_t operator()(const Digest &k) const {
     return *(int64_t *)&k[0];
   }
@@ -115,26 +115,26 @@ static bool is_eligible(Context<E> &ctx, InputSection<E> &isec) {
   const ElfShdr<E> &shdr = isec.shdr();
   std::string_view name = isec.name();
 
-  bool is_alloc = (shdr.sh_flags & SHF_ALLOC);
-  bool is_exec = (shdr.sh_flags & SHF_EXECINSTR) ||
-                 ctx.arg.ignore_data_address_equality;
-  bool is_relro = (name == ".data.rel.ro" ||
-                   name.starts_with(".data.rel.ro."));
-  bool is_readonly = !(shdr.sh_flags & SHF_WRITE) || is_relro;
-  bool is_bss = (shdr.sh_type == SHT_NOBITS);
-  bool is_empty = (shdr.sh_size == 0);
-  bool is_init = (shdr.sh_type == SHT_INIT_ARRAY || name == ".init");
-  bool is_fini = (shdr.sh_type == SHT_FINI_ARRAY || name == ".fini");
-  bool is_enumerable = is_c_identifier(name);
-  bool is_addr_taken = !ctx.arg.icf_all && isec.address_significant;
+  if (shdr.sh_size == 0 || !(shdr.sh_flags & SHF_ALLOC) ||
+      shdr.sh_type == SHT_NOBITS || is_c_identifier(name))
+    return false;
 
-  return is_alloc && is_exec && is_readonly && !is_bss && !is_empty &&
-         !is_init && !is_fini && !is_enumerable && !is_addr_taken;
+  if (shdr.sh_flags & SHF_EXECINSTR) {
+    return (ctx.arg.icf_all || !isec.address_taken) &&
+           name != ".init" && name != ".fini";
+  } else {
+    bool is_readonly = !(shdr.sh_flags & SHF_WRITE);
+    bool is_relro = isec.output_section && isec.output_section->is_relro;
+    return (ctx.arg.ignore_data_address_equality || !isec.address_taken) &&
+           (is_readonly || is_relro);
+  }
 }
 
-static Digest digest_final(SHA256Hash &sha) {
-  u8 buf[SHA256_SIZE];
-  sha.finish(buf);
+static Digest digest_final(blake3_hasher *hasher) {
+  assert(HASH_SIZE <= BLAKE3_OUT_LEN);
+
+  u8 buf[BLAKE3_OUT_LEN];
+  blake3_hasher_finalize(hasher, buf, BLAKE3_OUT_LEN);
 
   Digest digest;
   memcpy(digest.data(), buf, HASH_SIZE);
@@ -234,15 +234,16 @@ static void merge_leaf_nodes(Context<E> &ctx) {
 
 template <typename E>
 static Digest compute_digest(Context<E> &ctx, InputSection<E> &isec) {
-  SHA256Hash sha;
+  blake3_hasher hasher;
+  blake3_hasher_init(&hasher);
 
   auto hash = [&](auto val) {
-    sha.update((u8 *)&val, sizeof(val));
+    blake3_hasher_update(&hasher, (u8 *)&val, sizeof(val));
   };
 
   auto hash_string = [&](std::string_view str) {
     hash(str.size());
-    sha.update((u8 *)str.data(), str.size());
+    blake3_hasher_update(&hasher, (u8 *)str.data(), str.size());
   };
 
   auto hash_symbol = [&](Symbol<E> &sym) {
@@ -298,7 +299,7 @@ static Digest compute_digest(Context<E> &ctx, InputSection<E> &isec) {
     hash_symbol(*isec.file.symbols[rel.r_sym]);
   }
 
-  return digest_final(sha);
+  return digest_final(&hasher);
 }
 
 template <typename E>
@@ -411,16 +412,17 @@ static i64 propagate(std::span<std::vector<Digest>> digests,
     if (converged.get(i))
       return;
 
-    SHA256Hash sha;
-    sha.update(digests[2][i].data(), HASH_SIZE);
+    blake3_hasher hasher;
+    blake3_hasher_init(&hasher);
+    blake3_hasher_update(&hasher, digests[2][i].data(), HASH_SIZE);
 
     i64 begin = edge_indices[i];
     i64 end = (i + 1 == num_digests) ? edges.size() : edge_indices[i + 1];
 
     for (i64 j : edges.subspan(begin, end - begin))
-      sha.update(digests[slot][j].data(), HASH_SIZE);
+      blake3_hasher_update(&hasher, digests[slot][j].data(), HASH_SIZE);
 
-    digests[!slot][i] = digest_final(sha);
+    digests[!slot][i] = digest_final(&hasher);
 
     if (digests[slot][i] == digests[!slot][i]) {
       // This node has converged. Skip further iterations as it will
@@ -563,7 +565,7 @@ void icf_sections(Context<E> &ctx) {
     }
   }
 
-  // Group sections by SHA digest.
+  // Group sections by BLAKE3 digest.
   {
     Timer t(ctx, "group");
 

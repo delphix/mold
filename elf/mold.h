@@ -36,8 +36,6 @@
 
 namespace mold::elf {
 
-static constexpr i32 SHA256_SIZE = 32;
-
 template <typename E> class InputFile;
 template <typename E> class InputSection;
 template <typename E> class MergedSection;
@@ -62,10 +60,6 @@ template <typename E>
 struct SectionFragment {
   SectionFragment(MergedSection<E> *sec, bool is_alive)
     : output_section(*sec), is_alive(is_alive) {}
-
-  SectionFragment(const SectionFragment &other)
-    : output_section(other.output_section), offset(other.offset),
-      p2align(other.p2align.load()), is_alive(other.is_alive.load()) {}
 
   u64 get_addr(Context<E> &ctx) const;
 
@@ -101,12 +95,12 @@ struct SymbolAux<PPC64V1> : SymbolAux<X86_64> {
 //
 
 template <typename E>
-class RangeExtensionThunk {};
+class Thunk {};
 
-template <typename E> requires needs_thunk<E>
-class RangeExtensionThunk<E> {
+template <needs_thunk E>
+class Thunk<E> {
 public:
-  RangeExtensionThunk(OutputSection<E> &osec, i64 offset)
+  Thunk(OutputSection<E> &osec, i64 offset)
     : output_section(osec), offset(offset) {}
 
   i64 size() const { return E::thunk_hdr_size + symbols.size() * E::thunk_size; }
@@ -117,7 +111,7 @@ public:
            idx * E::thunk_size;
   }
 
-  static constexpr i64 alignment = 4;
+  static constexpr i64 alignment = 16;
 
   OutputSection<E> &output_section;
   i64 offset;
@@ -125,13 +119,10 @@ public:
   std::vector<Symbol<E> *> symbols;
 };
 
-struct RangeExtensionRef {
+struct ThunkRef {
   i16 thunk_idx = -1;
   i16 sym_idx = -1;
 };
-
-template <typename E>
-void create_range_extension_thunks(Context<E> &ctx, OutputSection<E> &osec);
 
 //
 // input-sections.cc
@@ -204,20 +195,6 @@ struct FdeRecord {
   FdeRecord(u32 input_offset, u32 rel_idx)
     : input_offset(input_offset), rel_idx(rel_idx) {}
 
-  FdeRecord(const FdeRecord &other)
-    : input_offset(other.input_offset), output_offset(other.output_offset),
-      rel_idx(other.rel_idx), cie_idx(other.cie_idx),
-      is_alive(other.is_alive.load()) {}
-
-  FdeRecord &operator=(const FdeRecord<E> &other) {
-    input_offset = other.input_offset;
-    output_offset = other.output_offset;
-    rel_idx = other.rel_idx;
-    cie_idx = other.cie_idx;
-    is_alive = other.is_alive.load();
-    return *this;
-  }
-
   i64 size(ObjectFile<E> &file) const;
   std::string_view get_contents(ObjectFile<E> &file) const;
   std::span<ElfRel<E>> get_rels(ObjectFile<E> &file) const;
@@ -233,12 +210,12 @@ struct FdeRecord {
 template <typename E>
 struct InputSectionExtras {};
 
-template <typename E> requires needs_thunk<E>
+template <needs_thunk E>
 struct InputSectionExtras<E> {
-  std::vector<RangeExtensionRef> range_extn;
+  std::vector<ThunkRef> thunk_refs;
 };
 
-template <typename E> requires is_riscv<E>
+template <is_riscv E>
 struct InputSectionExtras<E> {
   std::vector<i32> r_deltas;
 };
@@ -247,8 +224,7 @@ struct InputSectionExtras<E> {
 template <typename E>
 class InputSection {
 public:
-  InputSection(Context<E> &ctx, ObjectFile<E> &file, std::string_view name,
-               i64 shndx);
+  InputSection(Context<E> &ctx, ObjectFile<E> &file, i64 shndx);
 
   void uncompress(Context<E> &ctx);
   void uncompress_to(Context<E> &ctx, u8 *buf);
@@ -268,7 +244,7 @@ public:
   bool is_relr_reloc(Context<E> &ctx, const ElfRel<E> &rel) const;
   bool is_killed_by_icf() const;
 
-  void record_undef_error(Context<E> &ctx, const ElfRel<E> &rel);
+  bool record_undef_error(Context<E> &ctx, const ElfRel<E> &rel);
 
   ObjectFile<E> &file;
   OutputSection<E> *output_section = nullptr;
@@ -281,17 +257,19 @@ public:
   i32 fde_begin = -1;
   i32 fde_end = -1;
 
-  u32 offset = -1;
+  u64 offset = -1;
   u32 shndx = -1;
   u32 relsec_idx = -1;
   u32 reldyn_offset = 0;
+
+  bool uncompressed = false;
 
   // For COMDAT de-duplication and garbage collection
   std::atomic_bool is_alive = true;
   u8 p2align = 0;
 
-  bool address_significant : 1 = false;
-  bool uncompressed : 1 = false;
+  // For ICF
+  Atomic<bool> address_taken = false;
 
   // For garbage collection
   Atomic<bool> is_visited = false;
@@ -313,14 +291,14 @@ private:
   void scan_absrel(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel);
   void scan_dyn_absrel(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel);
   void scan_toc_rel(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel);
-
+  void scan_tlsdesc(Context<E> &ctx, Symbol<E> &sym);
   void check_tlsle(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel);
 
   void apply_dyn_absrel(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel,
-                        u8 *loc, u64 S, i64 A, u64 P, ElfRel<E> *&dynrel);
+                        u8 *loc, u64 S, i64 A, u64 P, ElfRel<E> **dynrel);
 
   void apply_toc_rel(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel,
-                     u8 *loc, u64 S, i64 A, u64 P, ElfRel<E> *&dynrel);
+                     u8 *loc, u64 S, i64 A, u64 P, ElfRel<E> **dynrel);
 
   void copy_contents_riscv(Context<E> &ctx, u8 *buf);
 
@@ -336,9 +314,9 @@ private:
 // tls.cc
 //
 
-template<typename E> u64 get_tls_begin(Context<E> &);
-template<typename E> u64 get_tp_addr(Context<E> &);
-template<typename E> u64 get_dtp_addr(Context<E> &);
+template <typename E> u64 get_tls_begin(Context<E> &);
+template <typename E> u64 get_tp_addr(Context<E> &);
+template <typename E> u64 get_dtp_addr(Context<E> &);
 
 //
 // output-chunks.cc
@@ -349,9 +327,6 @@ u64 get_eflags(Context<E> &ctx);
 
 template <typename E>
 i64 to_phdr_flags(Context<E> &ctx, Chunk<E> *chunk);
-
-template <typename E>
-bool is_relro(Context<E> &ctx, Chunk<E> *chunk);
 
 template <typename E>
 std::string_view get_output_name(Context<E> &ctx, std::string_view name, u64 flags);
@@ -375,16 +350,19 @@ public:
   virtual ChunkKind kind() { return SYNTHETIC; }
   virtual OutputSection<E> *to_osec() { return nullptr; }
   virtual i64 get_reldyn_size(Context<E> &ctx) const { return 0; }
+  virtual void construct_relr(Context<E> &ctx) {}
   virtual void copy_buf(Context<E> &ctx) {}
   virtual void write_to(Context<E> &ctx, u8 *buf) { unreachable(); }
   virtual void update_shdr(Context<E> &ctx) {}
 
-  // For --gdb-index
-  virtual u8 *get_uncompressed_data() { return nullptr; }
-
   std::string_view name;
   ElfShdr<E> shdr = { .sh_addralign = 1 };
   i64 shndx = 0;
+  bool is_relro = false;
+
+  // For --gdb-index
+  bool is_compressed = false;
+  std::vector<u8> uncompressed_data;
 
   // Some synethetic sections add local symbols to the output.
   // For example, range extension thunks adds function_name@thunk
@@ -403,6 +381,9 @@ public:
 
   // For --section-order
   i64 sect_order = 0;
+
+  // For --pack-dyn-relocs=relr
+  std::vector<u64> relr;
 };
 
 // ELF header
@@ -468,26 +449,20 @@ public:
 template <typename E>
 class OutputSection : public Chunk<E> {
 public:
-  OutputSection(std::string_view name, u32 type, u64 flags) {
-    this->name = name;
-    this->shdr.sh_type = type;
-    this->shdr.sh_flags = flags;
-  }
-
+  OutputSection(Context<E> &ctx, std::string_view name, u32 type, u64 flags);
   ChunkKind kind() override { return OUTPUT_SECTION; }
   OutputSection<E> *to_osec() override { return this; }
+  void construct_relr(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
   void write_to(Context<E> &ctx, u8 *buf) override;
 
   void compute_symtab_size(Context<E> &ctx) override;
   void populate_symtab(Context<E> &ctx) override;
 
+  void create_range_extension_thunks(Context<E> &ctx);
+
   std::vector<InputSection<E> *> members;
-
-  void construct_relr(Context<E> &ctx);
-  std::vector<u64> relr;
-
-  std::vector<std::unique_ptr<RangeExtensionThunk<E>>> thunks;
+  std::vector<std::unique_ptr<Thunk<E>>> thunks;
   std::unique_ptr<RelocSection<E>> reloc_sec;
 };
 
@@ -496,13 +471,14 @@ class GotSection : public Chunk<E> {
 public:
   GotSection() {
     this->name = ".got";
+    this->is_relro = true;
     this->shdr.sh_type = SHT_PROGBITS;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
     this->shdr.sh_addralign = sizeof(Word<E>);
 
     // We always create a .got so that _GLOBAL_OFFSET_TABLE_ has
-    // something to point to. s390x psABI defines GOT[1] as a
-    // reserved slot, so we allocate one more on s390x.
+    // something to point to. s390x psABI define GOT[1] as a
+    // reserved slot, so we allocate one more for them.
     this->shdr.sh_size = (is_s390x<E> ? 2 : 1) * sizeof(Word<E>);
   }
 
@@ -517,24 +493,23 @@ public:
   i64 get_reldyn_size(Context<E> &ctx) const override;
   void copy_buf(Context<E> &ctx) override;
 
+  void construct_relr(Context<E> &ctx) override;
   void compute_symtab_size(Context<E> &ctx) override;
   void populate_symtab(Context<E> &ctx) override;
 
   std::vector<Symbol<E> *> got_syms;
-  std::vector<Symbol<E> *> gottp_syms;
   std::vector<Symbol<E> *> tlsgd_syms;
   std::vector<Symbol<E> *> tlsdesc_syms;
+  std::vector<Symbol<E> *> gottp_syms;
   u32 tlsld_idx = -1;
-
-  void construct_relr(Context<E> &ctx);
-  std::vector<u64> relr;
 };
 
 template <typename E>
 class GotPltSection : public Chunk<E> {
 public:
-  GotPltSection() {
+  GotPltSection(Context<E> &ctx) {
     this->name = ".got.plt";
+    this->is_relro = ctx.arg.z_now;
     this->shdr.sh_type = is_ppc64<E> ? SHT_NOBITS : SHT_PROGBITS;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
     this->shdr.sh_addralign = sizeof(Word<E>);
@@ -647,6 +622,12 @@ public:
   }
 
   void update_shdr(Context<E> &ctx) override;
+  void copy_buf(Context<E> &ctx) override;
+
+  // Offsets in .strtab for ARM32 mapping symbols
+  static constexpr i64 ARM = 1;
+  static constexpr i64 THUMB = 4;
+  static constexpr i64 DATA = 7;
 };
 
 template <typename E>
@@ -670,7 +651,6 @@ public:
     this->shdr.sh_flags = SHF_ALLOC;
   }
 
-  void keep() { this->shdr.sh_size = 1; }
   i64 add_string(std::string_view str);
   i64 find_string(std::string_view str);
   void copy_buf(Context<E> &ctx) override;
@@ -686,6 +666,7 @@ class DynamicSection : public Chunk<E> {
 public:
   DynamicSection() {
     this->name = ".dynamic";
+    this->is_relro = true;
     this->shdr.sh_type = SHT_DYNAMIC;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
     this->shdr.sh_addralign = sizeof(Word<E>);
@@ -696,7 +677,7 @@ public:
   void copy_buf(Context<E> &ctx) override;
 };
 
-template<typename E>
+template <typename E>
 ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym, u32 st_name,
                          U32<E> *shndx);
 
@@ -736,13 +717,13 @@ public:
     this->shdr.sh_addralign = sizeof(Word<E>);
   }
 
-  void keep() { this->symbols.resize(1); }
   void add_symbol(Context<E> &ctx, Symbol<E> *sym);
   void finalize(Context<E> &ctx);
   void update_shdr(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
 
   std::vector<Symbol<E> *> symbols;
+  bool finalized = false;
 };
 
 template <typename E>
@@ -786,7 +767,8 @@ template <typename E>
 class MergedSection : public Chunk<E> {
 public:
   static MergedSection<E> *
-  get_instance(Context<E> &ctx, std::string_view name, u64 type, u64 flags);
+  get_instance(Context<E> &ctx, std::string_view name, i64 type, i64 flags,
+               i64 entsize, i64 addralign);
 
   SectionFragment<E> *insert(Context<E> &ctx, std::string_view data,
                              u64 hash, i64 p2align);
@@ -799,7 +781,7 @@ public:
   HyperLogLog estimator;
 
 private:
-  MergedSection(std::string_view name, u64 flags, u32 type);
+  MergedSection(std::string_view name, i64 flags, i64 type, i64 entsize);
 
   ConcurrentMap<SectionFragment<E>> map;
   std::vector<i64> shard_offsets;
@@ -817,7 +799,7 @@ public:
   }
 
   void construct(Context<E> &ctx);
-  void apply_reloc(Context<E> &ctx, const ElfRel<E> &rel, u64 offset, u64 val);
+  void apply_eh_reloc(Context<E> &ctx, const ElfRel<E> &rel, u64 offset, u64 val);
   void copy_buf(Context<E> &ctx) override;
 };
 
@@ -858,8 +840,9 @@ public:
 template <typename E>
 class CopyrelSection : public Chunk<E> {
 public:
-  CopyrelSection(bool is_relro) : is_relro(is_relro) {
+  CopyrelSection(bool is_relro) {
     this->name = is_relro ? ".copyrel.rel.ro" : ".copyrel";
+    this->is_relro = is_relro;
     this->shdr.sh_type = SHT_NOBITS;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
   }
@@ -869,7 +852,6 @@ public:
   i64 get_reldyn_size(Context<E> &ctx) const override { return symbols.size(); }
   void copy_buf(Context<E> &ctx) override;
 
-  bool is_relro;
   std::vector<Symbol<E> *> symbols;
 };
 
@@ -975,13 +957,6 @@ private:
   std::map<u32, u32> properties;
 };
 
-struct GdbIndexName {
-  std::string_view name;
-  u32 hash = 0;
-  u32 attr = 0;
-  u32 entry_idx = 0;
-};
-
 template <typename E>
 class GdbIndexSection : public Chunk<E> {
 public:
@@ -990,38 +965,6 @@ public:
     this->shdr.sh_type = SHT_PROGBITS;
     this->shdr.sh_addralign = 4;
   }
-
-  void construct(Context<E> &ctx);
-  void copy_buf(Context<E> &ctx) override;
-  void write_address_areas(Context<E> &ctx);
-
-private:
-  struct SectionHeader {
-    ul32 version = 7;
-    ul32 cu_list_offset = 0;
-    ul32 cu_types_offset = 0;
-    ul32 areas_offset = 0;
-    ul32 symtab_offset = 0;
-    ul32 const_pool_offset = 0;
-  };
-
-  struct MapEntry {
-    MapEntry(ObjectFile<E> *owner, u32 hash) : owner(owner), hash(hash) {}
-
-    MapEntry(const MapEntry &other)
-      : owner(other.owner.load()), num_attrs(other.num_attrs.load()),
-        hash(other.hash), name_offset(other.name_offset),
-        attr_offset(other.attr_offset) {}
-
-    std::atomic<ObjectFile<E> *> owner;
-    std::atomic_uint32_t num_attrs = 0;
-    u32 hash = 0;
-    u32 name_offset = -1;
-    u32 attr_offset = -1;
-  };
-
-  SectionHeader header;
-  ConcurrentMap<MapEntry> map;
 };
 
 template <typename E>
@@ -1029,12 +972,10 @@ class CompressedSection : public Chunk<E> {
 public:
   CompressedSection(Context<E> &ctx, Chunk<E> &chunk);
   void copy_buf(Context<E> &ctx) override;
-  u8 *get_uncompressed_data() override { return uncompressed.get(); }
 
 private:
   ElfChdr<E> chdr = {};
   std::unique_ptr<Compressor> compressed;
-  std::unique_ptr<u8[]> uncompressed;
 };
 
 template <typename E>
@@ -1057,6 +998,7 @@ class RelroPaddingSection : public Chunk<E> {
 public:
   RelroPaddingSection() {
     this->name = ".relro_padding";
+    this->is_relro = true;
     this->shdr.sh_type = SHT_NOBITS;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
     this->shdr.sh_addralign = 1;
@@ -1085,22 +1027,10 @@ private:
 };
 
 //
-// dwarf.cc
+// gdb-index.cc
 //
 
-template <typename E>
-std::vector<std::string_view>
-read_compunits(Context<E> &ctx, ObjectFile<E> &file);
-
-template <typename E>
-std::vector<GdbIndexName> read_pubnames(Context<E> &ctx, ObjectFile<E> &file);
-
-template <typename E>
-i64 estimate_address_areas(Context<E> &ctx, ObjectFile<E> &file);
-
-template <typename E>
-std::vector<u64>
-read_address_areas(Context<E> &ctx, ObjectFile<E> &file, i64 offset);
+template <typename E> void write_gdb_index(Context<E> &ctx);
 
 //
 // input-files.cc
@@ -1153,11 +1083,11 @@ public:
 
   virtual ~InputFile() = default;
 
-  template<typename T> std::span<T>
-  get_data(Context<E> &ctx, const ElfShdr<E> &shdr);
+  template <typename T>
+  std::span<T> get_data(Context<E> &ctx, const ElfShdr<E> &shdr);
 
-  template<typename T> std::span<T>
-  get_data(Context<E> &ctx, i64 idx);
+  template <typename T>
+  std::span<T> get_data(Context<E> &ctx, i64 idx);
 
   std::string_view get_string(Context<E> &ctx, const ElfShdr<E> &shdr);
   std::string_view get_string(Context<E> &ctx, i64 idx);
@@ -1206,6 +1136,20 @@ protected:
   std::vector<Symbol<E>> frag_syms;
 };
 
+template <typename E> struct ObjectFileExtras {};
+
+template <is_riscv E>
+struct ObjectFileExtras<E> {
+  std::optional<i64> stack_align;
+  std::optional<std::string_view> arch;
+  bool unaligned_access = false;
+};
+
+template <>
+struct ObjectFileExtras<PPC32> {
+  InputSection<PPC32> *got2 = nullptr;
+};
+
 // ObjectFile represents an input .o file.
 template <typename E>
 class ObjectFile : public InputFile<E> {
@@ -1222,7 +1166,6 @@ public:
   void mark_live_objects(Context<E> &ctx,
                          std::function<void(InputFile<E> *)> feeder) override;
   void convert_undefined_weak_symbols(Context<E> &ctx);
-  void mark_addrsig(Context<E> &ctx);
   void scan_relocations(Context<E> &ctx);
   void convert_common_symbols(Context<E> &ctx);
   void compute_symtab_size(Context<E> &ctx);
@@ -1240,6 +1183,7 @@ public:
   std::vector<FdeRecord<E>> fdes;
   BitVector has_symver;
   std::vector<ComdatGroupRef<E>> comdat_groups;
+  std::vector<InputSection<E> *> eh_frame_sections;
   bool exclude_libs = false;
   std::map<u32, u32> gnu_properties;
   bool is_lto_obj = false;
@@ -1257,22 +1201,14 @@ public:
 
   // For .gdb_index
   InputSection<E> *debug_info = nullptr;
-  InputSection<E> *debug_ranges = nullptr;
-  InputSection<E> *debug_rnglists = nullptr;
   InputSection<E> *debug_pubnames = nullptr;
   InputSection<E> *debug_pubtypes = nullptr;
-  std::vector<std::string_view> compunits;
-  std::vector<GdbIndexName> gdb_names;
-  i64 compunits_idx = 0;
-  i64 attrs_size = 0;
-  i64 attrs_offset = 0;
-  i64 names_size = 0;
-  i64 names_offset = 0;
-  i64 num_areas = 0;
-  i64 area_offset = 0;
 
-  // For PPC32
-  InputSection<E> *ppc32_got2 = nullptr;
+  // For LTO
+  std::vector<std::string_view> lto_symbol_versions;
+
+  // Target-specific member
+  [[no_unique_address]] ObjectFileExtras<E> extra;
 
 private:
   ObjectFile(Context<E> &ctx, MappedFile<Context<E>> *mf,
@@ -1282,8 +1218,8 @@ private:
   void initialize_symbols(Context<E> &ctx);
   void sort_relocations(Context<E> &ctx);
   void initialize_ehframe_sections(Context<E> &ctx);
-  void read_note_gnu_property(Context <E> &ctx, const ElfShdr <E> &shdr);
-  void read_ehframe(Context<E> &ctx, InputSection<E> &isec);
+  void parse_note_gnu_property(Context <E> &ctx, const ElfShdr <E> &shdr);
+  void parse_ehframe(Context<E> &ctx);
   void override_symbol(Context<E> &ctx, Symbol<E> &sym,
                        const ElfSym<E> &esym, i64 symidx);
   void merge_visibility(Context<E> &ctx, Symbol<E> &sym, u8 visibility);
@@ -1312,7 +1248,6 @@ public:
   void compute_symtab_size(Context<E> &ctx);
   void populate_symtab(Context<E> &ctx);
 
-  bool is_needed = false;
   std::string soname;
   std::vector<std::string_view> version_strings;
   std::vector<ElfSym<E>> elf_syms2;
@@ -1346,8 +1281,15 @@ get_script_output_type(Context<E> &ctx, MappedFile<Context<E>> *mf);
 template <typename E>
 void parse_version_script(Context<E> &ctx, MappedFile<Context<E>> *mf);
 
+struct DynamicPattern {
+  std::string_view pattern;
+  std::string_view source;
+  bool is_cpp = false;
+};
+
 template <typename E>
-void parse_dynamic_list(Context<E> &ctx, MappedFile<Context<E>> *mf);
+std::vector<DynamicPattern>
+parse_dynamic_list(Context<E> &ctx, std::string_view path);
 
 //
 // lto.cc
@@ -1401,7 +1343,14 @@ template <typename E>
 void process_run_subcommand(Context<E> &ctx, int argc, char **argv);
 
 //
-// commandline.cc
+// jobs.cc
+//
+
+template <typename E> void acquire_global_lock(Context<E> &ctx);
+template <typename E> void release_global_lock(Context<E> &ctx);
+
+//
+// cmdline.cc
 //
 
 template <typename E>
@@ -1411,11 +1360,13 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx);
 // passes.cc
 //
 
+template <typename E> int redo_main(Context<E> &, int argc, char **argv);
 template <typename E> void create_internal_file(Context<E> &);
 template <typename E> void apply_exclude_libs(Context<E> &);
 template <typename E> void create_synthetic_sections(Context<E> &);
 template <typename E> void set_file_priority(Context<E> &);
 template <typename E> void resolve_symbols(Context<E> &);
+template <typename E> void kill_eh_frame_sections(Context<E> &);
 template <typename E> void resolve_section_pieces(Context<E> &);
 template <typename E> void convert_common_symbols(Context<E> &);
 template <typename E> void compute_merged_section_sizes(Context<E> &);
@@ -1428,6 +1379,7 @@ template <typename E> void check_duplicate_symbols(Context<E> &);
 template <typename E> void check_symbol_types(Context<E> &);
 template <typename E> void sort_init_fini(Context<E> &);
 template <typename E> void sort_ctor_dtor(Context<E> &);
+template <typename E> void fixup_ctors_in_init_array(Context<E> &);
 template <typename E> void shuffle_sections(Context<E> &);
 template <typename E> void compute_section_sizes(Context<E> &);
 template <typename E> void sort_output_sections(Context<E> &);
@@ -1438,10 +1390,11 @@ template <typename E> void create_output_symtab(Context<E> &);
 template <typename E> void report_undef_errors(Context<E> &);
 template <typename E> void create_reloc_sections(Context<E> &);
 template <typename E> void copy_chunks(Context<E> &);
+template <typename E> void rewrite_endbr(Context<E> &);
 template <typename E> void apply_version_script(Context<E> &);
 template <typename E> void parse_symbol_version(Context<E> &);
 template <typename E> void compute_import_export(Context<E> &);
-template <typename E> void mark_addrsig(Context<E> &);
+template <typename E> void compute_address_significance(Context<E> &);
 template <typename E> void clear_padding(Context<E> &);
 template <typename E> void compute_section_headers(Context<E> &);
 template <typename E> i64 set_osec_offsets(Context<E> &);
@@ -1454,13 +1407,31 @@ template <typename E> void show_stats(Context<E> &);
 // arch-arm32.cc
 //
 
+template <> u64 get_eflags(Context<ARM32> &ctx);
 void fixup_arm_exidx_section(Context<ARM32> &ctx);
 
 //
-// arch-riscv64.cc
+// arch-riscv.cc
 //
 
-template <typename E>
+template <is_riscv E>
+class RiscvAttributesSection : public Chunk<E> {
+public:
+  RiscvAttributesSection() {
+    this->name = ".riscv.attributes";
+    this->shdr.sh_type = SHT_RISCV_ATTRIBUTES;
+  }
+
+  void update_shdr(Context<E> &ctx) override;
+  void copy_buf(Context<E> &ctx) override;
+
+  std::vector<u8> contents;
+};
+
+template <is_riscv E>
+u64 get_eflags(Context<E> &ctx);
+
+template <is_riscv E>
 i64 riscv_resize_sections(Context<E> &ctx);
 
 //
@@ -1489,6 +1460,12 @@ public:
 };
 
 //
+// arch-ppc64v2.cc
+//
+
+template <> u64 get_eflags(Context<PPC64V2> &ctx);
+
+//
 // arch-sparc.cc
 //
 
@@ -1513,6 +1490,7 @@ class AlphaGotSection : public Chunk<ALPHA> {
 public:
   AlphaGotSection() {
     this->name = ".alpha_got";
+    this->is_relro = true;
     this->shdr.sh_type = SHT_PROGBITS;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
     this->shdr.sh_addralign = 8;
@@ -1588,27 +1566,39 @@ struct SectionOrder {
 };
 
 // Target-specific context members
-template <typename E> struct ContextExtras {};
+template <typename E>
+struct ContextExtras {};
 
-template <> struct ContextExtras<PPC32> {
+template <is_riscv E>
+struct ContextExtras<E> {
+  RiscvAttributesSection<E> *riscv_attributes = nullptr;
+};
+
+template <>
+struct ContextExtras<PPC32> {
   Symbol<PPC32> *_SDA_BASE_ = nullptr;
 };
 
-template <> struct ContextExtras<PPC64V1> {
+template <>
+struct ContextExtras<PPC64V1> {
   PPC64OpdSection *opd = nullptr;
   Symbol<PPC64V1> *TOC = nullptr;
 };
 
-template <> struct ContextExtras<PPC64V2> {
+template <>
+struct ContextExtras<PPC64V2> {
   Symbol<PPC64V2> *TOC = nullptr;
+  Atomic<bool> is_power10 = false;
 };
 
-template <> struct ContextExtras<SPARC64> {
+template <>
+struct ContextExtras<SPARC64> {
   SparcTlsGetAddrSection *tls_get_addr_sec = nullptr;
   Symbol<SPARC64> *tls_get_addr_sym = nullptr;
 };
 
-template <> struct ContextExtras<ALPHA> {
+template <>
+struct ContextExtras<ALPHA> {
   AlphaGotSection *got = nullptr;
 };
 
@@ -1618,7 +1608,12 @@ template <> struct ContextExtras<ALPHA> {
 // resource management, and other miscellaneous objects.
 template <typename E>
 struct Context {
-  Context() = default;
+  Context() {
+    arg.entry = get_symbol(*this, "_start");
+    arg.fini = get_symbol(*this, "_fini");
+    arg.init = get_symbol(*this, "_init");
+  }
+
   Context(const Context<E> &) = delete;
 
   void checkpoint() {
@@ -1635,15 +1630,18 @@ struct Context {
     CompressKind compress_debug_sections = COMPRESS_NONE;
     SeparateCodeKind z_separate_code = NOSEPARATE_CODE;
     ShuffleSectionsKind shuffle_sections = SHUFFLE_SECTIONS_NONE;
+    Symbol<E> *entry = nullptr;
+    Symbol<E> *fini = nullptr;
+    Symbol<E> *init = nullptr;
     UnresolvedKind unresolved_symbols = UNRESOLVED_ERROR;
     bool Bsymbolic = false;
     bool Bsymbolic_functions = false;
     bool allow_multiple_definition = false;
+    bool apply_dynamic_relocs = true;
     bool color_diagnostics = false;
     bool default_symver = false;
     bool demangle = true;
     bool discard_all = false;
-    bool apply_dynamic_relocs = true;
     bool discard_locals = false;
     bool eh_frame_hdr = true;
     bool emit_relocs = false;
@@ -1661,6 +1659,7 @@ struct Context {
     bool ignore_data_address_equality = false;
     bool is_static = false;
     bool lto_pass2 = false;
+    bool nmagic = false;
     bool noinhibit_exec = false;
     bool oformat_binary = false;
     bool omagic = false;
@@ -1683,6 +1682,7 @@ struct Context {
     bool stats = false;
     bool strip_all = false;
     bool strip_debug = false;
+    bool suppress_warnings = false;
     bool trace = false;
     bool undefined_version = false;
     bool warn_common = false;
@@ -1704,23 +1704,24 @@ struct Context {
     bool z_now = false;
     bool z_origin = false;
     bool z_relro = true;
+    bool z_rewrite_endbr = false;
+    bool z_sectionheader = true;
     bool z_shstk = false;
     bool z_text = false;
     i64 filler = -1;
     i64 spare_dynamic_tags = 5;
+    i64 spare_program_headers = 0;
     i64 thread_count = 0;
+    i64 z_stack_size = 0;
+    u64 shuffle_sections_seed;
     std::string_view emulation;
     std::optional<Glob> unique;
     std::optional<u64> physical_image_base;
-    std::optional<u64> shuffle_sections_seed;
     std::string Map;
     std::string chroot;
     std::string dependency_file;
     std::string directory;
     std::string dynamic_linker;
-    std::string entry = "_start";
-    std::string fini = "_fini";
-    std::string init = "_init";
     std::string output = "a.out";
     std::string package_metadata;
     std::string plugin;
@@ -1733,6 +1734,8 @@ struct Context {
     std::unordered_set<std::string_view> ignore_ir_file;
     std::unordered_set<std::string_view> wrap;
     std::vector<SectionOrder> section_order;
+    std::vector<Symbol<E> *> require_defined;
+    std::vector<Symbol<E> *> undefined;
     std::vector<std::pair<Symbol<E> *, std::variant<Symbol<E> *, u64>>> defsyms;
     std::vector<std::string> library_paths;
     std::vector<std::string> plugin_opt;
@@ -1740,16 +1743,15 @@ struct Context {
     std::vector<std::string_view> auxiliary;
     std::vector<std::string_view> exclude_libs;
     std::vector<std::string_view> filter;
-    std::vector<std::string_view> require_defined;
     std::vector<std::string_view> trace_symbol;
-    std::vector<std::string_view> undefined;
     u64 image_base = 0x200000;
   } arg;
 
   std::vector<VersionPattern> version_patterns;
-  u16 default_version = VER_NDX_GLOBAL;
-  bool default_version_from_version_script = false; // true if default_version is set by a wildcard in version script.
-  i64 page_size = -1;
+  std::vector<DynamicPattern> dynamic_list_patterns;
+  i64 default_version = VER_NDX_UNSPECIFIED;
+  i64 page_size = E::page_size;
+  std::optional<int> global_lock_fd;
 
   // Reader context
   bool as_needed = false;
@@ -1757,11 +1759,14 @@ struct Context {
   bool is_static;
   bool in_lib = false;
   i64 file_priority = 10000;
+  MappedFile<Context<E>> *script_file = nullptr;
   std::unordered_set<std::string_view> visited;
   tbb::task_group tg;
 
   bool has_error = false;
   bool has_lto_object = false;
+  Atomic<bool> has_init_array = false;
+  Atomic<bool> has_ctors = false;
 
   // Symbol table
   tbb::concurrent_hash_map<std::string_view, Symbol<E>, HashCmp> symbol_map;
@@ -1797,9 +1802,9 @@ struct Context {
   bool overwrite_output_file = true;
 
   std::vector<Chunk<E> *> chunks;
-  std::atomic_bool needs_tlsld = false;
-  std::atomic_bool has_textrel = false;
-  std::atomic_uint32_t num_ifunc_dynrels = 0;
+  Atomic<bool> needs_tlsld = false;
+  Atomic<bool> has_textrel = false;
+  Atomic<u32> num_ifunc_dynrels = 0;
 
   tbb::concurrent_hash_map<std::string_view, std::vector<std::string>> undef_errors;
 
@@ -1841,11 +1846,11 @@ struct Context {
   [[no_unique_address]] ContextExtras<E> extra;
 
   // For --gdb-index
-  Chunk<E> *debug_info = nullptr;
-  Chunk<E> *debug_abbrev = nullptr;
-  Chunk<E> *debug_ranges = nullptr;
-  Chunk<E> *debug_addr = nullptr;
-  Chunk<E> *debug_rnglists = nullptr;
+  std::span<u8> debug_info;
+  std::span<u8> debug_abbrev;
+  std::span<u8> debug_ranges;
+  std::span<u8> debug_addr;
+  std::span<u8> debug_rnglists;
 
   // For thread-local variables
   u64 tls_begin = 0;
@@ -1920,7 +1925,7 @@ enum {
 template <typename E>
 struct SymbolExtras {};
 
-template <typename E> requires needs_thunk<E>
+template <needs_thunk E>
 struct SymbolExtras<E> {
   // For range extension thunks
   i16 thunk_idx = -1;
@@ -1953,6 +1958,7 @@ public:
   u64 get_tlsdesc_addr(Context<E> &ctx) const;
   u64 get_plt_addr(Context<E> &ctx) const;
   u64 get_opd_addr(Context<E> &ctx) const;
+  u64 get_got_pltgot_addr(Context<E> &ctx) const;
 
   void set_got_idx(Context<E> &ctx, i32 idx);
   void set_gottp_idx(Context<E> &ctx, i32 idx);
@@ -1986,7 +1992,12 @@ public:
   bool is_relative() const { return !is_absolute(); }
   bool is_local(Context<E> &ctx) const;
   bool is_ifunc() const { return get_type() == STT_GNU_IFUNC; }
+  bool is_pde_ifunc(Context<E> &ctx) const;
   bool is_remaining_undef_weak() const;
+
+  bool is_pcrel_linktime_const(Context<E> &ctx) const;
+  bool is_tprel_linktime_const(Context<E> &ctx) const;
+  bool is_tprel_runtime_const(Context<E> &ctx) const;
 
   InputSection<E> *get_input_section() const;
   Chunk<E> *get_output_section() const;
@@ -2004,7 +2015,6 @@ public:
   i64 get_output_sym_idx(Context<E> &ctx) const;
   const ElfSym<E> &esym() const;
   void add_aux(Context<E> &ctx);
-  void clear();
 
   // A symbol is owned by a file. If two or more files define the
   // same symbol, the one with the strongest definition owns the symbol.
@@ -2038,7 +2048,7 @@ public:
   i32 sym_idx = -1;
 
   i32 aux_idx = -1;
-  u16 ver_idx = 0;
+  u16 ver_idx = VER_NDX_UNSPECIFIED;
 
   // `flags` has NEEDS_ flags.
   Atomic<u8> flags = 0;
@@ -2158,6 +2168,9 @@ public:
   // For LTO. True if the symbol is referenced by a regular object (as
   // opposed to IR object).
   bool referenced_by_regular_obj : 1 = false;
+
+  // For `-z rewrite-endbr`
+  bool address_taken : 1 = false;
 
   // Target-dependent extra members.
   [[no_unique_address]] SymbolExtras<E> extra;
@@ -2306,7 +2319,7 @@ InputSection<E>::get_fragment(Context<E> &ctx, const ElfRel<E> &rel) {
 template <typename E>
 u64 InputSection<E>::get_thunk_addr(i64 idx) {
   if constexpr (needs_thunk<E>) {
-    RangeExtensionRef ref = extra.range_extn[idx];
+    ThunkRef ref = extra.thunk_refs[idx];
     assert(ref.thunk_idx != -1);
     return output_section->thunks[ref.thunk_idx]->get_addr(ref.sym_idx);
   }
@@ -2360,7 +2373,7 @@ InputSection<E>::is_relr_reloc(Context<E> &ctx, const ElfRel<E> &rel) const {
          (rel.r_offset % sizeof(Word<E>)) == 0;
 }
 
-template<typename E>
+template <typename E>
 inline bool InputSection<E>::is_killed_by_icf() const {
   return this->leader && this->leader != this;
 }
@@ -2404,8 +2417,6 @@ InputFile<E>::get_string(Context<E> &ctx, const ElfShdr<E> &shdr) {
 
 template <typename E>
 inline std::string_view InputFile<E>::get_string(Context<E> &ctx, i64 idx) {
-  assert(idx < elf_sections.size());
-
   if (elf_sections.size() <= idx)
     Fatal(ctx) << *this << ": invalid section index: " << idx;
   return this->get_string(ctx, elf_sections[idx]);
@@ -2491,11 +2502,17 @@ u64 Symbol<E>::get_addr(Context<E> &ctx, i64 flags) const {
       // so pointing to a specific location in a source .eh_frame
       // section doesn't make much sense. However, CRT files contain
       // symbols pointing to the very beginning and ending of the section.
-      if (name() == "__EH_FRAME_BEGIN__" || name() == "__EH_FRAME_LIST__" ||
-          name() == ".eh_frame_seg" || esym().st_type == STT_SECTION)
+      //
+      // If LTO is enabled, GCC may add `.lto_priv.<whatever>` as a symbol
+      // suffix. That's why we use starts_with() instead of `==` here.
+      if (name().starts_with("__EH_FRAME_BEGIN__") ||
+          name().starts_with("__EH_FRAME_LIST__") ||
+          name().starts_with(".eh_frame_seg") ||
+          esym().st_type == STT_SECTION)
         return ctx.eh_frame->shdr.sh_addr;
 
-      if (name() == "__FRAME_END__" || name() == "__EH_FRAME_LIST_END__")
+      if (name().starts_with("__FRAME_END__") ||
+          name().starts_with("__EH_FRAME_LIST_END__"))
         return ctx.eh_frame->shdr.sh_addr + ctx.eh_frame->shdr.sh_size;
 
       // ARM object files contain "$d" local symbol at the beginning
@@ -2504,7 +2521,7 @@ u64 Symbol<E>::get_addr(Context<E> &ctx, i64 flags) const {
       if (name() == "$d" || name().starts_with("$d."))
         return ctx.eh_frame->shdr.sh_addr;
 
-      Fatal(ctx) << "symbol referring .eh_frame is not supported: "
+      Fatal(ctx) << "symbol referring to .eh_frame is not supported: "
                  << *this << " " << *file;
     }
 
@@ -2576,6 +2593,25 @@ inline u64 Symbol<E>::get_opd_addr(Context<E> &ctx) const {
   assert(get_opd_idx(ctx) != -1);
   return ctx.extra.opd->shdr.sh_addr +
          get_opd_idx(ctx) * PPC64OpdSection::ENTRY_SIZE;
+}
+
+template <typename E>
+inline u64 Symbol<E>::get_got_pltgot_addr(Context<E> &ctx) const {
+  // An ifunc symbol occupies two consecutive GOT slots in a
+  // position-dependent executable (PDE). The first slot contains the
+  // symbol's PLT address, and the second slot holds the resolved
+  // address. A PDE uses the ifunc symbol's PLT entry as the address
+  // for the symbol, akin to a canonical PLT.
+  //
+  // This function returns the address that the PLT entry should use
+  // to jump to the resolved address.
+  //
+  // Note that we don't use this function for PPC64. In PPC64, symbols
+  // are always accessed through the TOC table regardless of the
+  // -fno-PIE setting. We don't need canonical PLTs on the psABIs too.
+  if (is_pde_ifunc(ctx))
+    return get_got_addr(ctx) + sizeof(Word<E>);
+  return get_got_addr(ctx);
 }
 
 template <typename E>
@@ -2706,12 +2742,41 @@ inline bool Symbol<E>::is_local(Context<E> &ctx) const {
   return !is_imported && !is_exported;
 }
 
+template <typename E>
+inline bool Symbol<E>::is_pde_ifunc(Context<E> &ctx) const {
+  // Returns true if this is an ifunc tha uses two GOT slots
+  return is_ifunc() && !ctx.arg.pic && !is_ppc64<E>;
+}
+
 // A remaining weak undefined symbol is promoted to a dynamic symbol
 // in DSO and resolved to 0 in an executable. This function returns
 // true if it's latter.
-template<typename E>
+template <typename E>
 inline bool Symbol<E>::is_remaining_undef_weak() const {
   return !is_imported && esym().is_undef_weak();
+}
+
+// Returns true if the symbol's PC-relative address is known at link-time.
+template <typename E>
+inline bool Symbol<E>::is_pcrel_linktime_const(Context<E> &ctx) const {
+  return !is_imported && !is_ifunc() && (is_relative() || !ctx.arg.pic);
+}
+
+// Returns true if the symbol's Thread Pointer-relative address is
+// known at link-time.
+template <typename E>
+inline bool Symbol<E>::is_tprel_linktime_const(Context<E> &ctx) const {
+  assert(get_type() == STT_TLS);
+  return !ctx.arg.shared && !is_imported;
+}
+
+// Returns true if the symbol's Thread Pointer-relative address is
+// known at load-time.
+template <typename E>
+inline bool Symbol<E>::is_tprel_runtime_const(Context<E> &ctx) const {
+  // Returns true unless we are creating a dlopen'able DSO.
+  assert(get_type() == STT_TLS);
+  return !(ctx.arg.shared && ctx.arg.z_dlopen);
 }
 
 template <typename E>
@@ -2798,22 +2863,9 @@ inline std::string_view Symbol<E>::name() const {
 template <typename E>
 inline void Symbol<E>::add_aux(Context<E> &ctx) {
   if (aux_idx == -1) {
-    i64 sz = ctx.symbol_aux.size();
-    aux_idx = sz;
-    ctx.symbol_aux.resize(sz + 1);
+    aux_idx = ctx.symbol_aux.size();
+    ctx.symbol_aux.resize(aux_idx + 1);
   }
-}
-
-template <typename E>
-inline void Symbol<E>::clear() {
-  file = nullptr;
-  origin = 0;
-  value = -1;
-  sym_idx = -1;
-  ver_idx = 0;
-  is_weak = false;
-  is_imported = false;
-  is_exported = false;
 }
 
 inline bool is_c_identifier(std::string_view s) {
@@ -2833,41 +2885,6 @@ inline bool is_c_identifier(std::string_view s) {
   for (i64 i = 1; i < s.size(); i++)
     if (!is_alnum(s[i]))
       return false;
-  return true;
-}
-
-template <typename E>
-inline bool relax_tlsdesc(Context<E> &ctx, Symbol<E> &sym) {
-  // TLSDESC relocs must be always relaxed for statically-linked
-  // executables even if -no-relax is given. It is because a
-  // statically-linked executable doesn't contain a tranpoline
-  // function needed for TLSDESC.
-  if (ctx.arg.is_static)
-    return true;
-  return ctx.arg.relax && !ctx.arg.shared && !sym.is_imported;
-}
-
-// Returns true if esym has already been resolved.
-template <typename E>
-bool is_resolved(Symbol<E> &sym, const ElfSym<E> &esym) {
-  assert(sym.file);
-
-  // A non-weak undefined symbol must be promoted to an imported
-  // symbol or resolved to an defined symbol. Otherwise, it's an
-  // undefined symbol error.
-  //
-  // Every ELF file has an absolute local symbol as its first symbol.
-  // Referring to that symbol is always valid.
-  bool is_undef = esym.is_undef() && !esym.is_weak() && sym.sym_idx;
-  if (!sym.is_imported && is_undef && sym.esym().is_undef())
-    return false;
-
-  // If a protected/hidden undefined symbol is resolved to other .so,
-  // it's handled as if no symbols were found.
-  if (sym.file->is_dso &&
-      (sym.visibility == STV_PROTECTED || sym.visibility == STV_HIDDEN))
-    return false;
-
   return true;
 }
 

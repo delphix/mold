@@ -8,6 +8,7 @@
 #include <bitset>
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
@@ -22,6 +23,7 @@
 #include <sys/types.h>
 #include <tbb/concurrent_vector.h>
 #include <tbb/enumerable_thread_specific.h>
+#include <tbb/parallel_for.h>
 #include <vector>
 
 #ifdef _WIN32
@@ -44,6 +46,18 @@
 // available only in C++23, so we use this macro when giving a hint to
 // the compiler's optimizer what's true.
 #define ASSUME(x) do { if (!(x)) __builtin_unreachable(); } while (0)
+
+// This is an assert() that is enabled even in the release build.
+#define ASSERT(x)                                       \
+  do {                                                  \
+    if (!(x)) {                                         \
+      std::cerr << "Assertion failed: (" << #x          \
+                << "), function " << __FUNCTION__       \
+                << ", file " << __FILE__                \
+                << ", line " << __LINE__ << ".\n";      \
+      std::abort();                                     \
+    }                                                   \
+  } while (0)
 
 inline uint64_t hash_string(std::string_view str) {
   return XXH3_64bits(str.data(), str.size());
@@ -94,24 +108,27 @@ static u64 combine_hash(u64 a, u64 b) {
 template <typename Context>
 class SyncOut {
 public:
-  SyncOut(Context &ctx, std::ostream &out = std::cout) : out(out) {
+  SyncOut(Context &ctx, std::ostream *out = &std::cout) : out(out) {
     opt_demangle = ctx.arg.demangle;
   }
 
   ~SyncOut() {
-    std::scoped_lock lock(mu);
-    out << ss.str() << "\n";
+    if (out) {
+      std::scoped_lock lock(mu);
+      *out << ss.str() << "\n";
+    }
   }
 
   template <class T> SyncOut &operator<<(T &&val) {
-    ss << std::forward<T>(val);
+    if (out)
+      ss << std::forward<T>(val);
     return *this;
   }
 
   static inline std::mutex mu;
 
 private:
-  std::ostream &out;
+  std::ostream *out;
   std::stringstream ss;
 };
 
@@ -125,7 +142,7 @@ static std::string add_color(Context &ctx, std::string msg) {
 template <typename Context>
 class Fatal {
 public:
-  Fatal(Context &ctx) : out(ctx, std::cerr) {
+  Fatal(Context &ctx) : out(ctx, &std::cerr) {
     out << add_color(ctx, "fatal");
   }
 
@@ -147,7 +164,7 @@ private:
 template <typename Context>
 class Error {
 public:
-  Error(Context &ctx) : out(ctx, std::cerr) {
+  Error(Context &ctx) : out(ctx, &std::cerr) {
     if (ctx.arg.noinhibit_exec) {
       out << add_color(ctx, "warning");
     } else {
@@ -168,7 +185,8 @@ private:
 template <typename Context>
 class Warn {
 public:
-  Warn(Context &ctx) : out(ctx, std::cerr) {
+  Warn(Context &ctx)
+    : out(ctx, ctx.arg.suppress_warnings ? nullptr : &std::cerr) {
     if (ctx.arg.fatal_warnings) {
       out << add_color(ctx, "error");
       ctx.has_error = true;
@@ -198,6 +216,13 @@ struct Atomic : std::atomic<T> {
 
   using std::atomic<T>::atomic;
 
+  Atomic(const Atomic<T> &other) { store(other.load()); }
+
+  Atomic<T> &operator=(const Atomic<T> &other) {
+    store(other.load());
+    return *this;
+  }
+
   void operator=(T val) { store(val); }
   operator T() const { return load(); }
 
@@ -209,11 +234,12 @@ struct Atomic : std::atomic<T> {
     return std::atomic<T>::load(order);
   }
 
-  T exchange(T val, std::memory_order order = relaxed) {
-    return std::atomic<T>::exchange(val, order);
-  }
-
+  T exchange(T val) { return std::atomic<T>::exchange(val, relaxed); }
   T operator|=(T val) { return std::atomic<T>::fetch_or(val, relaxed); }
+  T operator++() { return std::atomic<T>::fetch_add(1, relaxed) + 1; }
+  T operator--() { return std::atomic<T>::fetch_sub(1, relaxed) - 1; }
+  T operator++(int) { return std::atomic<T>::fetch_add(1, relaxed); }
+  T operator--(int) { return std::atomic<T>::fetch_sub(1, relaxed); }
 
   bool test_and_set() {
     // A relaxed load + branch (assuming miss) takes only around 20 cycles,
@@ -222,6 +248,85 @@ struct Atomic : std::atomic<T> {
     // early test tends to improve performance in the ~20% ballpark.
     return load() || exchange(true);
   }
+};
+
+//
+// perf.cc
+//
+
+// Counter is used to collect statistics numbers.
+class Counter {
+public:
+  Counter(std::string_view name, i64 value = 0) : name(name), values(value) {
+    static std::mutex mu;
+    std::scoped_lock lock(mu);
+    instances.push_back(this);
+  }
+
+  Counter &operator++(int) {
+    if (enabled) [[unlikely]]
+      values.local()++;
+    return *this;
+  }
+
+  Counter &operator+=(int delta) {
+    if (enabled) [[unlikely]]
+      values.local() += delta;
+    return *this;
+  }
+
+  static void print();
+
+  static inline bool enabled = false;
+
+private:
+  i64 get_value();
+
+  std::string_view name;
+  tbb::enumerable_thread_specific<i64> values;
+
+  static inline std::vector<Counter *> instances;
+};
+
+// Timer and TimeRecord records elapsed time (wall clock time)
+// used by each pass of the linker.
+struct TimerRecord {
+  TimerRecord(std::string name, TimerRecord *parent = nullptr);
+  void stop();
+
+  std::string name;
+  TimerRecord *parent;
+  tbb::concurrent_vector<TimerRecord *> children;
+  i64 start;
+  i64 end;
+  i64 user;
+  i64 sys;
+  bool stopped = false;
+};
+
+void
+print_timer_records(tbb::concurrent_vector<std::unique_ptr<TimerRecord>> &);
+
+template <typename Context>
+class Timer {
+public:
+  Timer(Context &ctx, std::string name, Timer *parent = nullptr) {
+    record = new TimerRecord(name, parent ? parent->record : nullptr);
+    ctx.timer_records.push_back(std::unique_ptr<TimerRecord>(record));
+  }
+
+  Timer(const Timer &) = delete;
+
+  ~Timer() {
+    record->stop();
+  }
+
+  void stop() {
+    record->stop();
+  }
+
+private:
+  TimerRecord *record;
 };
 
 //
@@ -280,7 +385,7 @@ inline u64 bits(u64 val, u64 hi, u64 lo) {
 
 inline i64 sign_extend(u64 val, i64 size) {
   return (i64)(val << (63 - size)) >> (63 - size);
-};
+}
 
 template <typename T, typename Compare = std::less<T>>
 void update_minimum(std::atomic<T> &atomic, u64 new_val, Compare cmp = {}) {
@@ -305,7 +410,12 @@ inline void append(std::vector<T> &vec1, std::vector<U> vec2) {
 
 template <typename T>
 inline std::vector<T> flatten(std::vector<std::vector<T>> &vec) {
+  i64 size = 0;
+  for (std::vector<T> &v : vec)
+    size += v.size();
+
   std::vector<T> ret;
+  ret.reserve(size);
   for (std::vector<T> &v : vec)
     append(ret, v);
   return ret;
@@ -371,28 +481,34 @@ inline i64 write_uleb(u8 *buf, u64 val) {
   return i;
 }
 
-inline u64 read_uleb(u8 *&buf) {
+inline u64 read_uleb(u8 **buf) {
   u64 val = 0;
   u8 shift = 0;
   u8 byte;
   do {
-    byte = *buf++;
+    byte = *(*buf)++;
     val |= (byte & 0x7f) << shift;
     shift += 7;
   } while (byte & 0x80);
   return val;
 }
 
-inline u64 read_uleb(u8 const*&buf) {
-  return read_uleb(const_cast<u8 *&>(buf));
+inline u64 read_uleb(u8 *buf) {
+  u8 *tmp = buf;
+  return read_uleb(&tmp);
 }
 
-inline u64 read_uleb(std::string_view &str) {
-  u8 *start = (u8 *)&str[0];
+inline u64 read_uleb(std::string_view *str) {
+  u8 *start = (u8 *)str->data();
   u8 *ptr = start;
-  u64 val = read_uleb(ptr);
-  str = str.substr(ptr - start);
+  u64 val = read_uleb(&ptr);
+  *str = str->substr(ptr - start);
   return val;
+}
+
+inline u64 read_uleb(std::string_view str) {
+  std::string_view tmp = str;
+  return read_uleb(&tmp);
 }
 
 inline i64 uleb_size(u64 val) {
@@ -403,6 +519,14 @@ inline i64 uleb_size(u64 val) {
     if (val < (1LL << (7 * i)))
       return i;
   return 9;
+}
+
+inline void overwrite_uleb(u8 *loc, u64 val) {
+  while (*loc & 0b1000'0000) {
+    *loc++ = 0b1000'0000 | (val & 0b0111'1111);
+    val >>= 7;
+  }
+  *loc = val & 0b0111'1111;
 }
 
 template <typename Context>
@@ -441,53 +565,68 @@ public:
   }
 
   ~ConcurrentMap() {
-    if (keys) {
-      free((void *)keys);
-      free((void *)key_sizes);
-      free((void *)values);
-    }
+    free(entries_buf);
   }
 
+  // In order to avoid unnecessary cache-line false sharing, we want
+  // to make this object to be aligned to a reasonably large
+  // power-of-two address.
+  struct alignas(32) Entry {
+    Atomic<const char *> key;
+    T value;
+    u32 keylen;
+  };
+
   void resize(i64 nbuckets) {
-    this->~ConcurrentMap();
+    this->nbuckets = std::max<i64>(MIN_NBUCKETS, bit_ceil(nbuckets));
+    free(entries_buf);
 
-    nbuckets = std::max<i64>(MIN_NBUCKETS, bit_ceil(nbuckets));
-
-    this->nbuckets = nbuckets;
-    keys = (std::atomic<const char *> *)calloc(nbuckets, sizeof(char *));
-    key_sizes = (u32 *)malloc(nbuckets * sizeof(u32));
-    values = (T *)malloc(nbuckets * sizeof(T));
+    // Even though std::aligned_alloc is defined in C++17, MSVC doesn't
+    // seem to provide that function. C11's aligned_alloc may not be always
+    // avialalbe. Therefore, we'll align the buffer ourselves.
+    i64 size = sizeof(Entry) * this->nbuckets;
+    entries_buf = malloc(size + alignof(Entry) - 1);
+    entries = (Entry *)align_to((u64)entries_buf, alignof(Entry));
+    memset(entries, 0, size);
   }
 
   std::pair<T *, bool> insert(std::string_view key, u64 hash, const T &val) {
-    if (!keys)
-      return {nullptr, false};
-
     assert(has_single_bit(nbuckets));
+
     i64 idx = hash & (nbuckets - 1);
     i64 retry = 0;
 
     while (retry < MAX_RETRY) {
-      const char *ptr = keys[idx].load(std::memory_order_acquire);
-      if (ptr == marker) {
-        pause();
+      Entry &ent = entries[idx];
+      const char *ptr = nullptr;
+      bool claimed = ent.key.compare_exchange_weak(ptr, (char *)-1,
+                                                   std::memory_order_acquire);
+
+      // If we successfully claimed the ownership of an unused slot,
+      // copy values to it.
+      if (claimed) {
+        new (&ent.value) T(val);
+        ent.keylen = key.size();
+        ent.key.store(key.data(), std::memory_order_release);
+        return {&ent.value, true};
+      }
+
+      // Loop on a spurious failure.
+      if (ptr == nullptr)
         continue;
+
+      // If someone is copying values to the slot, do busy wait.
+      while (ptr == (char *)-1) {
+        pause();
+        ptr = ent.key.load(std::memory_order_acquire);
       }
 
-      if (ptr == nullptr) {
-        if (!keys[idx].compare_exchange_weak(ptr, marker,
-                                             std::memory_order_acquire))
-          continue;
-        new (values + idx) T(val);
-        key_sizes[idx] = key.size();
-        keys[idx].store(key.data(), std::memory_order_release);
-        return {values + idx, true};
-      }
+      // If the same key is already present, this is the slot we are
+      // looking for.
+      if (key == std::string_view(ptr, ent.keylen))
+        return {&ent.value, false};
 
-      if (key.size() == key_sizes[idx] &&
-          memcmp(ptr, key.data(), key_sizes[idx]) == 0)
-        return {values + idx, false};
-
+      // Otherwise, move on to the next slot.
       u64 mask = nbuckets / NUM_SHARDS - 1;
       idx = (idx & ~mask) | ((idx + 1) & mask);
       retry++;
@@ -497,17 +636,68 @@ public:
     return {nullptr, false};
   }
 
-  const char *get_key(i64 idx) {
-    return keys[idx].load(std::memory_order_relaxed);
+  i64 get_idx(T *value) const {
+    uintptr_t addr = (uintptr_t)value - (uintptr_t)value % sizeof(Entry);
+    return (Entry *)addr - entries;
+  }
+
+  // Return a list of map entries sorted in a deterministic order.
+  std::vector<Entry *> get_sorted_entries(i64 shard_idx) {
+    if (nbuckets == 0)
+      return {};
+
+    i64 shard_size = nbuckets / NUM_SHARDS;
+    i64 begin = shard_idx * shard_size;
+    i64 end = begin + shard_size;
+
+    i64 sz = 0;
+    for (i64 i = begin; i < end; i++)
+      if (entries[i].key)
+        sz++;
+
+    std::vector<Entry *> vec;
+    vec.reserve(sz);
+
+    // Since the shard is circular, we need to handle the last entries
+    // as if they were next to the first entries.
+    while (entries[end - 1].key)
+      vec.push_back(entries + --end);
+
+    // Find entries contiguous in the buckets and sort them.
+    i64 last = 0;
+    for (i64 i = begin; i < end;) {
+      while (i < end && entries[i].key)
+        vec.push_back(entries + i++);
+
+      std::sort(vec.begin() + last, vec.end(), [](Entry *a, Entry *b) {
+        if (a->keylen != b->keylen)
+          return a->keylen < b->keylen;
+        return memcmp(a->key, b->key, a->keylen) < 0;
+      });
+
+      last = vec.size();
+
+      while (i < end && !entries[i].key)
+        i++;
+    }
+    return vec;
+  }
+
+  std::vector<Entry *> get_sorted_entries_all() {
+    std::vector<std::vector<Entry *>> vec(NUM_SHARDS);
+    tbb::parallel_for((i64)0, NUM_SHARDS, [&](i64 i) {
+      vec[i] = get_sorted_entries(i);
+    });
+    return flatten(vec);
   }
 
   static constexpr i64 MIN_NBUCKETS = 2048;
   static constexpr i64 NUM_SHARDS = 16;
   static constexpr i64 MAX_RETRY = 128;
 
+  void *entries_buf = nullptr;
+  Entry *entries = nullptr;
   i64 nbuckets = 0;
-  u32 *key_sizes = nullptr;
-  T *values = nullptr;
 
 private:
   static void pause() {
@@ -517,10 +707,6 @@ private:
     asm volatile("yield");
 #endif
   }
-
-private:
-  std::atomic<const char *> *keys = nullptr;
-  static constexpr const char *marker = "marker";
 };
 
 //
@@ -537,14 +723,53 @@ public:
   virtual ~OutputFile() = default;
 
   u8 *buf = nullptr;
+  std::vector<u8> buf2;
   std::string path;
-  i64 filesize;
-  bool is_mmapped;
+  i64 fd = -1;
+  i64 filesize = 0;
+  bool is_mmapped = false;
   bool is_unmapped = false;
 
 protected:
   OutputFile(std::string path, i64 filesize, bool is_mmapped)
     : path(path), filesize(filesize), is_mmapped(is_mmapped) {}
+};
+
+template <typename Context>
+class MallocOutputFile : public OutputFile<Context> {
+public:
+  MallocOutputFile(Context &ctx, std::string path, i64 filesize, i64 perm)
+    : OutputFile<Context>(path, filesize, false), perm(perm) {
+    this->buf = (u8 *)malloc(filesize);
+    if (!this->buf)
+      Fatal(ctx) << "malloc failed";
+  }
+
+  ~MallocOutputFile() {
+    free(this->buf);
+  }
+
+  void close(Context &ctx) override {
+    Timer t(ctx, "close_file");
+    FILE *fp;
+
+    if (this->path == "-") {
+      fp = stdout;
+    } else {
+      i64 fd = ::open(this->path.c_str(), O_RDWR | O_CREAT, perm);
+      if (fd == -1)
+        Fatal(ctx) << "cannot open " << this->path << ": " << errno_string();
+      fp = fdopen(fd, "w");
+    }
+
+    fwrite(this->buf, this->filesize, 1, fp);
+    if (!this->buf2.empty())
+      fwrite(this->buf2.data(), this->buf2.size(), 1, fp);
+    fclose(fp);
+  }
+
+private:
+  i64 perm;
 };
 
 //
@@ -683,85 +908,6 @@ private:
 };
 
 //
-// perf.cc
-//
-
-// Counter is used to collect statistics numbers.
-class Counter {
-public:
-  Counter(std::string_view name, i64 value = 0) : name(name), values(value) {
-    static std::mutex mu;
-    std::scoped_lock lock(mu);
-    instances.push_back(this);
-  }
-
-  Counter &operator++(int) {
-    if (enabled) [[unlikely]]
-      values.local()++;
-    return *this;
-  }
-
-  Counter &operator+=(int delta) {
-    if (enabled) [[unlikely]]
-      values.local() += delta;
-    return *this;
-  }
-
-  static void print();
-
-  static inline bool enabled = false;
-
-private:
-  i64 get_value();
-
-  std::string_view name;
-  tbb::enumerable_thread_specific<i64> values;
-
-  static inline std::vector<Counter *> instances;
-};
-
-// Timer and TimeRecord records elapsed time (wall clock time)
-// used by each pass of the linker.
-struct TimerRecord {
-  TimerRecord(std::string name, TimerRecord *parent = nullptr);
-  void stop();
-
-  std::string name;
-  TimerRecord *parent;
-  tbb::concurrent_vector<TimerRecord *> children;
-  i64 start;
-  i64 end;
-  i64 user;
-  i64 sys;
-  bool stopped = false;
-};
-
-void
-print_timer_records(tbb::concurrent_vector<std::unique_ptr<TimerRecord>> &);
-
-template <typename Context>
-class Timer {
-public:
-  Timer(Context &ctx, std::string name, Timer *parent = nullptr) {
-    record = new TimerRecord(name, parent ? parent->record : nullptr);
-    ctx.timer_records.push_back(std::unique_ptr<TimerRecord>(record));
-  }
-
-  Timer(const Timer &) = delete;
-
-  ~Timer() {
-    record->stop();
-  }
-
-  void stop() {
-    record->stop();
-  }
-
-private:
-  TimerRecord *record;
-};
-
-//
 // tar.cc
 //
 
@@ -832,7 +978,6 @@ public:
   std::string name;
   u8 *data = nullptr;
   i64 size = 0;
-  i64 mtime = 0;
   bool given_fullpath = true;
   MappedFile *parent = nullptr;
   MappedFile *thin_parent = nullptr;
@@ -849,13 +994,16 @@ MappedFile<Context> *MappedFile<Context>::open(Context &ctx, std::string path) {
 
   i64 fd;
 #ifdef _WIN32
-    fd = ::_open(path.c_str(), O_RDONLY);
+  fd = ::_open(path.c_str(), O_RDONLY);
 #else
-    fd = ::open(path.c_str(), O_RDONLY);
+  fd = ::open(path.c_str(), O_RDONLY);
 #endif
 
-  if (fd == -1)
+  if (fd == -1) {
+    if (errno != ENOENT)
+      Fatal(ctx) << "opening " << path << " failed: " << errno_string();
     return nullptr;
+  }
 
   struct stat st;
   if (fstat(fd, &st) == -1)
@@ -866,15 +1014,6 @@ MappedFile<Context> *MappedFile<Context>::open(Context &ctx, std::string path) {
 
   mf->name = path;
   mf->size = st.st_size;
-
-#ifdef _WIN32
-    mf->mtime = st.st_mtime;
-#elif defined(__APPLE__)
-    mf->mtime = (u64)st.st_mtimespec.tv_sec * 1'000'000'000 +
-                st.st_mtimespec.tv_nsec;
-#else
-    mf->mtime = (u64)st.st_mtim.tv_sec * 1'000'000'000 + st.st_mtim.tv_nsec;
-#endif
 
   if (st.st_size > 0) {
 #ifdef _WIN32
@@ -893,7 +1032,7 @@ MappedFile<Context> *MappedFile<Context>::open(Context &ctx, std::string path) {
     if (mf->data == MAP_FAILED)
       Fatal(ctx) << path << ": mmap failed: " << errno_string();
 #endif
-    }
+  }
 
   close(fd);
   return mf;

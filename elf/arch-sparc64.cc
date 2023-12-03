@@ -115,12 +115,12 @@ void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
   };
 
   memcpy(buf, entry, sizeof(entry));
-  *(ub64 *)(buf + 24) = sym.get_got_addr(ctx) - sym.get_plt_addr(ctx) - 4;
+  *(ub64 *)(buf + 24) = sym.get_got_pltgot_addr(ctx) - sym.get_plt_addr(ctx) - 4;
 }
 
 template <>
-void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
-                                    u64 offset, u64 val) {
+void EhFrameSection<E>::apply_eh_reloc(Context<E> &ctx, const ElfRel<E> &rel,
+                                       u64 offset, u64 val) {
   u8 *loc = ctx.buf + this->shdr.sh_offset + offset;
 
   switch (rel.r_type) {
@@ -170,7 +170,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 
     switch (rel.r_type) {
     case R_SPARC_64:
-      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, dynrel);
+      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, &dynrel);
       break;
     case R_SPARC_5:
       check(S + A, 0, 1 << 5);
@@ -288,36 +288,32 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       // We always have to relax a GOT load to a load immediate if a
       // symbol is local, because R_SPARC_GOTDATA_OP cannot represent
       // an addend for a local symbol.
-      if (sym.is_imported || sym.is_ifunc()) {
+      if (sym.is_absolute()) {
+        i64 val = S + A;
+        *(ub32 *)loc |= bits(val < 0 ? ~val : val, 31, 10);
+      } else if (sym.is_pcrel_linktime_const(ctx)) {
+        i64 val = S + A - GOT;
+        *(ub32 *)loc |= bits(val < 0 ? ~val : val, 31, 10);
+      } else {
         *(ub32 *)loc |= bits(G, 31, 10);
-      } else if (sym.is_absolute()) {
-        i64 val = S + A;
-        *(ub32 *)loc |= bits(val < 0 ? ~val : val, 31, 10);
-      } else {
-        i64 val = S + A - GOT;
-        *(ub32 *)loc |= bits(val < 0 ? ~val : val, 31, 10);
       }
       break;
-    case R_SPARC_GOTDATA_OP_LOX10: {
-      if (sym.is_imported || sym.is_ifunc()) {
+    case R_SPARC_GOTDATA_OP_LOX10:
+      if (sym.is_absolute()) {
+        i64 val = S + A;
+        *(ub32 *)loc |= bits(val, 9, 0) | (val < 0 ? 0b1'1100'0000'0000 : 0);
+      } else if (sym.is_pcrel_linktime_const(ctx)) {
+        i64 val = S + A - GOT;
+        *(ub32 *)loc |= bits(val, 9, 0) | (val < 0 ? 0b1'1100'0000'0000 : 0);
+      } else {
         *(ub32 *)loc |= bits(G, 9, 0);
-      } else if (sym.is_absolute()) {
-        i64 val = S + A;
-        *(ub32 *)loc |= bits(val, 9, 0) | (val < 0 ? 0b1'1100'0000'0000 : 0);
-      } else {
-        i64 val = S + A - GOT;
-        *(ub32 *)loc |= bits(val, 9, 0) | (val < 0 ? 0b1'1100'0000'0000 : 0);
       }
       break;
-    }
     case R_SPARC_GOTDATA_OP:
-      if (sym.is_imported || sym.is_ifunc())
-        break;
-
       if (sym.is_absolute()) {
         // ldx [ %g2 + %g1 ], %g1  →  nop
         *(ub32 *)loc = 0x0100'0000;
-      } else {
+      } else if (sym.is_pcrel_linktime_const(ctx)) {
         // ldx [ %g2 + %g1 ], %g1  →  add %g2, %g1, %g1
         *(ub32 *)loc &= 0b00'11111'000000'11111'1'11111111'11111;
         *(ub32 *)loc |= 0b10'00000'000000'00000'0'00000000'00000;
@@ -425,17 +421,11 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_NONE)
+    if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
-    const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
     u8 *loc = base + rel.r_offset;
-
-    if (!is_resolved(sym, esym)) {
-      record_undef_error(ctx, rel);
-      continue;
-    }
 
     auto check = [&](i64 val, i64 lo, i64 hi) {
       if (val < lo || hi <= val)
@@ -488,16 +478,10 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
   // Scan relocations
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_NONE)
+    if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
-    const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
-
-    if (!is_resolved(sym, esym)) {
-      record_undef_error(ctx, rel);
-      continue;
-    }
 
     if (sym.is_ifunc())
       sym.flags |= NEEDS_GOT | NEEDS_PLT;
@@ -580,8 +564,9 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       break;
     case R_SPARC_TLS_GD_CALL:
     case R_SPARC_TLS_LDM_CALL:
-      if (!ctx.arg.is_static && ctx.extra.tls_get_addr_sym->is_imported)
-        ctx.extra.tls_get_addr_sym->flags |= NEEDS_PLT;
+      if (!ctx.arg.is_static)
+        if (Symbol<E> &sym = *ctx.extra.tls_get_addr_sym; sym.is_imported)
+          sym.flags |= NEEDS_PLT;
       break;
     case R_SPARC_TLS_LE_HIX22:
     case R_SPARC_TLS_LE_LOX10:
@@ -604,7 +589,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_SPARC_SIZE32:
       break;
     default:
-      Fatal(ctx) << *this << ": scan_relocations: " << rel;
+      Error(ctx) << *this << ": unknown relocation: " << rel;
     }
   }
 }

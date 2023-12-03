@@ -1,13 +1,14 @@
 #!/bin/bash
 . $(dirname $0)/common.inc
 
-[ $MACHINE = i386 ] && skip
+[ $MACHINE = i686 ] && skip
 [ $MACHINE = m68k ] && skip
 [ $MACHINE = arm ] && skip
 [ $MACHINE = ppc64 ] && skip
 [ $MACHINE = ppc64le ] && skip
 [ $MACHINE = sh4 ] && skip
 [ $MACHINE = alpha ] && skip
+[[ $MACHINE = loongarch* ]] && skip
 
 cat <<EOF | $CC -shared -o $t/a.so -xc -
 int foo = 3;

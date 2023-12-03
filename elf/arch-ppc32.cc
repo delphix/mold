@@ -120,14 +120,14 @@ void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
   memcpy(buf, plt_entry, sizeof(plt_entry));
 
   ub32 *loc = (ub32 *)buf;
-  i64 offset = sym.get_got_addr(ctx) - sym.get_plt_addr(ctx) - 8;
+  i64 offset = sym.get_got_pltgot_addr(ctx) - sym.get_plt_addr(ctx) - 8;
   loc[4] |= higha(offset);
   loc[5] |= lo(offset);
 }
 
 template <>
-void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
-                                    u64 offset, u64 val) {
+void EhFrameSection<E>::apply_eh_reloc(Context<E> &ctx, const ElfRel<E> &rel,
+                                       u64 offset, u64 val) {
   u8 *loc = ctx.buf + this->shdr.sh_offset + offset;
 
   switch (rel.r_type) {
@@ -153,7 +153,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     dynrel = (ElfRel<E> *)(ctx.buf + ctx.reldyn->shdr.sh_offset +
                            file.reldyn_offset + this->reldyn_offset);
 
-  u64 GOT2 = file.ppc32_got2 ? file.ppc32_got2->get_addr() : 0;
+  u64 GOT2 = file.extra.got2 ? file.extra.got2->get_addr() : 0;
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
@@ -172,7 +172,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     switch (rel.r_type) {
     case R_PPC_ADDR32:
     case R_PPC_UADDR32:
-      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, dynrel);
+      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, &dynrel);
       break;
     case R_PPC_ADDR14:
       *(ub32 *)loc |= bits(S + A, 15, 2) << 2;
@@ -293,17 +293,11 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_NONE)
+    if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
-    const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
     u8 *loc = base + rel.r_offset;
-
-    if (!is_resolved(sym, esym)) {
-      record_undef_error(ctx, rel);
-      continue;
-    }
 
     SectionFragment<E> *frag;
     i64 frag_addend;
@@ -336,16 +330,10 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
   // Scan relocations
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_NONE)
+    if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
-    const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
-
-    if (!is_resolved(sym, esym)) {
-      record_undef_error(ctx, rel);
-      continue;
-    }
 
     if (sym.is_ifunc())
       sym.flags |= NEEDS_GOT | NEEDS_PLT;
@@ -420,9 +408,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 }
 
 template <>
-void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
-
+void Thunk<E>::copy_buf(Context<E> &ctx) {
   static const ub32 local_thunk[] = {
     // Get this thunk's address
     0x7c08'02a6, // mflr    r0
@@ -441,22 +427,26 @@ void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
   static_assert(E::thunk_size == sizeof(plt_entry));
   static_assert(E::thunk_size == sizeof(local_thunk));
 
-  for (i64 i = 0; i < symbols.size(); i++) {
-    ub32 *loc = (ub32 *)(buf + i * E::thunk_size);
-    Symbol<E> &sym = *symbols[i];
+  u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
+  u64 P = output_section.shdr.sh_addr + offset;
 
-    if (sym.has_plt(ctx)) {
-      memcpy(loc, plt_entry, sizeof(plt_entry));
-      u64 got = sym.has_got(ctx) ? sym.get_got_addr(ctx) : sym.get_gotplt_addr(ctx);
-      i64 val = got - get_addr(i) - 8;
-      loc[4] |= higha(val);
-      loc[5] |= lo(val);
+  for (Symbol<E> *sym : symbols) {
+    if (sym->has_plt(ctx)) {
+      u64 got =
+        sym->has_got(ctx) ? sym->get_got_addr(ctx) : sym->get_gotplt_addr(ctx);
+      i64 val = got - P - 8;
+      memcpy(buf, plt_entry, sizeof(plt_entry));
+      *(ub32 *)(buf + 16) |= higha(val);
+      *(ub32 *)(buf + 20) |= lo(val);
     } else {
-      memcpy(loc, local_thunk, sizeof(local_thunk));
-      i64 val = sym.get_addr(ctx) - get_addr(i) - 8;
-      loc[4] |= higha(val);
-      loc[5] |= lo(val);
+      i64 val = sym->get_addr(ctx) - P - 8;
+      memcpy(buf, local_thunk, sizeof(local_thunk));
+      *(ub32 *)(buf + 16) |= higha(val);
+      *(ub32 *)(buf + 20) |= lo(val);
     }
+
+    buf += E::thunk_size;
+    P += E::thunk_size;
   }
 }
 

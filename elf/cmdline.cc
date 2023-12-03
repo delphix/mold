@@ -1,6 +1,7 @@
 #include "mold.h"
 #include "../common/cmdline.h"
 
+#include <random>
 #include <regex>
 #include <sstream>
 #include <sys/stat.h>
@@ -51,6 +52,8 @@ Options:
   -s, --strip-all             Strip .symtab section
   -u SYMBOL, --undefined SYMBOL
                               Force to resolve SYMBOL
+  -y SYMBOL, --trace-symbol SYMBOL
+                              Trace references to SYMBOL
   --Bdynamic, --dy            Link against shared libraries (default)
   --Bstatic, --dn, --static   Do not link against shared libraries
   --Bsymbolic                 Bind global symbols locally
@@ -98,7 +101,7 @@ Options:
   --gc-sections               Remove unreferenced sections
     --no-gc-sections
   --gdb-index                 Create .gdb_index for faster gdb startup
-  --hash-style [sysv,gnu,both]
+  --hash-style [sysv,gnu,both,none]
                               Set hash style
   --icf=[all,safe,none]       Fold identical code
     --no-icf
@@ -106,6 +109,8 @@ Options:
                               Allow merging non-executable sections with --icf
   --image-base ADDR           Set the base address to a given value
   --init SYMBOL               Call SYMBOL at load-time
+  --nmagic                    Do not page align sections
+    --no-nmagic
   --no-undefined              Report undefined symbols (even with --shared)
   --noinhibit-exec            Create an output file even if errors occur
   --oformat=binary            Omit ELF, section and program headers
@@ -139,7 +144,9 @@ Options:
   --shuffle-sections[=SEED]   Randomize the output by shuffling input sections
   --sort-common               Ignored
   --sort-section              Ignored
-  --spare-dynamic-tags NUMBER Reserve give number of tags in .dynamic section
+  --spare-dynamic-tags NUMBER Reserve given number of tags in .dynamic section
+  --spare-program-headers NUMBER
+                              Reserve given number of slots in the program header
   --start-lib                 Give following object files in-archive-file semantics
     --end-lib                 End the effect of --start-lib
   --stats                     Print input statistics
@@ -187,18 +194,21 @@ Options:
   -z origin                   Mark object requiring immediate $ORIGIN processing at runtime
   -z pack-relative-relocs     Alias for --pack-dyn-relocs=relr
     -z nopack-relative-relocs
+  -z sectionheader            Do not omit section header (default)
+    -z nosectionheader        Omit section header
   -z separate-loadable-segments
                               Separate all loadable segments to different pages
     -z separate-code          Separate code and data into different pages
     -z noseparate-code        Allow overlap in pages
+  -z stack-size=VALUE         Set size of stack segment
   -z relro                    Make some sections read-only after relocation (default)
     -z norelro
   -z text                     Report error if DT_TEXTREL is set
     -z notext
     -z textoff
 
-mold: supported targets: elf32-i386 elf64-x86-64 elf32-littlearm elf64-littleaarch64 elf32-littleriscv elf32-bigriscv elf64-littleriscv elf64-bigriscv elf32-powerpc elf64-powerpc elf64-powerpc elf64-powerpcle elf64-s390 elf64-sparc elf32-m68k elf32-sh-linux elf64-alpha
-mold: supported emulations: elf_i386 elf_x86_64 armelf_linux_eabi aarch64linux aarch64elf elf32lriscv elf32briscv elf64lriscv elf64briscv elf32ppc elf32ppclinux elf64ppc elf64lppc elf64_s390 elf64_sparc m68kelf shlelf_linux elf64alpha)";
+mold: supported targets: elf32-i386 elf64-x86-64 elf32-littlearm elf64-littleaarch64 elf32-littleriscv elf32-bigriscv elf64-littleriscv elf64-bigriscv elf32-powerpc elf64-powerpc elf64-powerpc elf64-powerpcle elf64-s390 elf64-sparc elf32-m68k elf32-sh-linux elf64-alpha elf64-loongarch elf32-loongarch
+mold: supported emulations: elf_i386 elf_x86_64 armelf_linux_eabi aarch64linux aarch64elf elf32lriscv elf32briscv elf64lriscv elf64briscv elf32ppc elf32ppclinux elf64ppc elf64lppc elf64_s390 elf64_sparc m68kelf shlelf_linux elf64alpha elf64loongarch elf32loongarch)";
 
 static std::vector<std::string> add_dashes(std::string name) {
   // Single-letter option
@@ -398,13 +408,13 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   std::vector<std::string> remaining;
   std::string_view arg;
 
-  ctx.page_size = E::page_size;
   ctx.arg.color_diagnostics = isatty(STDERR_FILENO);
 
   bool version_shown = false;
   bool warn_shared_textrel = false;
   std::optional<SeparateCodeKind> z_separate_code;
   std::optional<bool> z_relro;
+  std::optional<u64> shuffle_sections_seed;
   std::unordered_set<std::string_view> rpaths;
 
   auto add_rpath = [&](std::string_view arg) {
@@ -423,7 +433,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   // It looks like the SPARC's dynamic linker takes both RELA's r_addend
   // and the value at the relocated place. So we don't want to write
   // values to relocated places.
-  if (is_sparc<E>)
+  if constexpr (is_sparc<E>)
     ctx.arg.apply_dynamic_relocs = false;
 
   auto read_arg = [&](std::string name) {
@@ -520,7 +530,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
                    << "   aarch64linux\n   armelf_linux_eabi\n   elf64lriscv\n"
                    << "   elf64briscv\n   elf32lriscv\n   elf32briscv\n"
                    << "   elf32ppc\n   elf64ppc\n   elf64lppc\n   elf64_s390\n"
-                   << "   elf64_sparc\n   m68kelf\n   shlelf_linux\n   elf64alpha";
+                   << "   elf64_sparc\n   m68kelf\n   shlelf_linux\n"
+                   << "   elf64alpha\n   elf64loongarch\n   elf32loongarch";
       version_shown = true;
     } else if (read_arg("m")) {
       if (arg == "elf_x86_64") {
@@ -555,6 +566,10 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
         ctx.arg.emulation = SH4::target_name;
       } else if (arg == "elf64alpha") {
         ctx.arg.emulation = ALPHA::target_name;
+      } else if (arg == "elf64loongarch") {
+        ctx.arg.emulation = LOONGARCH64::target_name;
+      } else if (arg == "elf32loongarch") {
+        ctx.arg.emulation = LOONGARCH32::target_name;
       } else {
         Fatal(ctx) << "unknown -m argument: " << arg;
       }
@@ -577,7 +592,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.emit_relocs = true;
       ctx.arg.discard_locals = false;
     } else if (read_arg("e") || read_arg("entry")) {
-      ctx.arg.entry = arg;
+      ctx.arg.entry = get_symbol(ctx, arg);
     } else if (read_arg("Map")) {
       ctx.arg.Map = arg;
       ctx.arg.print_map = true;
@@ -595,6 +610,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.shared = true;
     } else if (read_arg("spare-dynamic-tags")) {
       ctx.arg.spare_dynamic_tags = parse_number(ctx, "spare-dynamic-tags", arg);
+    } else if (read_arg("spare-program-headers")) {
+      ctx.arg.spare_program_headers
+        = parse_number(ctx, "spare-program-headers", arg);
     } else if (read_flag("start-lib")) {
       remaining.push_back("--start-lib");
     } else if (read_flag("start-stop")) {
@@ -623,7 +641,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.shuffle_sections = SHUFFLE_SECTIONS_SHUFFLE;
     } else if (read_eq("shuffle-sections")) {
       ctx.arg.shuffle_sections = SHUFFLE_SECTIONS_SHUFFLE;
-      ctx.arg.shuffle_sections_seed = parse_number(ctx, "shuffle-sections", arg);
+      shuffle_sections_seed = parse_number(ctx, "shuffle-sections", arg);
     } else if (read_flag("reverse-sections")) {
       ctx.arg.shuffle_sections = SHUFFLE_SECTIONS_REVERSE;
     } else if (read_flag("rosegment")) {
@@ -650,14 +668,14 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
         ctx.arg.unresolved_symbols = UNRESOLVED_IGNORE;
       else
         Fatal(ctx) << "unknown --unresolved-symbols argument: " << arg;
-    } else if (read_arg("u") || read_arg("undefined")) {
-      ctx.arg.undefined.push_back(arg);
+    } else if (read_arg("undefined") || read_arg("u")) {
+      ctx.arg.undefined.push_back(get_symbol(ctx, arg));
     } else if (read_arg("require-defined")) {
-      ctx.arg.require_defined.push_back(arg);
+      ctx.arg.require_defined.push_back(get_symbol(ctx, arg));
     } else if (read_arg("init")) {
-      ctx.arg.init = arg;
+      ctx.arg.init = get_symbol(ctx, arg);
     } else if (read_arg("fini")) {
-      ctx.arg.fini = arg;
+      ctx.arg.fini = get_symbol(ctx, arg);
     } else if (read_arg("hash-style")) {
       if (arg == "sysv") {
         ctx.arg.hash_style_sysv = true;
@@ -668,6 +686,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       } else if (arg == "both") {
         ctx.arg.hash_style_sysv = true;
         ctx.arg.hash_style_gnu = true;
+      } else if (arg == "none") {
+        ctx.arg.hash_style_sysv = false;
+        ctx.arg.hash_style_gnu = false;
       } else {
         Fatal(ctx) << "invalid --hash-style argument: " << arg;
       }
@@ -689,7 +710,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("pie") || read_flag("pic-executable")) {
       ctx.arg.pic = true;
       ctx.arg.pie = true;
-    } else if (read_flag("no-pie") || read_flag("no-pic-executable")) {
+    } else if (read_flag("no-pie") || read_flag("no-pic-executable") ||
+               read_flag("nopie")) {
       ctx.arg.pic = false;
       ctx.arg.pie = false;
     } else if (read_flag("relax")) {
@@ -708,9 +730,11 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.relocatable_merge_sections = true;
     } else if (read_flag("perf")) {
       ctx.arg.perf = true;
-    } else if (read_flag("pack-dyn-relocs=relr")) {
+    } else if (read_flag("pack-dyn-relocs=relr") ||
+               read_z_flag("pack-relative-relocs")) {
       ctx.arg.pack_dyn_relocs_relr = true;
-    } else if (read_flag("pack-dyn-relocs=none")) {
+    } else if (read_flag("pack-dyn-relocs=none") ||
+               read_z_flag("nopack-relative-relocs")) {
       ctx.arg.pack_dyn_relocs_relr = false;
     } else if (read_arg("package-metadata")) {
       ctx.arg.package_metadata = arg;
@@ -852,22 +876,30 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.z_origin = true;
     } else if (read_z_flag("nodefaultlib")) {
       ctx.arg.z_nodefaultlib = true;
-    } else if (read_z_flag("pack-relative-relocs")) {
-      ctx.arg.pack_dyn_relocs_relr = true;
-    } else if (read_z_flag("nopack-relative-relocs")) {
-      ctx.arg.pack_dyn_relocs_relr = false;
     } else if (read_z_flag("separate-loadable-segments")) {
       z_separate_code = SEPARATE_LOADABLE_SEGMENTS;
     } else if (read_z_flag("separate-code")) {
       z_separate_code = SEPARATE_CODE;
     } else if (read_z_flag("noseparate-code")) {
       z_separate_code = NOSEPARATE_CODE;
+    } else if (read_z_arg("stack-size")) {
+      ctx.arg.z_stack_size = parse_number(ctx, "-z stack-size", arg);
     } else if (read_z_flag("dynamic-undefined-weak")) {
       ctx.arg.z_dynamic_undefined_weak = true;
     } else if (read_z_flag("nodynamic-undefined-weak")) {
       ctx.arg.z_dynamic_undefined_weak = false;
+    } else if (read_z_flag("sectionheader")) {
+      ctx.arg.z_sectionheader = true;
+    } else if (read_z_flag("nosectionheader")) {
+      ctx.arg.z_sectionheader = false;
+    } else if (read_z_flag("rewrite-endbr")) {
+      ctx.arg.z_rewrite_endbr = true;
     } else if (read_flag("no-undefined")) {
       ctx.arg.z_defs = true;
+    } else if (read_flag("nmagic")) {
+      ctx.arg.nmagic = true;
+    } else if (read_flag("no-nmagic")) {
+      ctx.arg.nmagic = false;
     } else if (read_flag("fatal-warnings")) {
       ctx.arg.fatal_warnings = true;
     } else if (read_flag("no-fatal-warnings")) {
@@ -991,7 +1023,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("strip-all") || read_flag("s")) {
       ctx.arg.strip_all = true;
     } else if (read_flag("strip-debug") || read_flag("S")) {
-      ctx.arg.strip_all = true;
+      ctx.arg.strip_debug = true;
     } else if (read_flag("warn-unresolved-symbols")) {
       ctx.arg.unresolved_symbols = UNRESOLVED_WARN;
     } else if (read_flag("error-unresolved-symbols")) {
@@ -1044,6 +1076,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_arg("filter") || read_arg("F")) {
       ctx.arg.filter.push_back(arg);
     } else if (read_arg("O")) {
+    } else if (read_flag("EB")) {
+    } else if (read_flag("EL")) {
     } else if (read_flag("O0")) {
     } else if (read_flag("O1")) {
     } else if (read_flag("O2")) {
@@ -1083,21 +1117,21 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("no-keep-memory")) {
     } else if (read_arg("max-cache-size")) {
     } else if (read_arg("version-script")) {
-      // --version-script, --dynamic-list and --export-dynamic-symbol[-list]
-      // are treated as positional arguments even if they are actually not
-      // positional. This is because linker scripts (a positional argument)
-      // can also specify a version script, and it's better to consolidate
-      // parsing in read_input_files. In particular, version scripts can
-      // modify ctx.default_version which we initialize *after* parsing
-      // non-positional args, so the parsing cannot be done right here.
+      // --version-script is treated as positional arguments even though
+      // they are actually not positional. This is because linker scripts
+      // (a positional argument) can also specify a version script, and
+      // it's better to consolidate parsing in read_input_files. In
+      // particular, version scripts can modify ctx.default_version which
+      // we initialize *after* parsing non-positional args, so the parsing
+      // cannot be done right here.
       remaining.push_back("--version-script=" + std::string(arg));
     } else if (read_arg("dynamic-list")) {
       ctx.arg.Bsymbolic = true;
-      remaining.push_back("--dynamic-list=" + std::string(arg));
+      append(ctx.dynamic_list_patterns, parse_dynamic_list(ctx, arg));
     } else if (read_arg("export-dynamic-symbol")) {
-      remaining.push_back("--export-dynamic-symbol=" + std::string(arg));
+      ctx.dynamic_list_patterns.push_back({arg, "<command line>"});
     } else if (read_arg("export-dynamic-symbol-list")) {
-      remaining.push_back("--export-dynamic-symbol-list=" + std::string(arg));
+      append(ctx.dynamic_list_patterns, parse_dynamic_list(ctx, arg));
     } else if (read_flag("as-needed")) {
       remaining.push_back("--as-needed");
     } else if (read_flag("no-as-needed")) {
@@ -1121,10 +1155,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       Warn(ctx) << "unknown command line option: -z " << args[1];
       args = args.subspan(2);
     } else if (args[0] == "-dynamic") {
-      Fatal(ctx) << "unknown command line option: -dynamic;"
-                 << " -dynamic is a macOS linker's option. If you are trying"
-                 << " to build a binary for an Apple platform, you need to use"
-                 << " ld64.mold instead of mold or ld.mold.";
+      Fatal(ctx) << "unknown command line option: -dynamic; -dynamic is a "
+                 << "macOS linker's option. mold does not support macOS.";
     } else {
       if (args[0][0] == '-')
         Fatal(ctx) << "unknown command line option: " << args[0];
@@ -1161,6 +1193,14 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if (ctx.arg.relocatable)
     ctx.arg.is_static = true;
 
+  if (ctx.arg.shuffle_sections == SHUFFLE_SECTIONS_SHUFFLE) {
+    if (shuffle_sections_seed)
+      ctx.arg.shuffle_sections_seed = *shuffle_sections_seed;
+    else
+      ctx.arg.shuffle_sections_seed =
+        ((u64)std::random_device()() << 32) | std::random_device()();
+  }
+
   // --section-order implies `-z separate-loadable-segments`
   if (z_separate_code)
     ctx.arg.z_separate_code = *z_separate_code;
@@ -1173,6 +1213,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   else if (!ctx.arg.section_order.empty())
     ctx.arg.z_relro = false;
 
+  if (ctx.arg.nmagic)
+    ctx.arg.z_relro = false;
+
   if (!ctx.arg.shared) {
     if (!ctx.arg.filter.empty())
       Fatal(ctx) << "-filter may not be used without -shared";
@@ -1180,12 +1223,14 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       Fatal(ctx) << "-auxiliary may not be used without -shared";
   }
 
-  if (!ctx.arg.apply_dynamic_relocs && !E::is_rela)
-    Fatal(ctx) << "--no-apply-dynamic-relocs may not be used on "
-               << E::target_name;
+  if constexpr (!E::is_rela)
+    if (!ctx.arg.apply_dynamic_relocs)
+      Fatal(ctx) << "--no-apply-dynamic-relocs may not be used on "
+                 << E::target_name;
 
-  if (is_sparc<E> && ctx.arg.apply_dynamic_relocs)
-    Fatal(ctx) << "--apply-dynamic-relocs may not be used on SPARC64";
+  if constexpr (is_sparc<E>)
+    if (ctx.arg.apply_dynamic_relocs)
+      Fatal(ctx) << "--apply-dynamic-relocs may not be used on SPARC64";
 
   if (!ctx.arg.section_start.empty() && !ctx.arg.section_order.empty())
     Fatal(ctx) << "--section-start may not be used with --section-order";
@@ -1199,11 +1244,6 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if (char *env = getenv("MOLD_REPRO"); env && env[0])
     ctx.arg.repro = true;
 
-  if (ctx.arg.shared || ctx.arg.export_dynamic)
-    ctx.default_version = VER_NDX_GLOBAL;
-  else
-    ctx.default_version = VER_NDX_LOCAL;
-
   if (ctx.arg.default_symver) {
     std::string ver = ctx.arg.soname.empty() ?
       filepath(ctx.arg.output).filename().string() : std::string(ctx.arg.soname);
@@ -1215,6 +1255,12 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     ctx.arg.warn_textrel = true;
 
   ctx.arg.undefined.push_back(ctx.arg.entry);
+
+  for (i64 i = 0; i < ctx.arg.defsyms.size(); i++) {
+    std::variant<Symbol<E> *, u64> &val = ctx.arg.defsyms[i].second;
+    if (Symbol<E> **sym = std::get_if<Symbol<E> *>(&val))
+      ctx.arg.undefined.push_back(*sym);
+  }
 
   // --oformat=binary implies --strip-all because without a section
   // header, there's no way to identify the locations of a symbol
@@ -1234,6 +1280,14 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   // object file.
   if (ctx.arg.shared)
     ctx.overwrite_output_file = false;
+
+  if (!ctx.arg.chroot.empty()) {
+    if (!ctx.arg.Map.empty())
+      ctx.arg.Map = ctx.arg.chroot + "/" + ctx.arg.Map;
+
+    if (!ctx.arg.dependency_file.empty())
+      ctx.arg.dependency_file = ctx.arg.chroot + "/" + ctx.arg.dependency_file;
+  }
 
   if (version_shown && remaining.empty())
     exit(0);
