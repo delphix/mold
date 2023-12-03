@@ -95,12 +95,12 @@ struct SymbolAux<PPC64V1> : SymbolAux<X86_64> {
 //
 
 template <typename E>
-class RangeExtensionThunk {};
+class Thunk {};
 
 template <needs_thunk E>
-class RangeExtensionThunk<E> {
+class Thunk<E> {
 public:
-  RangeExtensionThunk(OutputSection<E> &osec, i64 offset)
+  Thunk(OutputSection<E> &osec, i64 offset)
     : output_section(osec), offset(offset) {}
 
   i64 size() const { return E::thunk_hdr_size + symbols.size() * E::thunk_size; }
@@ -119,7 +119,7 @@ public:
   std::vector<Symbol<E> *> symbols;
 };
 
-struct RangeExtensionRef {
+struct ThunkRef {
   i16 thunk_idx = -1;
   i16 sym_idx = -1;
 };
@@ -212,7 +212,7 @@ struct InputSectionExtras {};
 
 template <needs_thunk E>
 struct InputSectionExtras<E> {
-  std::vector<RangeExtensionRef> range_extn;
+  std::vector<ThunkRef> thunk_refs;
 };
 
 template <is_riscv E>
@@ -462,7 +462,7 @@ public:
   void create_range_extension_thunks(Context<E> &ctx);
 
   std::vector<InputSection<E> *> members;
-  std::vector<std::unique_ptr<RangeExtensionThunk<E>>> thunks;
+  std::vector<std::unique_ptr<Thunk<E>>> thunks;
   std::unique_ptr<RelocSection<E>> reloc_sec;
 };
 
@@ -1183,7 +1183,7 @@ public:
   std::vector<FdeRecord<E>> fdes;
   BitVector has_symver;
   std::vector<ComdatGroupRef<E>> comdat_groups;
-  InputSection<E> *eh_frame_section = nullptr;
+  std::vector<InputSection<E> *> eh_frame_sections;
   bool exclude_libs = false;
   std::map<u32, u32> gnu_properties;
   bool is_lto_obj = false;
@@ -1390,6 +1390,7 @@ template <typename E> void create_output_symtab(Context<E> &);
 template <typename E> void report_undef_errors(Context<E> &);
 template <typename E> void create_reloc_sections(Context<E> &);
 template <typename E> void copy_chunks(Context<E> &);
+template <typename E> void rewrite_endbr(Context<E> &);
 template <typename E> void apply_version_script(Context<E> &);
 template <typename E> void parse_symbol_version(Context<E> &);
 template <typename E> void compute_import_export(Context<E> &);
@@ -1607,7 +1608,12 @@ struct ContextExtras<ALPHA> {
 // resource management, and other miscellaneous objects.
 template <typename E>
 struct Context {
-  Context() = default;
+  Context() {
+    arg.entry = get_symbol(*this, "_start");
+    arg.fini = get_symbol(*this, "_fini");
+    arg.init = get_symbol(*this, "_init");
+  }
+
   Context(const Context<E> &) = delete;
 
   void checkpoint() {
@@ -1624,6 +1630,9 @@ struct Context {
     CompressKind compress_debug_sections = COMPRESS_NONE;
     SeparateCodeKind z_separate_code = NOSEPARATE_CODE;
     ShuffleSectionsKind shuffle_sections = SHUFFLE_SECTIONS_NONE;
+    Symbol<E> *entry = nullptr;
+    Symbol<E> *fini = nullptr;
+    Symbol<E> *init = nullptr;
     UnresolvedKind unresolved_symbols = UNRESOLVED_ERROR;
     bool Bsymbolic = false;
     bool Bsymbolic_functions = false;
@@ -1650,6 +1659,7 @@ struct Context {
     bool ignore_data_address_equality = false;
     bool is_static = false;
     bool lto_pass2 = false;
+    bool nmagic = false;
     bool noinhibit_exec = false;
     bool oformat_binary = false;
     bool omagic = false;
@@ -1700,6 +1710,7 @@ struct Context {
     bool z_text = false;
     i64 filler = -1;
     i64 spare_dynamic_tags = 5;
+    i64 spare_program_headers = 0;
     i64 thread_count = 0;
     i64 z_stack_size = 0;
     u64 shuffle_sections_seed;
@@ -1711,9 +1722,6 @@ struct Context {
     std::string dependency_file;
     std::string directory;
     std::string dynamic_linker;
-    std::string entry = "_start";
-    std::string fini = "_fini";
-    std::string init = "_init";
     std::string output = "a.out";
     std::string package_metadata;
     std::string plugin;
@@ -1751,6 +1759,7 @@ struct Context {
   bool is_static;
   bool in_lib = false;
   i64 file_priority = 10000;
+  MappedFile<Context<E>> *script_file = nullptr;
   std::unordered_set<std::string_view> visited;
   tbb::task_group tg;
 
@@ -2160,6 +2169,9 @@ public:
   // opposed to IR object).
   bool referenced_by_regular_obj : 1 = false;
 
+  // For `-z rewrite-endbr`
+  bool address_taken : 1 = false;
+
   // Target-dependent extra members.
   [[no_unique_address]] SymbolExtras<E> extra;
 };
@@ -2307,7 +2319,7 @@ InputSection<E>::get_fragment(Context<E> &ctx, const ElfRel<E> &rel) {
 template <typename E>
 u64 InputSection<E>::get_thunk_addr(i64 idx) {
   if constexpr (needs_thunk<E>) {
-    RangeExtensionRef ref = extra.range_extn[idx];
+    ThunkRef ref = extra.thunk_refs[idx];
     assert(ref.thunk_idx != -1);
     return output_section->thunks[ref.thunk_idx]->get_addr(ref.sym_idx);
   }
@@ -2405,8 +2417,6 @@ InputFile<E>::get_string(Context<E> &ctx, const ElfShdr<E> &shdr) {
 
 template <typename E>
 inline std::string_view InputFile<E>::get_string(Context<E> &ctx, i64 idx) {
-  assert(idx < elf_sections.size());
-
   if (elf_sections.size() <= idx)
     Fatal(ctx) << *this << ": invalid section index: " << idx;
   return this->get_string(ctx, elf_sections[idx]);

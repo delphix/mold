@@ -52,6 +52,8 @@ Options:
   -s, --strip-all             Strip .symtab section
   -u SYMBOL, --undefined SYMBOL
                               Force to resolve SYMBOL
+  -y SYMBOL, --trace-symbol SYMBOL
+                              Trace references to SYMBOL
   --Bdynamic, --dy            Link against shared libraries (default)
   --Bstatic, --dn, --static   Do not link against shared libraries
   --Bsymbolic                 Bind global symbols locally
@@ -107,6 +109,8 @@ Options:
                               Allow merging non-executable sections with --icf
   --image-base ADDR           Set the base address to a given value
   --init SYMBOL               Call SYMBOL at load-time
+  --nmagic                    Do not page align sections
+    --no-nmagic
   --no-undefined              Report undefined symbols (even with --shared)
   --noinhibit-exec            Create an output file even if errors occur
   --oformat=binary            Omit ELF, section and program headers
@@ -140,7 +144,9 @@ Options:
   --shuffle-sections[=SEED]   Randomize the output by shuffling input sections
   --sort-common               Ignored
   --sort-section              Ignored
-  --spare-dynamic-tags NUMBER Reserve give number of tags in .dynamic section
+  --spare-dynamic-tags NUMBER Reserve given number of tags in .dynamic section
+  --spare-program-headers NUMBER
+                              Reserve given number of slots in the program header
   --start-lib                 Give following object files in-archive-file semantics
     --end-lib                 End the effect of --start-lib
   --stats                     Print input statistics
@@ -586,7 +592,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.emit_relocs = true;
       ctx.arg.discard_locals = false;
     } else if (read_arg("e") || read_arg("entry")) {
-      ctx.arg.entry = arg;
+      ctx.arg.entry = get_symbol(ctx, arg);
     } else if (read_arg("Map")) {
       ctx.arg.Map = arg;
       ctx.arg.print_map = true;
@@ -604,6 +610,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.shared = true;
     } else if (read_arg("spare-dynamic-tags")) {
       ctx.arg.spare_dynamic_tags = parse_number(ctx, "spare-dynamic-tags", arg);
+    } else if (read_arg("spare-program-headers")) {
+      ctx.arg.spare_program_headers
+        = parse_number(ctx, "spare-program-headers", arg);
     } else if (read_flag("start-lib")) {
       remaining.push_back("--start-lib");
     } else if (read_flag("start-stop")) {
@@ -664,9 +673,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_arg("require-defined")) {
       ctx.arg.require_defined.push_back(get_symbol(ctx, arg));
     } else if (read_arg("init")) {
-      ctx.arg.init = arg;
+      ctx.arg.init = get_symbol(ctx, arg);
     } else if (read_arg("fini")) {
-      ctx.arg.fini = arg;
+      ctx.arg.fini = get_symbol(ctx, arg);
     } else if (read_arg("hash-style")) {
       if (arg == "sysv") {
         ctx.arg.hash_style_sysv = true;
@@ -887,6 +896,10 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.z_rewrite_endbr = true;
     } else if (read_flag("no-undefined")) {
       ctx.arg.z_defs = true;
+    } else if (read_flag("nmagic")) {
+      ctx.arg.nmagic = true;
+    } else if (read_flag("no-nmagic")) {
+      ctx.arg.nmagic = false;
     } else if (read_flag("fatal-warnings")) {
       ctx.arg.fatal_warnings = true;
     } else if (read_flag("no-fatal-warnings")) {
@@ -1200,6 +1213,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   else if (!ctx.arg.section_order.empty())
     ctx.arg.z_relro = false;
 
+  if (ctx.arg.nmagic)
+    ctx.arg.z_relro = false;
+
   if (!ctx.arg.shared) {
     if (!ctx.arg.filter.empty())
       Fatal(ctx) << "-filter may not be used without -shared";
@@ -1238,7 +1254,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if (ctx.arg.shared && warn_shared_textrel)
     ctx.arg.warn_textrel = true;
 
-  ctx.arg.undefined.push_back(get_symbol(ctx, ctx.arg.entry));
+  ctx.arg.undefined.push_back(ctx.arg.entry);
 
   for (i64 i = 0; i < ctx.arg.defsyms.size(); i++) {
     std::variant<Symbol<E> *, u64> &val = ctx.arg.defsyms[i].second;

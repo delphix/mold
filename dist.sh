@@ -33,6 +33,7 @@
 #  $ docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
 
 set -e -x
+cd "$(dirname $0)"
 
 usage() {
   echo "Usage: $0 [ x86_64 | aarch64 | arm | riscv64 | ppc64le | s390x ]"
@@ -42,7 +43,11 @@ usage() {
 case $# in
 0)
   arch=$(uname -m)
-  [[ $arch = arm* ]] && arch=arm
+  if [ $arch = arm64 ]; then
+    arch=aarch64
+  elif [[ $arch = arm* ]]; then
+    arch=arm
+  fi
   ;;
 1)
   arch="$1"
@@ -53,29 +58,38 @@ esac
 
 echo "$arch" | grep -Eq '^(x86_64|aarch64|arm|riscv64|ppc64le|s390x)$' || usage
 
-image=mold-builder-$arch
-version=$(sed -n 's/^project(mold VERSION \(.*\))/\1/p' $(dirname $0)/CMakeLists.txt)
+version=$(sed -n 's/^project(mold VERSION \(.*\))/\1/p' CMakeLists.txt)
 dest=mold-$version-$arch-linux
+
+if [ "$GITHUB_REPOSITORY" = '' ]; then
+  image=mold-builder-$arch
+  docker_build="docker build --platform linux/$arch -t $image -"
+else
+  # If this script is running on GitHub Actions, we want to cache
+  # the created Docker image in GitHub's Docker repostiory.
+  image=ghcr.io/$GITHUB_REPOSITORY/mold-builder-$arch
+  docker_build="docker buildx build --platform linux/$arch -t $image --push --cache-to type=inline --cache-from type=registry,ref=ghcr.io/$GITHUB_REPOSITORY/mold-builder-$arch -"
+fi
 
 # Create a Docker image.
 case $arch in
 x86_64)
   # Debian 8 (Jessie) released in April 2015
-  cat <<EOF | docker build --platform $arch -t $image -
-FROM debian:jessie-20210326
+  cat <<EOF | $docker_build
+FROM debian:jessie-20210326@sha256:32ad5050caffb2c7e969dac873bce2c370015c2256ff984b70c1c08b3a2816a0
 ENV DEBIAN_FRONTEND=noninteractive TZ=UTC
-RUN sed -i -e '/^deb/d' -e 's/^# //g' /etc/apt/sources.list && \
-  echo 'Acquire { Retries "10"; http::timeout "10"; Check-Valid-Until "false"; };' > /etc/apt/apt.conf.d/80-retries && \
+RUN sed -i -e '/^deb/d' -e 's/^# deb /deb [trusted=yes] /g' /etc/apt/sources.list && \
+  echo 'Acquire::Retries "10"; Acquire::http::timeout "10"; Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/80-retries && \
   apt-get update && \
-  apt-get install -y --force-yes --no-install-recommends wget bzip2 file make autoconf gcc g++ libssl-dev && \
+  apt-get install -y --no-install-recommends wget bzip2 file make autoconf gcc g++ libssl-dev && \
   rm -rf /var/lib/apt/lists
 
 # Build CMake 3.27
 RUN mkdir -p /build/cmake && \
   cd /build/cmake && \
   wget -O- --no-check-certificate https://cmake.org/files/v3.27/cmake-3.27.7.tar.gz | tar xzf - --strip-components=1 && \
-  ./bootstrap --parallel=$(nproc) && \
-  make -j$(nproc) && \
+  ./bootstrap --parallel=\$(nproc) && \
+  make -j\$(nproc) && \
   make install && \
   rm -rf /build
 
@@ -89,7 +103,7 @@ RUN mkdir -p /build/gcc && \
   wget -O- http://ftp.gnu.org/gnu/mpc/mpc-1.2.1.tar.gz | tar xzf - --strip-components=1 -C mpc && \
   wget -O- http://ftp.gnu.org/gnu/mpfr/mpfr-4.1.0.tar.gz | tar xzf - --strip-components=1 -C mpfr && \
   ./configure --prefix=/usr --enable-languages=c,c++ --disable-bootstrap --disable-multilib && \
-  make -j$(nproc) && \
+  make -j\$(nproc) && \
   make install && \
   ln -sf /usr/lib64/libstdc++.so.6 /usr/lib/x86_64-linux-gnu/libstdc++.so.6 && \
   rm -rf /build
@@ -97,11 +111,20 @@ EOF
   ;;
 aarch64 | arm | ppc64le | s390x)
   # Debian 10 (Bullseye) released in July 2019
-  cat <<EOF | docker build --platform $arch -t $image -
-FROM debian:bullseye-20231030
+  #
+  # We don't want to build GCC for these targets with Qemu becuase
+  # that'd take extremely long time. Also I believe old build machines
+  # are usually x86-64.
+  [ $arch = aarch64 ] && digest=d5ed76c5265576982e6599b6f12392290d9b52b315b19b28b640aaba6e8af002
+  [ $arch = arm ]     && digest=bede2623dae269454c5b6dd4af15a10810a5f4ef75963d4eb6531628f98bd633
+  [ $arch = ppc64le ] && digest=255f385e735469493b3465befad59a16f9d46f41d0b50e4fa6d5928c5ee7702a
+  [ $arch = s390x ]   && digest=96fb9ce5d3ce7f3dab7c34c18edfee093904cbc7fc19162dbcca22b2cc273b9d
+
+  cat <<EOF | $docker_build
+FROM debian:bullseye-20231030@sha256:$digest
 ENV DEBIAN_FRONTEND=noninteractive TZ=UTC
-RUN sed -i -e '/^deb/d' -e 's/^# //g' /etc/apt/sources.list && \
-  echo 'Acquire { Retries "10"; http::timeout "10"; Check-Valid-Until "false"; };' > /etc/apt/apt.conf.d/80-retries && \
+RUN sed -i -e '/^deb/d' -e 's/^# deb /deb [trusted=yes] /g' /etc/apt/sources.list && \
+  echo 'Acquire::Retries "10"; Acquire::http::timeout "10"; Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/80-retries && \
   apt-get update && \
   apt-get install -y --no-install-recommends build-essential gcc-10 g++-10 cmake && \
   ln -sf /usr/bin/gcc-10 /usr/bin/cc && \
@@ -111,8 +134,8 @@ EOF
   ;;
 riscv64)
   # snapshot.debian.org is not available for RISC-V binaries
-  cat <<EOF | docker build --platform $arch -t $image -
-FROM riscv64/debian:unstable-20231030
+  cat <<EOF | $docker_build
+FROM riscv64/debian:unstable-20231030@sha256:be1882409392c1f68f23e1e04bd965c49398f4a358b1a15f7b1820c0b39ede5b
 ENV DEBIAN_FRONTEND=noninteractive TZ=UTC
 RUN apt-get update && \
   apt-get install -y --no-install-recommends build-essential gcc-12 g++-12 cmake && \
@@ -123,18 +146,24 @@ EOF
   ;;
 esac
 
+# Source tarballs available on GitHub don't contain .git history.
+# Clone the repo if missing.
+[ -d .git ] || git clone --branch v$version --depth 1 --bare https://github.com/rui314/mold .git
+
 # We use the timestamp of the last Git commit as the file timestamp
 # for build artifacts.
 timestamp="$(git log -1 --format=%ci)"
 
 # Build mold in a container.
-docker run --platform linux/$arch -i --rm -v "$(realpath $(dirname $0)):/mold" $image \
-  bash -c "mkdir -p /build/mold &&
-cd /build/mold &&
-cmake -DCMAKE_BUILD_TYPE=Release -DMOLD_MOSTLY_STATIC=On /mold &&
-cmake --build . -j$(nproc) &&
-ctest -j$(nproc) &&
-cmake --install . --prefix $dest --strip &&
-find $dest -print | xargs touch --no-dereference --date='$timestamp' &&
-find $dest -print | sort | tar -cf - --no-recursion --files-from=- | gzip -9nc > /mold/$dest.tar.gz &&
-chown $(id -u):$(id -g) /mold/$dest.tar.gz"
+docker run --platform linux/$arch -i --rm -v "$(pwd):/mold" $image bash -c "
+set -e
+mkdir -p /build/mold
+cd /build/mold
+cmake -DCMAKE_BUILD_TYPE=Release -DMOLD_MOSTLY_STATIC=On /mold
+cmake --build . -j\$(nproc)
+ctest -j\$(nproc)
+cmake --install . --prefix $dest --strip
+find $dest -print | xargs touch --no-dereference --date='$timestamp'
+find $dest -print | sort | tar -cf - --no-recursion --files-from=- | gzip -9nc > /mold/$dest.tar.gz
+chown $(id -u):$(id -g) /mold/$dest.tar.gz
+"

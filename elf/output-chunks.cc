@@ -50,10 +50,9 @@ void OutputEhdr<E>::copy_buf(Context<E> &ctx) {
     if (ctx.arg.relocatable)
       return 0;
 
-    if (!ctx.arg.entry.empty())
-      if (Symbol<E> *sym = get_symbol(ctx, ctx.arg.entry);
-          sym->file && !sym->file->is_dso)
-        return sym->get_addr(ctx);
+    if (Symbol<E> &sym = *ctx.arg.entry;
+        sym.file && !sym.file->is_dso)
+      return sym.get_addr(ctx);
 
     if (OutputSection<E> *osec = find_section(ctx, ".text"))
       return osec->shdr.sh_addr;
@@ -149,11 +148,11 @@ template <typename E>
 static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
   std::vector<ElfPhdr<E>> vec;
 
-  auto define = [&](u64 type, u64 flags, i64 min_align, Chunk<E> *chunk) {
+  auto define = [&](u64 type, u64 flags, Chunk<E> *chunk) {
     ElfPhdr<E> phdr = {};
     phdr.p_type = type;
     phdr.p_flags = flags;
-    phdr.p_align = std::max<u64>(min_align, chunk->shdr.sh_addralign);
+    phdr.p_align = chunk->shdr.sh_addralign;
     phdr.p_offset = chunk->shdr.sh_offset;
 
     if (chunk->shdr.sh_type != SHT_NOBITS)
@@ -176,8 +175,7 @@ static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
   };
 
   auto is_bss = [](Chunk<E> *chunk) {
-    return chunk->shdr.sh_type == SHT_NOBITS &&
-           !(chunk->shdr.sh_flags & SHF_TLS);
+    return chunk->shdr.sh_type == SHT_NOBITS;
   };
 
   auto is_tbss = [](Chunk<E> *chunk) {
@@ -186,86 +184,86 @@ static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
   };
 
   auto is_note = [](Chunk<E> *chunk) {
-    ElfShdr<E> &shdr = chunk->shdr;
-    return (shdr.sh_type == SHT_NOTE) && (shdr.sh_flags & SHF_ALLOC);
+    return chunk->shdr.sh_type == SHT_NOTE;
   };
+
+  // When we are creating PT_LOAD segments, we consider only
+  // the following chunks.
+  std::vector<Chunk<E> *> chunks;
+  for (Chunk<E> *chunk : ctx.chunks)
+    if ((chunk->shdr.sh_flags & SHF_ALLOC) && !is_tbss(chunk))
+      chunks.push_back(chunk);
+
+  // The ELF spec says that "loadable segment entries in the program
+  // header table appear in ascending order, sorted on the p_vaddr
+  // member".
+  sort(chunks, [](Chunk<E> *a, Chunk<E> *b) {
+    return a->shdr.sh_addr < b->shdr.sh_addr;
+  });
 
   // Create a PT_PHDR for the program header itself.
   if (ctx.phdr && (ctx.phdr->shdr.sh_flags & SHF_ALLOC))
-    define(PT_PHDR, PF_R, sizeof(Word<E>), ctx.phdr);
+    define(PT_PHDR, PF_R, ctx.phdr);
 
   // Create a PT_INTERP.
   if (ctx.interp)
-    define(PT_INTERP, PF_R, 1, ctx.interp);
+    define(PT_INTERP, PF_R, ctx.interp);
 
   // Create a PT_NOTE for SHF_NOTE sections.
-  for (i64 i = 0, end = ctx.chunks.size(); i < end;) {
-    Chunk<E> *first = ctx.chunks[i++];
-    if (!is_note(first))
-      continue;
+  for (i64 i = 0; i < chunks.size();) {
+    Chunk<E> *first = chunks[i++];
+    if (is_note(first)) {
+      i64 flags = to_phdr_flags(ctx, first);
+      define(PT_NOTE, flags, first);
 
-    i64 flags = to_phdr_flags(ctx, first);
-    i64 alignment = first->shdr.sh_addralign;
-    define(PT_NOTE, flags, alignment, first);
-
-    while (i < end && is_note(ctx.chunks[i]) &&
-           to_phdr_flags(ctx, ctx.chunks[i]) == flags)
-      append(ctx.chunks[i++]);
+      while (i < chunks.size() &&
+             is_note(ctx.chunks[i]) &&
+             to_phdr_flags(ctx, ctx.chunks[i]) == flags)
+        append(ctx.chunks[i++]);
+    }
   }
 
   // Create PT_LOAD segments.
-  {
-    i64 idx = vec.size();
-    std::vector<Chunk<E> *> chunks = ctx.chunks;
-    std::erase_if(chunks, is_tbss);
+  for (i64 i = 0; i < chunks.size();) {
+    Chunk<E> *first = chunks[i++];
+    i64 flags = to_phdr_flags(ctx, first);
+    define(PT_LOAD, flags, first);
+    vec.back().p_align = std::max<u64>(ctx.page_size, vec.back().p_align);
 
-    for (i64 i = 0, end = chunks.size(); i < end;) {
-      Chunk<E> *first = chunks[i++];
-      if (!(first->shdr.sh_flags & SHF_ALLOC))
-        continue;
-
-      i64 flags = to_phdr_flags(ctx, first);
-      define(PT_LOAD, flags, ctx.page_size, first);
-
-      // Add contiguous ALLOC sections as long as they have the same
-      // section flags and there's no on-disk gap in between.
-      if (!is_bss(first))
-        while (i < end && !is_bss(chunks[i]) &&
-               to_phdr_flags(ctx, chunks[i]) == flags &&
-               chunks[i]->shdr.sh_offset - first->shdr.sh_offset ==
-               chunks[i]->shdr.sh_addr - first->shdr.sh_addr)
-          append(chunks[i++]);
-
-      while (i < end && is_bss(chunks[i]) &&
-             to_phdr_flags(ctx, chunks[i]) == flags)
+    // Add contiguous ALLOC sections as long as they have the same
+    // section flags and there's no on-disk gap in between.
+    if (!is_bss(first))
+      while (i < chunks.size() &&
+             !is_bss(chunks[i]) &&
+             to_phdr_flags(ctx, chunks[i]) == flags &&
+             chunks[i]->shdr.sh_offset - first->shdr.sh_offset ==
+             chunks[i]->shdr.sh_addr - first->shdr.sh_addr)
         append(chunks[i++]);
-    }
 
-    // The ELF spec says that "loadable segment entries in the program
-    // header table appear in ascending order, sorted on the p_vaddr
-    // member".
-    std::stable_sort(vec.begin() + idx, vec.end(),
-                     [](const ElfPhdr<E> &a, const ElfPhdr<E> &b) {
-      return a.p_vaddr < b.p_vaddr;
-    });
+    while (i < chunks.size() &&
+           is_bss(chunks[i]) &&
+           to_phdr_flags(ctx, chunks[i]) == flags)
+      append(chunks[i++]);
   }
 
   // Create a PT_TLS.
-  for (i64 i = 0; i < ctx.chunks.size(); i++) {
-    if (ctx.chunks[i]->shdr.sh_flags & SHF_TLS) {
-      define(PT_TLS, PF_R, 1, ctx.chunks[i++]);
-      while (i < ctx.chunks.size() && (ctx.chunks[i]->shdr.sh_flags & SHF_TLS))
+  for (i64 i = 0; i < ctx.chunks.size();) {
+    Chunk<E> *first = ctx.chunks[i++];
+    if (first->shdr.sh_flags & SHF_TLS) {
+      define(PT_TLS, PF_R, first);
+      while (i < ctx.chunks.size() &&
+             (ctx.chunks[i]->shdr.sh_flags & SHF_TLS))
         append(ctx.chunks[i++]);
     }
   }
 
   // Add PT_DYNAMIC
   if (ctx.dynamic && ctx.dynamic->shdr.sh_size)
-    define(PT_DYNAMIC, PF_R | PF_W, 1, ctx.dynamic);
+    define(PT_DYNAMIC, PF_R | PF_W, ctx.dynamic);
 
   // Add PT_GNU_EH_FRAME
   if (ctx.eh_frame_hdr)
-    define(PT_GNU_EH_FRAME, PF_R, 1, ctx.eh_frame_hdr);
+    define(PT_GNU_EH_FRAME, PF_R, ctx.eh_frame_hdr);
 
   // Add PT_GNU_STACK, which is a marker segment that doesn't really
   // contain any segments. It controls executable bit of stack area.
@@ -280,31 +278,31 @@ static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
 
   // Create a PT_GNU_RELRO.
   if (ctx.arg.z_relro) {
-    for (i64 i = 0; i < ctx.chunks.size(); i++) {
-      if (!ctx.chunks[i]->is_relro)
-        continue;
-
-      define(PT_GNU_RELRO, PF_R, 1, ctx.chunks[i++]);
-      while (i < ctx.chunks.size() && ctx.chunks[i]->is_relro)
-        append(ctx.chunks[i++]);
-      vec.back().p_align = 1;
+    for (i64 i = 0; i < chunks.size();) {
+      Chunk<E> *first = chunks[i++];
+      if (first->is_relro) {
+        define(PT_GNU_RELRO, PF_R, first);
+        while (i < chunks.size() && chunks[i]->is_relro)
+          append(chunks[i++]);
+        vec.back().p_align = 1;
+      }
     }
   }
 
   // Create a PT_ARM_EDXIDX
   if constexpr (is_arm32<E>)
     if (OutputSection<E> *osec = find_section(ctx, SHT_ARM_EXIDX))
-      define(PT_ARM_EXIDX, PF_R, 4, osec);
+      define(PT_ARM_EXIDX, PF_R, osec);
 
   // Create a PT_RISCV_ATTRIBUTES
   if constexpr (is_riscv<E>)
     if (ctx.extra.riscv_attributes->shdr.sh_size)
-      define(PT_RISCV_ATTRIBUTES, PF_R, 1, ctx.extra.riscv_attributes);
+      define(PT_RISCV_ATTRIBUTES, PF_R, ctx.extra.riscv_attributes);
 
   // Create a PT_OPENBSD_RANDOMIZE
   for (Chunk<E> *chunk : ctx.chunks)
     if (chunk->name == ".openbsd.randomdata")
-      define(PT_OPENBSD_RANDOMIZE, PF_R | PF_W, 1, chunk);
+      define(PT_OPENBSD_RANDOMIZE, PF_R | PF_W, chunk);
 
   // Set p_paddr if --physical-image-base was given. --physical-image-base
   // is typically used in embedded programming to specify the base address
@@ -352,6 +350,7 @@ static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
     }
   }
 
+  vec.resize(vec.size() + ctx.arg.spare_program_headers);
   return vec;
 }
 
@@ -763,13 +762,13 @@ static std::vector<Word<E>> create_dynamic_section(Context<E> &ctx) {
     define(DT_VERDEFNUM, ctx.verdef->shdr.sh_info);
   }
 
-  if (Symbol<E> *sym = get_symbol(ctx, ctx.arg.init);
-      sym->file && !sym->file->is_dso)
-    define(DT_INIT, sym->get_addr(ctx));
+  if (Symbol<E> &sym = *ctx.arg.init;
+      sym.file && !sym.file->is_dso)
+    define(DT_INIT, sym.get_addr(ctx));
 
-  if (Symbol<E> *sym = get_symbol(ctx, ctx.arg.fini);
-      sym->file && !sym->file->is_dso)
-    define(DT_FINI, sym->get_addr(ctx));
+  if (Symbol<E> &sym = *ctx.arg.fini;
+      sym.file && !sym.file->is_dso)
+    define(DT_FINI, sym.get_addr(ctx));
 
   if (ctx.hash)
     define(DT_HASH, ctx.hash->shdr.sh_addr);
@@ -925,8 +924,7 @@ void OutputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
   });
 
   if constexpr (needs_thunk<E>) {
-    tbb::parallel_for_each(thunks,
-                           [&](std::unique_ptr<RangeExtensionThunk<E>> &thunk) {
+    tbb::parallel_for_each(thunks, [&](std::unique_ptr<Thunk<E>> &thunk) {
       thunk->copy_buf(ctx);
     });
   }
@@ -1019,7 +1017,7 @@ void OutputSection<E>::compute_symtab_size(Context<E> &ctx) {
     this->strtab_size = 0;
     this->num_local_symtab = 0;
 
-    for (std::unique_ptr<RangeExtensionThunk<E>> &thunk : thunks) {
+    for (std::unique_ptr<Thunk<E>> &thunk : thunks) {
       // For ARM32, we emit additional symbol "$t", "$a" and "$d" for
       // each thunk to mark the beginning of Thumb code, ARM code and
       // data, respectively.
@@ -1058,7 +1056,7 @@ void OutputSection<E>::populate_symtab(Context<E> &ctx) {
       esym++;
     };
 
-    for (std::unique_ptr<RangeExtensionThunk<E>> &thunk : thunks) {
+    for (std::unique_ptr<Thunk<E>> &thunk : thunks) {
       for (i64 i = 0; i < thunk->symbols.size(); i++) {
         Symbol<E> &sym = *thunk->symbols[i];
         u64 addr = thunk->get_addr(i);
@@ -1922,14 +1920,11 @@ get_merged_output_name(Context<E> &ctx, std::string_view name, u64 flags,
   // GCC seems to create sections named ".rodata.strN.<mangled-symbol-name>.M".
   // We want to eliminate the symbol name part from the section name.
   if ((flags & SHF_STRINGS) && name.starts_with(".rodata.")) {
-    if (entsize == 1 && addralign == 1)
-      return ".rodata.str1.1";
-    if (entsize == 2 && addralign == 2)
-      return ".rodata.str2.2";
-    if (entsize == 4 && addralign == 4)
-      return ".rodata.str4.4";
-    return save_string(ctx,".rodata.str"s + std::to_string(entsize) + "." +
-                       std::to_string(addralign));
+    std::string name2 = ".rodata.str"s + std::to_string(entsize) +
+                        "." + std::to_string(addralign);
+    if (name == name2)
+      return name;
+    return save_string(ctx, name2);
   }
 
   return name;

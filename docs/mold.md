@@ -321,6 +321,9 @@ arguments.
   _symbol_, pull out the object file and link it so that the output file
   contains a definition of _symbol_.
 
+* `-y` _symbol_, `--trace-symbol`=_symbol_:
+  Trace references to _symbol_.
+
 * `--Bdynamic`:
   Link against shared libraries.
 
@@ -580,6 +583,9 @@ arguments.
 
 * `--spare-dynamic-tags`=_number_:
   Reserve the given _number_ of tags in `.dynamic` section.
+
+* `--spare-program-headers`=_number_:
+  Reserve the given _number_ of entries in the program header.
 
 * `--start-lib`, `--end-lib`:
   Handle object files between `--start-lib` and `--end-lib` as if they were in

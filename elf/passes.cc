@@ -356,8 +356,8 @@ void kill_eh_frame_sections(Context<E> &ctx) {
   Timer t(ctx, "kill_eh_frame_sections");
 
   for (ObjectFile<E> *file : ctx.objs)
-    if (file->eh_frame_section)
-      file->eh_frame_section->is_alive = false;
+    for (InputSection<E> *sec : file->eh_frame_sections)
+      sec->is_alive = false;
 }
 
 template <typename E>
@@ -1547,12 +1547,12 @@ void copy_chunks(Context<E> &ctx) {
   // sections first. This is because REL-type relocation sections (as
   // opposed to RELA-type) stores relocation addends to target sections.
   tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
-    if (chunk->shdr.sh_type != (E::is_rela ? SHT_RELA : SHT_REL))
+    if (chunk->shdr.sh_type != SHT_REL)
       copy(*chunk);
   });
 
   tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
-    if (chunk->shdr.sh_type == (E::is_rela ? SHT_RELA : SHT_REL))
+    if (chunk->shdr.sh_type == SHT_REL)
       copy(*chunk);
   });
 
@@ -1564,6 +1564,54 @@ void copy_chunks(Context<E> &ctx) {
 
   if constexpr (is_arm32<E>)
     fixup_arm_exidx_section(ctx);
+}
+
+// Rewrite the leading endbr64 instruction with a nop if a function
+// symbol's address was not taken.
+template <typename E>
+void rewrite_endbr(Context<E> &ctx) {
+  Timer t(ctx, "rewrite_endbr");
+  assert(is_x86_64<E>);
+
+  // Compute address-taken bit for each symbol
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    for (std::unique_ptr<InputSection<E>> &isec : file->sections) {
+      if (isec && isec->is_alive && (isec->shdr().sh_flags & SHF_ALLOC)) {
+        for (const ElfRel<E> &rel : isec->get_rels(ctx)) {
+          Symbol<E> &sym = *file->symbols[rel.r_sym];
+          if (!is_func_call_rel(rel) && sym.esym().st_type == STT_FUNC) {
+            std::scoped_lock lock(sym.mu);
+            sym.address_taken = true;
+          }
+        }
+      }
+    }
+  });
+
+  // Some symbols are implicitly address-taken
+  ctx.arg.entry->address_taken = true;
+  ctx.arg.init->address_taken = true;
+  ctx.arg.fini->address_taken = true;
+
+  // Rewrite endbr64 with nop
+  u8 endbr64[] = {0xf3, 0x0f, 0x1e, 0xfa};
+  u8 nop[] = {0x0f, 0x1f, 0x40, 0x00};
+
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    for (Symbol<E> *sym : file->symbols) {
+      if (sym->file == file && sym->esym().st_type == STT_FUNC &&
+          !sym->address_taken) {
+        if (InputSection<E> *isec = sym->get_input_section()) {
+          if (OutputSection<E> *osec = isec->output_section) {
+            u8 *buf = ctx.buf + osec->shdr.sh_offset + isec->offset +
+              sym->value;
+            if (memcmp(buf, endbr64, 4) == 0)
+              memcpy(buf, nop, 4);
+          }
+        }
+      }
+    }
+  });
 }
 
 template <typename E>
@@ -1598,18 +1646,54 @@ template <typename E>
 void apply_version_script(Context<E> &ctx) {
   Timer t(ctx, "apply_version_script");
 
-  auto is_simple = [&] {
-    for (VersionPattern &v : ctx.version_patterns)
-      if (v.is_cpp || v.pattern.find_first_of("*?[") != v.pattern.npos)
-        return false;
-    return true;
-  };
+  // Assign versions to symbols specified with `extern "C++"` or
+  // wildcard patterns first.
+  MultiGlob matcher;
+  MultiGlob cpp_matcher;
 
-  // If all patterns are simple (i.e. not containing any meta-
-  // characters and is not a C++ name), we can simply look up
-  // symbols.
-  if (is_simple()) {
-    for (VersionPattern &v : ctx.version_patterns) {
+  for (i64 i = 0; i < ctx.version_patterns.size(); i++) {
+    VersionPattern &v = ctx.version_patterns[i];
+    if (v.is_cpp) {
+      if (!cpp_matcher.add(v.pattern, i))
+        Fatal(ctx) << "invalid version pattern: " << v.pattern;
+    } else if (v.pattern.find_first_of("*?[") != v.pattern.npos) {
+      if (!matcher.add(v.pattern, i))
+        Fatal(ctx) << "invalid version pattern: " << v.pattern;
+    }
+  }
+
+  if (!matcher.empty() || !cpp_matcher.empty()) {
+    tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+      for (Symbol<E> *sym : file->get_global_syms()) {
+        if (sym->file != file)
+          continue;
+
+        std::string_view name = sym->name();
+        i64 match = INT64_MAX;
+
+        if (std::optional<u32> idx = matcher.find(name))
+          match = std::min<i64>(match, *idx);
+
+        // Match non-mangled symbols against the C++ pattern as well.
+        // Weird, but required to match other linkers' behavior.
+        if (!cpp_matcher.empty()) {
+          if (std::optional<std::string_view> s = cpp_demangle(name))
+            name = *s;
+          if (std::optional<u32> idx = cpp_matcher.find(name))
+            match = std::min<i64>(match, *idx);
+        }
+
+        if (match != INT64_MAX)
+          sym->ver_idx = ctx.version_patterns[match].ver_idx;
+      }
+    });
+  }
+
+  // Next, assign versions to symbols specified by exact name.
+  // In other words, exact matches have higher precedence over
+  // wildcard or `extern "C++"` patterns.
+  for (VersionPattern &v : ctx.version_patterns) {
+    if (!v.is_cpp && v.pattern.find_first_of("*?[") == v.pattern.npos) {
       Symbol<E> *sym = get_symbol(ctx, v.pattern);
 
       if (!sym->file && !ctx.arg.undefined_version)
@@ -1619,48 +1703,7 @@ void apply_version_script(Context<E> &ctx) {
       if (sym->file && !sym->file->is_dso)
         sym->ver_idx = v.ver_idx;
     }
-    return;
   }
-
-  // Otherwise, use glob pattern matchers.
-  MultiGlob matcher;
-  MultiGlob cpp_matcher;
-
-  for (i64 i = 0; i < ctx.version_patterns.size(); i++) {
-    VersionPattern &v = ctx.version_patterns[i];
-    if (v.is_cpp) {
-      if (!cpp_matcher.add(v.pattern, i))
-        Fatal(ctx) << "invalid version pattern: " << v.pattern;
-    } else {
-      if (!matcher.add(v.pattern, i))
-        Fatal(ctx) << "invalid version pattern: " << v.pattern;
-    }
-  }
-
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    for (Symbol<E> *sym : file->get_global_syms()) {
-      if (sym->file != file)
-        continue;
-
-      std::string_view name = sym->name();
-      i64 match = INT64_MAX;
-
-      if (std::optional<u32> idx = matcher.find(name))
-        match = std::min<i64>(match, *idx);
-
-      // Match non-mangled symbols against the C++ pattern as well.
-      // Weird, but required to match other linkers' behavior.
-      if (!cpp_matcher.empty()) {
-        if (std::optional<std::string_view> s = cpp_demangle(name))
-          name = *s;
-        if (std::optional<u32> idx = cpp_matcher.find(name))
-          match = std::min<i64>(match, *idx);
-      }
-
-      if (match != INT64_MAX)
-        sym->ver_idx = ctx.version_patterns[match].ver_idx;
-    }
-  });
 }
 
 template <typename E>
@@ -1907,9 +1950,9 @@ void compute_address_significance(Context<E> &ctx) {
   };
 
   // Some symbols' pointer values are leaked to the dynamic section.
-  mark(get_symbol(ctx, ctx.arg.entry));
-  mark(get_symbol(ctx, ctx.arg.init));
-  mark(get_symbol(ctx, ctx.arg.fini));
+  mark(ctx.arg.entry);
+  mark(ctx.arg.init);
+  mark(ctx.arg.fini);
 
   // Exported symbols are conservatively considered address-taken.
   if (ctx.dynsym)
@@ -2257,7 +2300,7 @@ static void set_virtual_addresses_regular(Context<E> &ctx) {
       i64 flags1 = get_flags(chunks[i - 1]);
       i64 flags2 = get_flags(chunks[i]);
 
-      if (flags1 != flags2) {
+      if (!ctx.arg.nmagic && flags1 != flags2) {
         switch (ctx.arg.z_separate_code) {
         case SEPARATE_LOADABLE_SEGMENTS:
           addr = align_to(addr, ctx.page_size);
@@ -2844,7 +2887,7 @@ void show_stats(Context<E> &ctx) {
     static Counter thunk_bytes("thunk_bytes");
     for (Chunk<E> *chunk : ctx.chunks)
       if (OutputSection<E> *osec = chunk->to_osec())
-        for (std::unique_ptr<RangeExtensionThunk<E>> &thunk : osec->thunks)
+        for (std::unique_ptr<Thunk<E>> &thunk : osec->thunks)
           thunk_bytes += thunk->size();
   }
 
@@ -2883,6 +2926,7 @@ template void scan_relocations(Context<E> &);
 template void report_undef_errors(Context<E> &);
 template void create_reloc_sections(Context<E> &);
 template void copy_chunks(Context<E> &);
+template void rewrite_endbr(Context<E> &);
 template void construct_relr(Context<E> &);
 template void create_output_symtab(Context<E> &);
 template void apply_version_script(Context<E> &);
