@@ -10,6 +10,48 @@
 
 namespace mold::elf {
 
+// If we haven't seen the same `key` before, create a new instance
+// of Symbol and returns it. Otherwise, returns the previously-
+// instantiated object. `key` is usually the same as `name`.
+template <typename E>
+Symbol<E> *get_symbol(Context<E> &ctx, std::string_view key,
+                      std::string_view name) {
+  typename decltype(ctx.symbol_map)::const_accessor acc;
+  ctx.symbol_map.insert(acc, {key, Symbol<E>(name)});
+  return const_cast<Symbol<E> *>(&acc->second);
+}
+
+template <typename E>
+Symbol<E> *get_symbol(Context<E> &ctx, std::string_view key) {
+  std::string_view name = key.substr(0, key.find('@'));
+  return get_symbol(ctx, key, name);
+}
+
+template <typename E>
+static bool is_rust_symbol(const Symbol<E> &sym) {
+  // The legacy Rust mangling scheme is indistinguishtable from C++.
+  // We don't want to accidentally demangle C++ symbols as Rust ones.
+  // So, the legacy mangling scheme will be demangled only when we
+  // know the object file was created by rustc.
+  if (sym.file && !sym.file->is_dso && ((ObjectFile<E> *)sym.file)->is_rust_obj)
+    return true;
+
+  // "_R" is the prefix of the new Rust mangling scheme.
+  return sym.name().starts_with("_R");
+}
+
+template <typename E>
+std::string_view demangle(const Symbol<E> &sym) {
+  if (is_rust_symbol(sym)) {
+    if (std::optional<std::string_view> s = demangle_rust(sym.name()))
+      return *s;
+  } else {
+    if (std::optional<std::string_view> s = demangle_cpp(sym.name()))
+      return *s;
+  }
+  return sym.name();
+}
+
 template <typename E>
 InputFile<E>::InputFile(Context<E> &ctx, MappedFile<Context<E>> *mf)
   : mf(mf), filename(mf->name) {
@@ -196,6 +238,13 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
   // Read sections
   for (i64 i = 0; i < this->elf_sections.size(); i++) {
     const ElfShdr<E> &shdr = this->elf_sections[i];
+    std::string_view name = this->shstrtab.data() + shdr.sh_name;
+
+    if ((shdr.sh_flags & SHF_EXCLUDE) &&
+        name.starts_with(".gnu.offload_lto_.symtab.")) {
+      this->is_gcc_offload_obj = true;
+      continue;
+    }
 
     if ((shdr.sh_flags & SHF_EXCLUDE) && !(shdr.sh_flags & SHF_ALLOC) &&
         shdr.sh_type != SHT_LLVM_ADDRSIG && !ctx.arg.relocatable)
@@ -255,9 +304,7 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
     case SHT_STRTAB:
     case SHT_NULL:
       break;
-    default: {
-      std::string_view name = this->shstrtab.data() + shdr.sh_name;
-
+    default:
       // .note.GNU-stack section controls executable-ness of the stack
       // area in GNU linkers. We ignore that section because silently
       // making the stack area executable is too dangerous. Tell our
@@ -299,6 +346,10 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
           is_debug_section(shdr, name))
         continue;
 
+      if (name == ".comment" &&
+          this->get_string(ctx, shdr).starts_with("rustc "))
+        this->is_rust_obj = true;
+
       // If an output file doesn't have a section header (i.e.
       // --oformat=binary is given), we discard all non-memory-allocated
       // sections. This is because without a section header, we can't find
@@ -310,7 +361,12 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
 
       // Save .llvm_addrsig for --icf=safe.
       if (shdr.sh_type == SHT_LLVM_ADDRSIG && !ctx.arg.relocatable) {
-        llvm_addrsig = std::move(this->sections[i]);
+        if (shdr.sh_link != 0) {
+          llvm_addrsig = std::move(this->sections[i]);
+        } else {
+          Warn(ctx) << *this << ": ignoring .llvm_addrsig section without"
+                    << " sh_link; was the file processed by strip or objcopy -r?";
+        }
         continue;
       }
 
@@ -364,7 +420,6 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
       static Counter counter("regular_sections");
       counter++;
       break;
-    }
     }
   }
 
@@ -495,29 +550,9 @@ void ObjectFile<E>::parse_ehframe(Context<E> &ctx) {
   }
 }
 
-// Returns a symbol object for a given key. This function handles
-// the -wrap option.
-template <typename E>
-static Symbol<E> *insert_symbol(Context<E> &ctx, const ElfSym<E> &esym,
-                                std::string_view key, std::string_view name) {
-  if (esym.is_undef() && name.starts_with("__real_") &&
-      ctx.arg.wrap.contains(name.substr(7))) {
-    return get_symbol(ctx, key.substr(7), name.substr(7));
-  }
-
-  Symbol<E> *sym = get_symbol(ctx, key, name);
-
-  if (esym.is_undef() && sym->is_wrapped) {
-    key = save_string(ctx, "__wrap_" + std::string(key));
-    name = save_string(ctx, "__wrap_" + std::string(name));
-    return get_symbol(ctx, key, name);
-  }
-  return sym;
-}
-
 template <typename E>
 void ObjectFile<E>::initialize_symbols(Context<E> &ctx) {
-  if (!symtab_sec)
+  if (this->elf_syms.empty())
     return;
 
   static Counter counter("all_syms");
@@ -561,6 +596,9 @@ void ObjectFile<E>::initialize_symbols(Context<E> &ctx) {
   for (i64 i = this->first_global; i < this->elf_syms.size(); i++) {
     const ElfSym<E> &esym = this->elf_syms[i];
 
+    if (esym.is_common())
+      has_common_symbol = true;
+
     // Get a symbol name
     std::string_view key = this->symbol_strtab.data() + esym.st_name;
     std::string_view name = key;
@@ -577,9 +615,21 @@ void ObjectFile<E>::initialize_symbols(Context<E> &ctx) {
       }
     }
 
-    this->symbols[i] = insert_symbol(ctx, esym, key, name);
-    if (esym.is_common())
-      has_common_symbol = true;
+    // Handle --wrap option
+    Symbol<E> *sym;
+    if (esym.is_undef() && name.starts_with("__real_") &&
+        ctx.arg.wrap.contains(name.substr(7))) {
+      sym = get_symbol(ctx, key.substr(7), name.substr(7));
+    } else {
+      sym = get_symbol(ctx, key, name);
+      if (esym.is_undef() && sym->is_wrapped) {
+        key = save_string(ctx, "__wrap_" + std::string(key));
+        name = save_string(ctx, "__wrap_" + std::string(name));
+        sym = get_symbol(ctx, key, name);
+      }
+    }
+
+    this->symbols[i] = sym;
   }
 }
 
@@ -1384,7 +1434,7 @@ void SharedFile<E>::resolve_symbols(Context<E> &ctx) {
       sym.value = esym.st_value;
       sym.sym_idx = i;
       sym.ver_idx = versyms[i];
-      sym.is_weak = false;
+      sym.is_weak = true;
     }
   }
 }
@@ -1512,6 +1562,9 @@ using E = MOLD_TARGET;
 template class InputFile<E>;
 template class ObjectFile<E>;
 template class SharedFile<E>;
+template Symbol<E> *get_symbol(Context<E> &, std::string_view, std::string_view);
+template Symbol<E> *get_symbol(Context<E> &, std::string_view);
+template std::string_view demangle(const Symbol<E> &);
 template std::ostream &operator<<(std::ostream &, const InputFile<E> &);
 
 } // namespace mold::elf

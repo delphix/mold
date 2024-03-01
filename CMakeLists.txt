@@ -1,31 +1,31 @@
 # You can customize a build by specifying CMake options. An option may be
 # given in the -Dvariable=value form. For a boolean variable, `ON` or `1`
-# means true while `OFF` or `0` means false.
+# means true, while `OFF` or `0` means false.
 #
 # Here are a couple of common cmake options:
 #
 #  -DCMAKE_C_COMPILER=<command-name>
 #
-#   Specifies a C compiler name to use. The default value is `cc`.
+#   Specifies the C compiler name to use. The default value is `cc`.
 #
 #  -DCMAKE_CXX_COMPILER=<command-name>
 #
-#   Specifies a C++ compiler name to use. The default value is `c++`.
+#   Specifies the C++ compiler name to use. The default value is `c++`.
 #
 #  -DCMAKE_INSTALL_PREFIX=<directory>
 #
-#   Specifies an install target directory. The default value is `/usr/local`.
+#   Specifies the install target directory. The default value is `/usr/local`.
 #
 #  -DCMAKE_BUILD_TYPE=[Debug | Release | RelWithDebInfo | MinSizeRel]
 #
-#   Specifies a build type. The default is `Release` which is the right
+#   Specifies the build type. The default is `Release`, which is the right
 #   option unless you are debugging mold.
 #
 # An example of a cmake command line is shown below:
 #
 #   $ cmake -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_CXX_COMPILER=g++-12 ..
 #
-# where `..` refers this directory.
+# where `..` refers to this directory.
 #
 # With cmake, you may run `cmake --install .` instead of `make install` to
 # install build artifacts to system directories. If you want to install
@@ -39,12 +39,12 @@
 # how to build mold. However, as a policy, we do not provide a way to
 # enable/disable any individual mold's feature. In other words, we do not
 # provide options like `--enable-foo` or `--disable-foo`. The motivation
-# behind it is build reproducibility. We want to guarantees that all builds
-# of the mold linker of the same version will have the exactly same set of
+# behind this is build reproducibility. We want to guarantee that all builds
+# of the mold linker of the same version will have the exact same set of
 # features and behave exactly the same.
 
 cmake_minimum_required(VERSION 3.14)
-project(mold VERSION 2.4.0)
+project(mold VERSION 2.4.1)
 
 include(CMakeDependentOption)
 include(GNUInstallDirs)
@@ -134,7 +134,7 @@ else()
   target_include_directories(mold PUBLIC third-party/blake3/c)
 endif()
 
-# Find zstd compression library. If libzstd.so is not found, we compile a
+# Find zstd compression library. If zstd.h is not found, we compile a
 # bundled one and statically-link it to mold.
 include(CheckIncludeFile)
 check_include_file(zstd.h HAVE_ZSTD_H)
@@ -210,11 +210,6 @@ else()
   endfunction()
 
   mold_add_tbb()
-endif()
-
-# Check if this is a commercial version of mold (a.k.a. "sold")
-if(EXISTS "${CMAKE_SOURCE_DIR}/LICENSE.md")
-  set(MOLD_IS_SOLD ON)
 endif()
 
 # We always use Clang to build mold on Windows. MSVC can't compile mold.
@@ -351,14 +346,6 @@ foreach (SOURCE IN LISTS MOLD_ELF_TEMPLATE_FILES)
   endforeach()
 endforeach()
 
-if(MOLD_IS_SOLD)
-  foreach (SOURCE IN LISTS MOLD_MACHO_TEMPLATE_FILES)
-    foreach(TARGET IN LISTS MOLD_MACHO_TARGETS)
-      mold_instantiate_templates(${SOURCE} ${TARGET})
-    endforeach()
-  endforeach()
-endif()
-
 # Add other non-template source files.
 target_sources(mold PRIVATE
   common/compress.cc
@@ -388,29 +375,14 @@ target_sources(mold PRIVATE
   third-party/rust-demangle/rust-demangle.c
   )
 
-if(MOLD_IS_SOLD)
-  target_sources(mold PRIVATE
-    macho/arch-arm64.cc
-    macho/arch-x86-64.cc
-    macho/yaml.cc
-    )
-endif()
-
 # Add frequently included header files for pre-compiling.
 # target_precompile_headers is supported by CMake 3.16.0 or newer.
 if(${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.16.0")
-  if(MOLD_IS_SOLD)
-    target_precompile_headers(mold PRIVATE
-      "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_SOURCE_DIR}/elf/mold.h>"
-      "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_SOURCE_DIR}/macho/mold.h>")
-  else()
-    target_precompile_headers(mold PRIVATE
-      "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_SOURCE_DIR}/elf/mold.h>")
-  endif()
-
   # ccache needs this flag along with `sloppiness = pch_defines,time_macros`
   # to enable caching
-  target_compile_options(mold PRIVATE -fpch-preprocess)
+  if(NOT MSVC)
+    target_compile_options(mold PRIVATE -fpch-preprocess)
+  endif()
 endif()
 
 include(CTest)
@@ -424,22 +396,9 @@ if(BUILD_TESTING)
       BYPRODUCTS ld
       WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
       VERBATIM)
-
-    if(MOLD_IS_SOLD)
-      add_custom_command(
-        TARGET mold POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E create_symlink mold ld64
-        BYPRODUCTS ld64
-        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-        VERBATIM)
-    endif()
   endif()
 
-  if(${APPLE})
-    if(MOLD_IS_SOLD)
-      add_subdirectory(test/macho)
-    endif()
-  elseif(${UNIX})
+  if(${UNIX})
     add_subdirectory(test/elf)
   endif()
 endif()
@@ -473,13 +432,4 @@ if(NOT CMAKE_SKIP_INSTALL_RULES)
     ${CMAKE_INSTALL_BINDIR}/ld.mold${CMAKE_EXECUTABLE_SUFFIX})
   mold_install_relative_symlink(${CMAKE_INSTALL_MANDIR}/man1/mold.1
     ${CMAKE_INSTALL_MANDIR}/man1/ld.mold.1)
-
-  if(MOLD_IS_SOLD)
-    mold_install_relative_symlink(${CMAKE_INSTALL_BINDIR}/mold
-      ${CMAKE_INSTALL_BINDIR}/ld64.mold)
-    mold_install_relative_symlink(${CMAKE_INSTALL_BINDIR}/mold
-      ${CMAKE_INSTALL_BINDIR}/ld.sold)
-    mold_install_relative_symlink(${CMAKE_INSTALL_BINDIR}/mold
-      ${CMAKE_INSTALL_BINDIR}/ld64.sold)
-  endif()
 endif()

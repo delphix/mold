@@ -39,11 +39,16 @@ open_or_create_file(Context &ctx, std::string path, i64 filesize, i64 perm) {
       Fatal(ctx) << "cannot open " << path2 << ": " << errno_string();
   }
 
-  if (ftruncate(fd, filesize))
-    Fatal(ctx) << "ftruncate failed: " << errno_string();
-
   if (fchmod(fd, (perm & ~get_umask())) == -1)
     Fatal(ctx) << "fchmod failed: " << errno_string();
+
+#ifdef __linux__
+  if (fallocate(fd, 0, 0, filesize) == 0)
+    return {fd, path2};
+#endif
+
+  if (ftruncate(fd, filesize) == -1)
+    Fatal(ctx) << "ftruncate failed: " << errno_string();
   return {fd, path2};
 }
 

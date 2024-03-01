@@ -5,14 +5,24 @@
 #include <filesystem>
 #include <signal.h>
 #include <tbb/global_control.h>
+#include <tbb/version.h>
 
 #ifdef USE_SYSTEM_MIMALLOC
 #include <mimalloc-new-delete.h>
 #endif
 
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+
 #ifdef __FreeBSD__
 # include <sys/sysctl.h>
 # include <unistd.h>
+#endif
+
+#ifdef _WIN32
+# define unlink _unlink
+# define write _write
 #endif
 
 namespace mold {
@@ -28,10 +38,10 @@ int main(int argc, char **argv);
 }
 
 static std::string get_mold_version() {
-  std::string name = MOLD_IS_SOLD ? "mold (sold) " : "mold ";
   if (mold_git_hash.empty())
-    return name + MOLD_VERSION + " (compatible with GNU ld)";
-  return name + MOLD_VERSION + " (" + mold_git_hash + "; compatible with GNU ld)";
+    return "mold "s + MOLD_VERSION + " (compatible with GNU ld)";
+  return "mold "s + MOLD_VERSION + " (" + mold_git_hash +
+         "; compatible with GNU ld)";
 }
 
 void cleanup() {
@@ -48,7 +58,15 @@ std::string errno_string() {
 
 // Returns the path of the mold executable itself
 std::string get_self_path() {
-#ifdef __FreeBSD__
+#if __APPLE__
+    char path[8192];
+    u32 size = sizeof(path);
+    if (_NSGetExecutablePath(path, &size)) {
+      std::cerr << "_NSGetExecutablePath failed\n";
+      exit(1);
+    }
+    return path;
+#elif __FreeBSD__
   // /proc may not be mounted on FreeBSD. The proper way to get the
   // current executable's path is to use sysctl(2).
   int mib[4];
@@ -106,6 +124,8 @@ void install_signal_handler() {
 
 #else
 
+static std::string sigabrt_msg;
+
 static void sighandler(int signo, siginfo_t *info, void *ucontext) {
   static std::mutex mu;
   std::scoped_lock lock{mu};
@@ -120,12 +140,7 @@ static void sighandler(int signo, siginfo_t *info, void *ucontext) {
     }
     break;
   case SIGABRT: {
-    const char msg[] =
-      "mold: aborted\n"
-      "mold: If mold failed due to a spurious failure of pthread_create, "
-      "it's likely because of https://github.com/oneapi-src/oneTBB/pull/824. "
-      "You should ensure that you are using 2021.9.0 or newer version of libtbb.\n";
-    (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    (void)!write(STDERR_FILENO, &sigabrt_msg[0], sigabrt_msg.size());
     break;
   }
   }
@@ -139,10 +154,20 @@ void install_signal_handler() {
   sigemptyset(&action.sa_mask);
   action.sa_flags = SA_SIGINFO;
 
-  sigaction(SIGABRT, &action, NULL);
   sigaction(SIGINT, &action, NULL);
   sigaction(SIGTERM, &action, NULL);
   sigaction(SIGBUS, &action, NULL);
+
+  // OneTBB 2021.9.0 has the interface version 12090.
+  if (TBB_runtime_interface_version() < 12090) {
+    sigabrt_msg = "mold: aborted\n"
+      "mold: mold with libtbb version 2021.9.0 or older is known to be unstable "
+      "under heavy load. Your libtbb version is " +
+      std::string(TBB_runtime_version()) +
+      ". Please upgrade your libtbb library and try again.\n";
+
+    sigaction(SIGABRT, &action, NULL);
+  }
 }
 
 #endif
@@ -158,12 +183,5 @@ i64 get_default_thread_count() {
 
 int main(int argc, char **argv) {
   mold::mold_version = mold::get_mold_version();
-
-#if MOLD_IS_SOLD
-  std::string cmd = mold::filepath(argv[0]).filename().string();
-  if (cmd == "ld64" || cmd.starts_with("ld64."))
-    return mold::macho::main(argc, argv);
-#endif
-
   return mold::elf::main(argc, argv);
 }

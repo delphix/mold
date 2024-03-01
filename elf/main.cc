@@ -17,7 +17,7 @@
 
 #ifdef _WIN32
 # include <direct.h>
-# define _chdir chdir
+# define chdir _chdir
 #else
 # include <unistd.h>
 #endif
@@ -139,7 +139,6 @@ static ObjectFile<E> *new_lto_obj(Context<E> &ctx, MappedFile<Context<E>> *mf,
   file->archive_name = archive_name;
   file->is_in_lib = ctx.in_lib || (!archive_name.empty() && !ctx.whole_archive);
   file->is_alive = !file->is_in_lib;
-  ctx.has_lto_object = true;
   if (ctx.arg.trace)
     SyncOut(ctx) << "trace: " << *file;
   return file;
@@ -441,7 +440,7 @@ int elf_main(int argc, char **argv) {
   compute_import_export(ctx);
 
   // Set "address-taken" bits for input sections.
-  if (ctx.arg.icf || ctx.arg.z_rewrite_endbr)
+  if (ctx.arg.icf)
     compute_address_significance(ctx);
 
   // Garbage-collect unreachable sections.
@@ -546,6 +545,9 @@ int elf_main(int argc, char **argv) {
   // Scan relocations to find symbols that need entries in .got, .plt,
   // .got.plt, .dynsym, .dynstr, etc.
   scan_relocations(ctx);
+
+  // Compute the is_weak bit for each imported symbol.
+  compute_imported_symbol_weakness(ctx);
 
   // Compute sizes of output sections while assigning offsets
   // within an output section to input sections.
@@ -663,7 +665,7 @@ int elf_main(int argc, char **argv) {
   if (!ctx.arg.dependency_file.empty())
     write_dependency_file(ctx);
 
-  if (ctx.has_lto_object)
+  if (!ctx.arg.plugin.empty())
     lto_cleanup(ctx);
 
   t_all.stop();
