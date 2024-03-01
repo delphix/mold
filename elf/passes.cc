@@ -177,6 +177,9 @@ void create_synthetic_sections(Context<E> &ctx) {
   if constexpr (is_ppc64v1<E>)
     ctx.extra.opd = push(new PPC64OpdSection);
 
+  if constexpr (is_ppc64v2<E>)
+    ctx.extra.save_restore = push(new PPC64SaveRestoreSection);
+
   if constexpr (is_sparc<E>) {
     if (ctx.arg.is_static)
       ctx.extra.tls_get_addr_sec = push(new SparcTlsGetAddrSection);
@@ -300,7 +303,12 @@ void resolve_symbols(Context<E> &ctx) {
 
   do_resolve_symbols(ctx);
 
-  if (ctx.has_lto_object) {
+  bool has_lto_obj = false;
+  for (ObjectFile<E> *file : objs)
+    if (file->is_lto_obj || file->is_gcc_offload_obj)
+      has_lto_obj = true;
+
+  if (has_lto_obj) {
     // Do link-time optimization. We pass all IR object files to the
     // compiler backend to compile them into a few ELF object files.
     //
@@ -453,7 +461,6 @@ struct OutputSectionKey {
   bool operator==(const OutputSectionKey &) const = default;
   std::string_view name;
   u64 type;
-  u64 flags;
 };
 
 template <typename E>
@@ -508,43 +515,29 @@ get_output_name(Context<E> &ctx, std::string_view name, u64 flags) {
   return name;
 }
 
-// Returns true if a given input section is a .ctors/.dtors that
-// should be put into .init_array/.fini_array.
-//
-// CRT object files contain .ctors/.dtors sections without any
-// relocations. They contain sentinel values, 0 and -1, to mark the
-// beginning and the end of the initializer/finalizer pointer arrays. We
-// do not place them into .init_array/.fini_array because such invalid
-// pointer values would simply make the program to crash.
-template <typename E>
-static bool is_ctors_in_init_array(Context<E> &ctx, InputSection<E> &isec) {
-  std::string_view name = isec.name();
-  return ctx.has_init_array && !isec.get_rels(ctx).empty() &&
-         (name == ".ctors" || name.starts_with(".ctors.") ||
-          name == ".dtors" || name.starts_with(".dtors."));
-}
-
 template <typename E>
 static OutputSectionKey
 get_output_section_key(Context<E> &ctx, InputSection<E> &isec) {
-  if (is_ctors_in_init_array(ctx, isec)) {
-    if (isec.name().starts_with(".ctors"))
-      return {".init_array", SHT_INIT_ARRAY, SHF_ALLOC | SHF_WRITE};
-    return {".fini_array", SHT_FINI_ARRAY, SHF_ALLOC | SHF_WRITE};
+  // If .init_array/.fini_array exist, .ctors/.dtors must be merged
+  // with them.
+  //
+  // CRT object files contain .ctors/.dtors sections without any
+  // relocations. They contain sentinel values, 0 and -1, to mark the
+  // beginning and the end of the initializer/finalizer pointer arrays.
+  // We do not place them into .init_array/.fini_array because such
+  // invalid pointer values would simply make the program to crash.
+  if (ctx.has_init_array && !isec.get_rels(ctx).empty()) {
+    std::string_view name = isec.name();
+    if (name == ".ctors" || name.starts_with(".ctors."))
+      return {".init_array", SHT_INIT_ARRAY};
+    if (name == ".dtors" || name.starts_with(".dtors."))
+      return {".fini_array", SHT_FINI_ARRAY};
   }
 
   const ElfShdr<E> &shdr = isec.shdr();
   std::string_view name = get_output_name(ctx, isec.name(), shdr.sh_flags);
   u64 type = canonicalize_type<E>(name, shdr.sh_type);
-  u64 flags = shdr.sh_flags & ~(u64)(SHF_COMPRESSED | SHF_GROUP | SHF_GNU_RETAIN);
-
-  // .init_array is usually writable. We don't want to create multiple
-  // .init_array output sections, so make it always writable.
-  // So is .fini_array.
-  if (type == SHT_INIT_ARRAY || type == SHT_FINI_ARRAY)
-    flags |= SHF_WRITE;
-
-  return {name, type, flags};
+  return {name, type};
 }
 
 // Create output sections for input sections.
@@ -554,10 +547,7 @@ void create_output_sections(Context<E> &ctx) {
 
   struct Hash {
     size_t operator()(const OutputSectionKey &k) const {
-      u64 h = hash_string(k.name);
-      h = combine_hash(h, std::hash<u64>{}(k.type));
-      h = combine_hash(h, std::hash<u64>{}(k.flags));
-      return h;
+      return combine_hash(hash_string(k.name), std::hash<u64>{}(k.type));
     }
   };
 
@@ -581,9 +571,12 @@ void create_output_sections(Context<E> &ctx) {
         continue;
 
       const ElfShdr<E> &shdr = isec->shdr();
-      if (ctx.arg.relocatable && (shdr.sh_flags & SHF_GROUP)) {
-        OutputSection<E> *osec =
-          new OutputSection<E>(ctx, isec->name(), shdr.sh_type, shdr.sh_flags);
+      u32 sh_flags = shdr.sh_flags & ~SHF_MERGE & ~SHF_STRINGS &
+                     ~SHF_COMPRESSED & ~SHF_GNU_RETAIN;
+
+      if (ctx.arg.relocatable && (sh_flags & SHF_GROUP)) {
+        OutputSection<E> *osec = new OutputSection<E>(isec->name(), shdr.sh_type);
+        osec->sh_flags = sh_flags;
         isec->output_section = osec;
         ctx.osec_pool.emplace_back(osec);
         continue;
@@ -604,7 +597,7 @@ void create_output_sections(Context<E> &ctx) {
         }
 
         std::unique_ptr<OutputSection<E>> osec =
-          std::make_unique<OutputSection<E>>(ctx, key.name, key.type, key.flags);
+          std::make_unique<OutputSection<E>>(key.name, key.type);
 
         std::unique_lock lock(mu);
         auto [it, inserted] = map.insert({key, osec.get()});
@@ -616,10 +609,41 @@ void create_output_sections(Context<E> &ctx) {
       };
 
       OutputSection<E> *osec = get_or_insert();
+      osec->sh_flags |= sh_flags & ~SHF_GROUP;
       isec->output_section = osec;
       cache.insert({key, osec});
     }
   });
+
+  for (std::unique_ptr<OutputSection<E>> &osec : ctx.osec_pool) {
+    osec->shdr.sh_flags = osec->sh_flags;
+
+    // Handle --section-align
+    if (!ctx.arg.section_align.empty())
+      if (auto it = ctx.arg.section_align.find(osec->name);
+          it != ctx.arg.section_align.end())
+        osec->shdr.sh_addralign = it->second;
+
+    // PT_GNU_RELRO segment is a security mechanism to make more pages
+    // read-only than we could have done without it.
+    //
+    // Traditionally, sections are either read-only or read-write. If a
+    // section contains dynamic relocations, it must have been put into a
+    // read-write segment so that the program loader can mutate its
+    // contents in memory, even if no one will write to it at runtime.
+    //
+    // RELRO segment allows us to make such pages writable only when a
+    // program is being loaded. After that, the page becomes read-only.
+    //
+    // Some sections, such as .init, .fini, .got, .dynamic, contain
+    // dynamic relocations but doesn't have to be writable at runtime,
+    // so they are put into a RELRO segment.
+    u32 type = osec->shdr.sh_type;
+    u32 flags = osec->shdr.sh_flags;
+    osec->is_relro = (osec->name == ".toc" || osec->name.ends_with(".rel.ro") ||
+                      type == SHT_INIT_ARRAY || type == SHT_FINI_ARRAY ||
+                      type == SHT_PREINIT_ARRAY || (flags & SHF_TLS));
+  }
 
   // Add input sections to output sections
   std::vector<Chunk<E> *> chunks;
@@ -778,8 +802,7 @@ void add_synthetic_symbols(Context<E> &ctx) {
     ctx._TLS_MODULE_BASE_ = add("_TLS_MODULE_BASE_", STT_TLS);
 
   if constexpr (is_riscv<E>)
-    if (!ctx.arg.shared)
-      ctx.__global_pointer = add("__global_pointer$");
+    ctx.__global_pointer = add("__global_pointer$");
 
   if constexpr (is_arm32<E>) {
     ctx.__exidx_start = add("__exidx_start");
@@ -803,6 +826,11 @@ void add_synthetic_symbols(Context<E> &ctx) {
       }
     }
   }
+
+  if constexpr (is_ppc64v2<E>)
+    for (auto [label, insn] : ppc64_save_restore_insns)
+      if (!label.empty())
+        add(label);
 
   obj.elf_syms = ctx.internal_esyms;
   obj.has_symver.resize(ctx.internal_esyms.size() - 1);
@@ -969,17 +997,16 @@ void write_repro_file(Context<E> &ctx) {
   tar->append("response.txt", save_string(ctx, create_response_file(ctx)));
   tar->append("version.txt", save_string(ctx, mold_version + "\n"));
 
-  std::unordered_set<std::string> seen;
+  std::unordered_set<std::string_view> seen;
+
   for (std::unique_ptr<MappedFile<Context<E>>> &mf : ctx.mf_pool) {
-    if (!mf->parent) {
-      std::string path = to_abs_path(mf->name).string();
-      if (seen.insert(path).second) {
-        // We reopen a file because we may have modified the contents of mf
-        // in memory, which is mapped with PROT_WRITE and MAP_PRIVATE.
-        MappedFile<Context<E>> *mf2 = MappedFile<Context<E>>::must_open(ctx, path);
-        tar->append(path, mf2->get_contents());
-        mf2->unmap();
-      }
+    if (!mf->parent && seen.insert(mf->name).second) {
+      // We reopen a file because we may have modified the contents of mf
+      // in memory, which is mapped with PROT_WRITE and MAP_PRIVATE.
+      MappedFile<Context<E>> *mf2 =
+        MappedFile<Context<E>>::must_open(ctx, mf->name);
+      tar->append(path, mf2->get_contents());
+      mf2->unmap();
     }
   }
 }
@@ -1486,20 +1513,40 @@ void scan_relocations(Context<E> &ctx) {
     Warn(ctx) << "creating a DT_TEXTREL in an output file";
 }
 
+// Compute the is_weak bit for each imported symbol.
+//
+// If all references to a shared symbol is weak, the symbol is marked
+// as weak in .dynsym.
+template <typename E>
+void compute_imported_symbol_weakness(Context<E> &ctx) {
+  Timer t(ctx, "compute_imported_symbol_weakness");
+
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    for (i64 i = file->first_global; i < file->elf_syms.size(); i++) {
+      const ElfSym<E> &esym = file->elf_syms[i];
+      Symbol<E> &sym = *file->symbols[i];
+
+      if (esym.is_undef() && !esym.is_weak() && sym.file && sym.file->is_dso) {
+        std::scoped_lock lock(sym.mu);
+        sym.is_weak = false;
+      }
+    }
+  });
+}
+
 // Report all undefined symbols, grouped by symbol.
 template <typename E>
 void report_undef_errors(Context<E> &ctx) {
   constexpr i64 max_errors = 3;
 
   for (auto &pair : ctx.undef_errors) {
-    std::string_view sym_name = pair.first;
+    Symbol<E> *sym = pair.first;
     std::span<std::string> errors = pair.second;
 
-    if (ctx.arg.demangle)
-      sym_name = demangle(sym_name);
-
     std::stringstream ss;
-    ss << "undefined symbol: " << sym_name << "\n";
+    ss << "undefined symbol: "
+       << (ctx.arg.demangle ? demangle(*sym) : sym->name())
+       << "\n";
 
     for (i64 i = 0; i < errors.size() && i < max_errors; i++)
       ss << errors[i];
@@ -1588,6 +1635,12 @@ void rewrite_endbr(Context<E> &ctx) {
     }
   });
 
+  // Exported symbols are conservatively assumed to be address-taken.
+  if (ctx.dynsym)
+    for (Symbol<E> *sym : ctx.dynsym->symbols)
+      if (sym && sym->is_exported)
+        sym->address_taken = true;
+
   // Some symbols are implicitly address-taken
   ctx.arg.entry->address_taken = true;
   ctx.arg.init->address_taken = true;
@@ -1604,7 +1657,7 @@ void rewrite_endbr(Context<E> &ctx) {
         if (InputSection<E> *isec = sym->get_input_section()) {
           if (OutputSection<E> *osec = isec->output_section) {
             u8 *buf = ctx.buf + osec->shdr.sh_offset + isec->offset +
-              sym->value;
+                      sym->value;
             if (memcmp(buf, endbr64, 4) == 0)
               memcpy(buf, nop, 4);
           }
@@ -1651,8 +1704,22 @@ void apply_version_script(Context<E> &ctx) {
   MultiGlob matcher;
   MultiGlob cpp_matcher;
 
-  for (i64 i = 0; i < ctx.version_patterns.size(); i++) {
-    VersionPattern &v = ctx.version_patterns[i];
+  // The "local:" label has a special meaning in the version script.
+  // It can appear in any VERSION clause, and it hides matched symbols
+  // unless other non-local patterns match to them. In other words,
+  // "local:" has lower precedence than other version definitions.
+  //
+  // If two or more non-local patterns match to the same symbol, the
+  // last one takes precedence.
+  std::vector<VersionPattern> patterns = ctx.version_patterns;
+
+  std::stable_partition(patterns.begin(), patterns.end(),
+                        [](const VersionPattern &pat) {
+    return pat.ver_idx == VER_NDX_LOCAL;
+  });
+
+  for (i64 i = 0; i < patterns.size(); i++) {
+    VersionPattern &v = patterns[i];
     if (v.is_cpp) {
       if (!cpp_matcher.add(v.pattern, i))
         Fatal(ctx) << "invalid version pattern: " << v.pattern;
@@ -1669,22 +1736,22 @@ void apply_version_script(Context<E> &ctx) {
           continue;
 
         std::string_view name = sym->name();
-        i64 match = INT64_MAX;
+        i64 match = -1;
 
-        if (std::optional<u32> idx = matcher.find(name))
-          match = std::min<i64>(match, *idx);
+        if (std::optional<i64> idx = matcher.find(name))
+          match = std::max(match, *idx);
 
         // Match non-mangled symbols against the C++ pattern as well.
         // Weird, but required to match other linkers' behavior.
         if (!cpp_matcher.empty()) {
-          if (std::optional<std::string_view> s = cpp_demangle(name))
+          if (std::optional<std::string_view> s = demangle_cpp(name))
             name = *s;
-          if (std::optional<u32> idx = cpp_matcher.find(name))
-            match = std::min<i64>(match, *idx);
+          if (std::optional<i64> idx = cpp_matcher.find(name))
+            match = std::max(match, *idx);
         }
 
-        if (match != INT64_MAX)
-          sym->ver_idx = ctx.version_patterns[match].ver_idx;
+        if (match != -1)
+          sym->ver_idx = patterns[match].ver_idx;
       }
     });
   }
@@ -1692,7 +1759,7 @@ void apply_version_script(Context<E> &ctx) {
   // Next, assign versions to symbols specified by exact name.
   // In other words, exact matches have higher precedence over
   // wildcard or `extern "C++"` patterns.
-  for (VersionPattern &v : ctx.version_patterns) {
+  for (VersionPattern &v : patterns) {
     if (!v.is_cpp && v.pattern.find_first_of("*?[") == v.pattern.npos) {
       Symbol<E> *sym = get_symbol(ctx, v.pattern);
 
@@ -1718,6 +1785,9 @@ void parse_symbol_version(Context<E> &ctx) {
     verdefs[ctx.arg.version_definitions[i]] = i + VER_NDX_LAST_RESERVED + 1;
 
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    if (file == ctx.internal_obj)
+      return;
+
     for (i64 i = file->first_global; i < file->elf_syms.size(); i++) {
       // Match VERSION part of symbol foo@VERSION with version definitions.
       if (!file->has_symver.get(i - file->first_global))
@@ -1727,14 +1797,8 @@ void parse_symbol_version(Context<E> &ctx) {
       if (sym->file != file)
         continue;
 
-      std::string_view ver;
-
-      if (file->is_lto_obj) {
-        ver = file->lto_symbol_versions[i - file->first_global];
-      } else {
-        const char *name = file->symbol_strtab.data() + file->elf_syms[i].st_name;
-        ver = strchr(name, '@') + 1;
-      }
+      const char *name = file->symbol_strtab.data() + file->elf_syms[i].st_name;
+      std::string_view ver = strchr(name, '@') + 1;
 
       bool is_default = false;
       if (ver.starts_with('@')) {
@@ -1807,10 +1871,8 @@ void compute_import_export(Context<E> &ctx) {
     for (Symbol<E> *sym : file->get_global_syms()) {
       // If we are using a symbol in a DSO, we need to import it.
       if (sym->file && sym->file->is_dso) {
-        if (!sym->is_absolute()) {
-          std::scoped_lock lock(sym->mu);
-          sym->is_imported = true;
-        }
+        std::scoped_lock lock(sym->mu);
+        sym->is_imported = true;
         continue;
       }
 
@@ -1886,7 +1948,7 @@ void compute_import_export(Context<E> &ctx) {
         if (matcher.find(name)) {
           handle_match(sym);
         } else if (!cpp_matcher.empty()) {
-          if (std::optional<std::string_view> s = cpp_demangle(name))
+          if (std::optional<std::string_view> s = demangle_cpp(name))
             name = *s;
           if (cpp_matcher.find(name))
             handle_match(sym);
@@ -1957,7 +2019,7 @@ void compute_address_significance(Context<E> &ctx) {
   // Exported symbols are conservatively considered address-taken.
   if (ctx.dynsym)
     for (Symbol<E> *sym : ctx.dynsym->symbols)
-      if (sym->is_exported)
+      if (sym && sym->is_exported)
         mark(sym);
 
   // Handle data objects.
@@ -1965,11 +2027,8 @@ void compute_address_significance(Context<E> &ctx) {
     if (InputSection<E> *sec = file->llvm_addrsig.get()) {
       u8 *p = (u8 *)sec->contents.data();
       u8 *end = p + sec->contents.size();
-      while (p != end) {
-        Symbol<E> *sym = file->symbols[read_uleb(&p)];
-        if (InputSection<E> *isec = sym->get_input_section())
-          isec->address_taken = true;
-      }
+      while (p != end)
+        mark(file->symbols[read_uleb(&p)]);
     } else {
       for (std::unique_ptr<InputSection<E>> &isec : file->sections)
         if (isec && !(isec->shdr().sh_flags & SHF_EXECINSTR))
@@ -2446,6 +2505,8 @@ static i64 set_file_offsets(Context<E> &ctx) {
     }
 
     if (first.shdr.sh_type == SHT_NOBITS) {
+      fileoff = align_to(fileoff, first.shdr.sh_addralign);
+      first.shdr.sh_offset = fileoff;
       i++;
       continue;
     }
@@ -2486,8 +2547,11 @@ static i64 set_file_offsets(Context<E> &ctx) {
 
     while (i < chunks.size() &&
            (chunks[i]->shdr.sh_flags & SHF_ALLOC) &&
-           chunks[i]->shdr.sh_type == SHT_NOBITS)
+           chunks[i]->shdr.sh_type == SHT_NOBITS) {
+      fileoff = align_to(fileoff, chunks[i]->shdr.sh_addralign);
+      chunks[i]->shdr.sh_offset = fileoff;
       i++;
+	}
   }
 
   return fileoff;
@@ -2731,6 +2795,18 @@ void fix_synthetic_symbols(Context<E> &ctx) {
     }
   }
 
+  // PPC64's _{save,rest}gpr{0,1}_{14,15,16,...,31} symbols
+  if constexpr (is_ppc64v2<E>) {
+    i64 offset = 0;
+    for (auto [label, insn] : ppc64_save_restore_insns) {
+      if (!label.empty())
+        if (Symbol<E> *sym = get_symbol(ctx, label);
+            sym->file == ctx.internal_obj)
+          start(sym, ctx.extra.save_restore, offset);
+      offset += 4;
+    }
+  }
+
   // __start_ and __stop_ symbols
   for (Chunk<E> *chunk : sections) {
     if (std::optional<std::string> name = get_start_stop_name(ctx, *chunk)) {
@@ -2922,6 +2998,7 @@ template void shuffle_sections(Context<E> &);
 template void compute_section_sizes(Context<E> &);
 template void sort_output_sections(Context<E> &);
 template void claim_unresolved_symbols(Context<E> &);
+template void compute_imported_symbol_weakness(Context<E> &);
 template void scan_relocations(Context<E> &);
 template void report_undef_errors(Context<E> &);
 template void create_reloc_sections(Context<E> &);

@@ -1,39 +1,31 @@
 # mold: A Modern Linker
 
-<i>This repository contains a free version of the mold linker.
-If you are looking for a commercial version that supports macOS
-please visit the
-[repository of the sold linker](https://github.com/bluewhalesystems/sold).</i>
-
 mold is a faster drop-in replacement for existing Unix linkers. It is several
 times quicker than the LLVM lld linker, the second-fastest open-source linker,
 which I initially developed a few years ago. mold aims to enhance developer
 productivity by minimizing build time, particularly in rapid
 debug-edit-rebuild cycles.
 
-Here is a performance comparison of GNU gold, LLVM lld, and mold when linking
-final debuginfo-enabled executables for major large programs on a simulated
-8-core, 16-thread machine.
+Here is a performance comparison of GNU ld, GNU gold, LLVM lld, and
+mold when linking final debuginfo-enabled executables for major large
+programs on a simulated 16-core, 32-thread machine.
 
-![Link speed comparison](docs/comparison.png)
+![Link speed comparison](docs/chart.svg)
 
-| Program (linker output size)  | GNU gold | LLVM lld | mold
-|-------------------------------|----------|----------|--------
-| Chrome 96 (1.89 GiB)          | 53.86s   | 11.74s   | 2.21s
-| Clang 13 (3.18 GiB)           | 64.12s   | 5.82s    | 2.90s
-| Firefox 89 libxul (1.64 GiB)  | 32.95s   | 6.80s    | 1.42s
+| Program (linker output size)  | GNU ld | GNU gold | LLVM lld | mold
+|-------------------------------|--------|----------|----------|------
+| MySQL 8.3 (0.47 GiB)          | 10.84s | 7.47s    | 1.64s    | 0.46s
+| Clang 19 (1.56 GiB)           | 42.07s | 33.13s   | 5.20s    | 1.35s
+| Chromium 124 (1.35 GiB)       | N/A    | 27.40s   | 6.10s    | 1.52s
 
 mold is so fast that it is only 2x _slower_ than the `cp` command on the same
-machine. If you find that mold is not faster than other linkers, please feel
+machine. If you find that mold is not faster than other linkers, feel
 free to [file a bug report](https://github.com/rui314/mold/issues).
 
 mold supports x86-64, i386, ARM64, ARM32, 64-bit/32-bit little/big-endian
 RISC-V, 32-bit PowerPC, 64-bit big-endian PowerPC ELFv1, 64-bit little-endian
 PowerPC ELFv2, s390x, 64-bit/32-bit LoongArch, SPARC64, m68k, SH-4, and DEC
 Alpha.
-
-mold/macOS is commercial software. For mold/macOS, please visit
-https://github.com/bluewhalesystems/sold.
 
 ## Why does linking speed matter?
 
@@ -71,7 +63,7 @@ necessary packages. You may need to run it as root.
 git clone https://github.com/rui314/mold.git
 mkdir mold/build
 cd mold/build
-git checkout v2.4.0
+git checkout v2.4.1
 ../install-build-deps.sh
 cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=c++ ..
 cmake --build . -j $(nproc)

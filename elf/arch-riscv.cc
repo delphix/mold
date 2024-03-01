@@ -363,9 +363,55 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       }
       break;
     }
-    case R_RISCV_GOT_HI20:
-      write_utype(loc, G + GOT + A - P);
+    case R_RISCV_GOT_HI20: {
+      // This relocation usually refers to an AUIPC + LD instruction
+      // pair to load a symbol value from the GOT. If the symbol value
+      // is actually a link-time constant, we can materialize the value
+      // directly into a register to eliminate a memory load.
+      i64 rd = get_rd(rel.r_offset);
+
+      switch (removed_bytes) {
+      case 6:
+        // c.li <rd>, val
+        *(ul16 *)loc = 0b010'0'00000'00000'01 | (rd << 7);
+        write_citype(loc, sym.get_addr(ctx));
+        i += 3;
+        break;
+      case 4:
+        // addi <rd>, zero, val
+        *(ul32 *)loc = 0b0010011 | (rd << 7);
+        write_itype(loc, sym.get_addr(ctx));
+        i += 3;
+        break;
+      case 0:
+        if (ctx.arg.relax &&
+            sym.is_pcrel_linktime_const(ctx) &&
+            i + 3 < rels.size() &&
+            rels[i + 1].r_type == R_RISCV_RELAX &&
+            rels[i + 2].r_type == R_RISCV_PCREL_LO12_I &&
+            rels[i + 2].r_offset == rels[i].r_offset + 4 &&
+            file.symbols[rels[i + 2].r_sym]->value == r_offset &&
+            rels[i + 3].r_type == R_RISCV_RELAX) {
+          i64 val = S + A - P;
+          if (rd == get_rd(rel.r_offset + 4) && (i32)val == val) {
+            // auipc <rd>, %hi20(val)
+            write_utype(loc, val);
+
+            // addi <rd>, <rd>, %lo12(val)
+            *(ul32 *)(loc + 4) = 0b0010011 | (rd << 15) | (rd << 7);
+            write_itype(loc + 4, val);
+            i += 3;
+            break;
+          }
+        }
+
+        write_utype(loc, G + GOT + A - P);
+        break;
+      default:
+        unreachable();
+      }
       break;
+    }
     case R_RISCV_TLS_GOT_HI20:
       write_utype(loc, sym.get_gottp_addr(ctx) + A - P);
       break;
@@ -466,12 +512,49 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       break;
     }
     case R_RISCV_TLSDESC_HI20:
+      // RISC-V TLSDESC uses the following code sequence to materialize
+      // a TP-relative address in x0.
+      //
+      //   .L0:
+      //   auipc  tX, 0
+      //       R_RISCV_TLSDESC_HI20         foo
+      //   l[d|w] tY, tX, 0
+      //       R_RISCV_TLSDESC_LOAD_LO12_I  .L0
+      //   addi   a0, tX, 0
+      //       R_RISCV_TLSDESC_ADD_LO12_I   .L0
+      //   jalr   t0, tY
+      //       R_RISCV_TLSDESC_CALL         .L0
+      //
+      // For non-dlopen'd DSO, we may relax the instructions to the following:
+      //
+      //   <deleted>
+      //   <deleted>
+      //   auipc  a0, %gottp_hi(a0)
+      //   l[d|w] a0, %gottp_lo(a0)
+      //
+      // For executable, if the TP offset is small enough, we'll relax
+      // it to the following:
+      //
+      //   <deleted>
+      //   <deleted>
+      //   <deleted>
+      //   addi   a0, zero, %tpoff_lo(a0)
+      //
+      // Otherwise, the following sequence is used:
+      //
+      //   <deleted>
+      //   <deleted>
+      //   lui    a0, %tpoff_hi(a0)
+      //   addi   a0, a0, %tpoff_lo(a0)
       if (removed_bytes == 0)
         write_utype(loc, sym.get_tlsdesc_addr(ctx) + A - P);
       break;
     case R_RISCV_TLSDESC_LOAD_LO12:
     case R_RISCV_TLSDESC_ADD_LO12:
     case R_RISCV_TLSDESC_CALL: {
+      if (removed_bytes == 4)
+        break;
+
       i64 idx2 = find_paired_reloc();
       const ElfRel<E> &rel2 = rels[idx2];
       Symbol<E> &sym2 = *file.symbols[rel2.r_sym];
@@ -482,27 +565,24 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 
       switch (rel.r_type) {
       case R_RISCV_TLSDESC_LOAD_LO12:
-        if (sym2.has_tlsdesc(ctx))
-          write_itype(loc, sym2.get_tlsdesc_addr(ctx) + A - P);
+        write_itype(loc, sym2.get_tlsdesc_addr(ctx) + A - P);
         break;
       case R_RISCV_TLSDESC_ADD_LO12:
         if (sym2.has_tlsdesc(ctx)) {
           write_itype(loc, sym2.get_tlsdesc_addr(ctx) + A - P);
         } else if (sym2.has_gottp(ctx)) {
-          *(ul32 *)loc = 0x517;   // auipc a0,<hi20>
+          *(ul32 *)loc = 0x517; // auipc a0,<hi20>
           write_utype(loc, sym2.get_gottp_addr(ctx) + A - P);
         } else {
-          if (removed_bytes == 0) {
-            *(ul32 *)loc = 0x537; // lui a0,<hi20>
-            write_utype(loc, S + A - ctx.tp_addr);
-          }
+          *(ul32 *)loc = 0x537; // lui a0,<hi20>
+          write_utype(loc, S + A - ctx.tp_addr);
         }
         break;
       case R_RISCV_TLSDESC_CALL:
         if (sym2.has_tlsdesc(ctx)) {
           // Do nothing
         } else if (sym2.has_gottp(ctx)) {
-          // {ld,lw} a0, <lo12>(a0)
+          // l[d|w] a0,<lo12>
           *(ul32 *)loc = E::is_64 ? 0x53503 : 0x52503;
           write_itype(loc, sym2.get_gottp_addr(ctx) + A - P);
         } else {
@@ -946,6 +1026,34 @@ static void shrink_section(Context<E> &ctx, InputSection<E> &isec, bool use_rvc)
       } else if (sign_extend(dist, 20) == dist) {
         // If the jump target is within ±1 MiB, we can use JAL.
         delta += 4;
+      }
+      break;
+    }
+    case R_RISCV_GOT_HI20: {
+      // A GOT_HI20 followed by a PCREL_LO12_I is used to load a value from
+      // GOT. If the loaded value is a link-time constant, we can rewrite
+      // the instructions to directly materialize the value, eliminating a
+      // memory load.
+      if (sym.is_absolute() &&
+          i + 3 < rels.size() &&
+          rels[i + 1].r_type == R_RISCV_RELAX &&
+          rels[i + 2].r_type == R_RISCV_PCREL_LO12_I &&
+          rels[i + 2].r_offset == rels[i].r_offset + 4 &&
+          isec.file.symbols[rels[i + 2].r_sym]->value == rels[i].r_offset &&
+          rels[i + 3].r_type == R_RISCV_RELAX) {
+        i64 rd = get_rd(r.r_offset);
+
+        if (rd == get_rd(r.r_offset + 4)) {
+          u64 val = sym.get_addr(ctx) + r.r_addend;
+
+          if (use_rvc && rd != 0 && sign_extend(val, 5) == val) {
+            // Replace AUIPC + LD with C.LI.
+            delta += 6;
+          } else if (sign_extend(val, 11) == val) {
+            // Replace AUIPC + LD with ADDI.
+            delta += 4;
+          }
+        }
       }
       break;
     }

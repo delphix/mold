@@ -449,7 +449,11 @@ public:
 template <typename E>
 class OutputSection : public Chunk<E> {
 public:
-  OutputSection(Context<E> &ctx, std::string_view name, u32 type, u64 flags);
+  OutputSection(std::string_view name, u32 type) {
+    this->name = name;
+    this->shdr.sh_type = type;
+  }
+
   ChunkKind kind() override { return OUTPUT_SECTION; }
   OutputSection<E> *to_osec() override { return this; }
   void construct_relr(Context<E> &ctx) override;
@@ -464,6 +468,7 @@ public:
   std::vector<InputSection<E> *> members;
   std::vector<std::unique_ptr<Thunk<E>>> thunks;
   std::unique_ptr<RelocSection<E>> reloc_sec;
+  Atomic<u32> sh_flags;
 };
 
 template <typename E>
@@ -1160,6 +1165,7 @@ public:
                                std::string archive_name, bool is_in_lib);
 
   void parse(Context<E> &ctx);
+  void initialize_symbols(Context<E> &ctx);
   void initialize_mergeable_sections(Context<E> &ctx);
   void resolve_section_pieces(Context<E> &ctx);
   void resolve_symbols(Context<E> &ctx) override;
@@ -1186,8 +1192,10 @@ public:
   std::vector<InputSection<E> *> eh_frame_sections;
   bool exclude_libs = false;
   std::map<u32, u32> gnu_properties;
-  bool is_lto_obj = false;
   bool needs_executable_stack = false;
+  bool is_lto_obj = false;
+  bool is_gcc_offload_obj = false;
+  bool is_rust_obj = false;
 
   u64 num_dynrel = 0;
   u64 reldyn_offset = 0;
@@ -1205,7 +1213,7 @@ public:
   InputSection<E> *debug_pubtypes = nullptr;
 
   // For LTO
-  std::vector<std::string_view> lto_symbol_versions;
+  std::vector<ElfSym<E>> lto_elf_syms;
 
   // Target-specific member
   [[no_unique_address]] ObjectFileExtras<E> extra;
@@ -1215,7 +1223,6 @@ private:
              std::string archive_name, bool is_in_lib);
 
   void initialize_sections(Context<E> &ctx);
-  void initialize_symbols(Context<E> &ctx);
   void sort_relocations(Context<E> &ctx);
   void initialize_ehframe_sections(Context<E> &ctx);
   void parse_note_gnu_property(Context <E> &ctx, const ElfShdr <E> &shdr);
@@ -1385,6 +1392,7 @@ template <typename E> void compute_section_sizes(Context<E> &);
 template <typename E> void sort_output_sections(Context<E> &);
 template <typename E> void claim_unresolved_symbols(Context<E> &);
 template <typename E> void scan_relocations(Context<E> &);
+template <typename E> void compute_imported_symbol_weakness(Context<E> &);
 template <typename E> void construct_relr(Context<E> &);
 template <typename E> void create_output_symtab(Context<E> &);
 template <typename E> void report_undef_errors(Context<E> &);
@@ -1462,6 +1470,22 @@ public:
 //
 // arch-ppc64v2.cc
 //
+
+extern const std::vector<std::pair<std::string_view, u32>>
+ppc64_save_restore_insns;
+
+class PPC64SaveRestoreSection : public Chunk<PPC64V2> {
+public:
+  PPC64SaveRestoreSection() {
+    this->name = ".save_restore_gprs";
+    this->shdr.sh_type = SHT_PROGBITS;
+    this->shdr.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
+    this->shdr.sh_addralign = 16;
+    this->shdr.sh_size = ppc64_save_restore_insns.size() * 4;
+  }
+
+  void copy_buf(Context<PPC64V2> &ctx) override;
+};
 
 template <> u64 get_eflags(Context<PPC64V2> &ctx);
 
@@ -1587,6 +1611,7 @@ struct ContextExtras<PPC64V1> {
 
 template <>
 struct ContextExtras<PPC64V2> {
+  PPC64SaveRestoreSection *save_restore = nullptr;
   Symbol<PPC64V2> *TOC = nullptr;
   Atomic<bool> is_power10 = false;
 };
@@ -1764,7 +1789,6 @@ struct Context {
   tbb::task_group tg;
 
   bool has_error = false;
-  bool has_lto_object = false;
   Atomic<bool> has_init_array = false;
   Atomic<bool> has_ctors = false;
 
@@ -1806,7 +1830,7 @@ struct Context {
   Atomic<bool> has_textrel = false;
   Atomic<u32> num_ifunc_dynrels = 0;
 
-  tbb::concurrent_hash_map<std::string_view, std::vector<std::string>> undef_errors;
+  tbb::concurrent_hash_map<Symbol<E> *, std::vector<std::string>> undef_errors;
 
   // Output chunks
   OutputEhdr<E> *ehdr = nullptr;
@@ -2033,6 +2057,10 @@ public:
     TAG_MASK = 0b11,
   };
 
+  static_assert(alignof(InputSection<E>) >= 4);
+  static_assert(alignof(Chunk<E>) >= 4);
+  static_assert(alignof(SectionFragment<E>) >= 4);
+
   uintptr_t origin = 0;
 
   // `value` contains symbol value. If it's an absolute symbol, it is
@@ -2176,26 +2204,20 @@ public:
   [[no_unique_address]] SymbolExtras<E> extra;
 };
 
-// If we haven't seen the same `key` before, create a new instance
-// of Symbol and returns it. Otherwise, returns the previously-
-// instantiated object. `key` is usually the same as `name`.
 template <typename E>
 Symbol<E> *get_symbol(Context<E> &ctx, std::string_view key,
-                      std::string_view name) {
-  typename decltype(ctx.symbol_map)::const_accessor acc;
-  ctx.symbol_map.insert(acc, {key, Symbol<E>(name)});
-  return const_cast<Symbol<E> *>(&acc->second);
-}
+                      std::string_view name);
 
 template <typename E>
-Symbol<E> *get_symbol(Context<E> &ctx, std::string_view name) {
-  return get_symbol(ctx, name, name);
-}
+Symbol<E> *get_symbol(Context<E> &ctx, std::string_view name);
+
+template <typename E>
+std::string_view demangle(const Symbol<E> &sym);
 
 template <typename E>
 std::ostream &operator<<(std::ostream &out, const Symbol<E> &sym) {
   if (opt_demangle)
-    out << demangle(sym.name());
+    out << demangle(sym);
   else
     out << sym.name();
   return out;
@@ -2252,7 +2274,7 @@ inline u64 InputSection<E>::get_addr() const {
 template <typename E>
 inline std::string_view InputSection<E>::name() const {
   if (file.elf_sections.size() <= shndx)
-    return ".common";
+    return (shdr().sh_flags & SHF_TLS) ? ".tls_common" : ".common";
   return file.shstrtab.data() + file.elf_sections[shndx].sh_name;
 }
 
@@ -2728,9 +2750,6 @@ inline bool Symbol<E>::has_plt(Context<E> &ctx) const {
 
 template <typename E>
 inline bool Symbol<E>::is_absolute() const {
-  if (file && file->is_dso)
-    return esym().is_abs();
-
   return !is_imported && !get_frag() && !get_input_section() &&
          !get_output_section();
 }
