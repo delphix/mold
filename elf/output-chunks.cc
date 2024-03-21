@@ -1,4 +1,6 @@
 #include "mold.h"
+
+#include "config.h"
 #include "blake3.h"
 
 #include <cctype>
@@ -503,7 +505,7 @@ void ShstrtabSection<E>::update_shdr(Context<E> &ctx) {
   i64 offset = 1;
 
   for (Chunk<E> *chunk : ctx.chunks) {
-    if (chunk->kind() != ChunkKind::HEADER && !chunk->name.empty()) {
+    if (!chunk->is_header() && !chunk->name.empty()) {
       auto [it, inserted] = map.insert({chunk->name, offset});
       chunk->shdr.sh_name = it->second;
       if (inserted)
@@ -520,7 +522,7 @@ void ShstrtabSection<E>::copy_buf(Context<E> &ctx) {
   base[0] = '\0';
 
   for (Chunk<E> *chunk : ctx.chunks)
-    if (chunk->kind() != ChunkKind::HEADER && !chunk->name.empty())
+    if (!chunk->is_header() && !chunk->name.empty())
       write_string(base + chunk->shdr.sh_name, chunk->name);
 }
 
@@ -1621,6 +1623,7 @@ ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym, u32 st_name,
     esym.st_value = sym.get_addr(ctx);
   } else if (sym.file->is_dso || sym.esym().is_undef()) {
     esym.st_shndx = SHN_UNDEF;
+    esym.st_size = 0;
     if (sym.is_canonical)
       esym.st_value = sym.get_plt_addr(ctx);
   } else if (Chunk<E> *osec = sym.get_output_section()) {
@@ -2585,13 +2588,11 @@ static void compute_blake3(Context<E> &ctx, i64 offset) {
     u8 *end = (i == num_shards - 1) ? buf + filesize : begin + shard_size;
     blake3_hash(begin, end - begin, shards.data() + i * BLAKE3_OUT_LEN);
 
-#ifndef _WIN32
-    // We call munmap early for each chunk so that the last munmap
-    // gets cheaper. We assume that the .note.build-id section is
-    // at the beginning of an output file. This is an ugly performance
-    // hack, but we can save about 30 ms for a 2 GiB output.
+#ifdef HAVE_MADVISE
+    // Make the kernel page out the file contents we've just written
+    // so that subsequent close(2) call will become quicker.
     if (i > 0 && ctx.output_file->is_mmapped)
-      munmap(begin, end - begin);
+      madvise(begin, end - begin, MADV_DONTNEED);
 #endif
    });
 
@@ -2600,13 +2601,6 @@ static void compute_blake3(Context<E> &ctx, i64 offset) {
   u8 digest[BLAKE3_OUT_LEN];
   blake3_hash(shards.data(), shards.size(), digest);
   memcpy(buf + offset, digest, ctx.arg.build_id.size());
-
-#ifndef _WIN32
-  if (ctx.output_file->is_mmapped) {
-    munmap(buf, std::min(filesize, shard_size));
-    ctx.output_file->is_unmapped = true;
-  }
-#endif
 }
 
 template <typename E>
@@ -2755,11 +2749,11 @@ CompressedSection<E>::CompressedSection(Context<E> &ctx, Chunk<E> &chunk) {
   switch (ctx.arg.compress_debug_sections) {
   case COMPRESS_ZLIB:
     chdr.ch_type = ELFCOMPRESS_ZLIB;
-    compressed.reset(new ZlibCompressor(buf, chunk.shdr.sh_size));
+    compressor.reset(new ZlibCompressor(buf, chunk.shdr.sh_size));
     break;
   case COMPRESS_ZSTD:
     chdr.ch_type = ELFCOMPRESS_ZSTD;
-    compressed.reset(new ZstdCompressor(buf, chunk.shdr.sh_size));
+    compressor.reset(new ZstdCompressor(buf, chunk.shdr.sh_size));
     break;
   default:
     unreachable();
@@ -2771,7 +2765,7 @@ CompressedSection<E>::CompressedSection(Context<E> &ctx, Chunk<E> &chunk) {
   this->shdr = chunk.shdr;
   this->shdr.sh_flags |= SHF_COMPRESSED;
   this->shdr.sh_addralign = 1;
-  this->shdr.sh_size = sizeof(chdr) + compressed->compressed_size;
+  this->shdr.sh_size = sizeof(chdr) + compressor->compressed_size;
   this->shndx = chunk.shndx;
 
   // We don't need to keep the original data unless --gdb-index is given.
@@ -2785,7 +2779,7 @@ template <typename E>
 void CompressedSection<E>::copy_buf(Context<E> &ctx) {
   u8 *base = ctx.buf + this->shdr.sh_offset;
   memcpy(base, &chdr, sizeof(chdr));
-  compressed->write_to(base + sizeof(chdr));
+  compressor->write_to(base + sizeof(chdr));
 }
 
 template <typename E>
