@@ -126,6 +126,16 @@ GNU linkers, for which some configurable values, such as system-dependent
 library search paths, are hard-coded. `mold` depends only on its command-line
 arguments.
 
+## OPTION NOTATIONS
+
+Multi-letter long options may precede either a single dash or double dashes,
+except for those starting with the letter "o". For historical reasons, long
+options beginning with "o" must precede double dashes.
+
+For example, you can spell `--as-needed` as `-as-needed`, but `--omagic` must
+not be spelled as `-omagic`. `-omagic` will be interpreted not as `--omagic`
+but as `-o magic`.
+
 ## MOLD-SPECIFIC OPTIONS
 
 * `--chroot`=_dir_:
@@ -340,8 +350,18 @@ arguments.
   This option has the same effect as `--Bsymbolic` but works only for function
   symbols. Data symbols remain being both imported and exported.
 
+* `--Bsymbolic-non-weak`:
+  This option has the same effect as `--Bsymbolic` but works only for non-weak
+  symbols. Weak symbols remain being both imported and exported.
+
+* `--Bsymbolic-non-weak-functions`:
+  This option has the same effect as `--Bsymbolic` but works only for non-weak
+  function symbols. Data symbols and weak function symbols remain being both
+  imported and exported.
+
 * `--Bno-symbolic`:
-  Cancel `--Bsymbolic` and `--Bsymbolic-functions`.
+  Cancel `--Bsymbolic`, `--Bsymbolic-functions`, `--Bsymbolic-non-weak` and
+  `--Bsymbolic-non-weak-functions`.
 
 * `--Map`=_file_:
   Write map file to _file_.
@@ -603,6 +623,10 @@ arguments.
 * `--trace`:
   Print name of each input file.
 
+* `--undefined-glob`=_pattern_:
+  Synonym for `--undefined`, except that `--undefined-glob` takes a glob
+  pattern instead of just a single symbol name.
+
 * `--undefined-version`, `--no-undefined-version`:
   By default, `mold` warns on a symbol specified by a version script or by
   `--export-dynamic-symbol` if it is not defined. You can silence the warning
@@ -729,6 +753,16 @@ arguments.
   `.note.gnu.property` output section. Shadow stack is part of Intel
   Control-flow Enforcement Technology (CET), which is available since Tiger
   Lake (2020).
+
+* `-z start_stop_visibility`=[ `hidden` | `protected` ]:
+  If a section name is valid as a C identifier (i.e., it matches
+  `/^[_a-zA-Z][_a-zA-Z0-9]*$/`), mold creates `__start_SECNAME` and
+  `__stop_SECNAME` symbols to mark the beginning and end of the section,
+  where `SECNAME` is the section name. By default, such symbols are created
+  as hidden symbols.
+
+  You can make these marker symbols visible from other ELF modules by passing
+  `-z start_stop_visibility=protected`. Default is `hidden`.
 
 * `-z text`, `-z notext`, `-z textoff`:
   `mold` by default reports an error if dynamic relocations are created in

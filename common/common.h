@@ -2,7 +2,6 @@
 
 #include "integers.h"
 
-#include <array>
 #include <atomic>
 #include <bit>
 #include <bitset>
@@ -42,23 +41,6 @@
 # define unreachable() assert(0 && "unreachable")
 #endif
 
-// __builtin_assume() is supported only by clang, and [[assume]] is
-// available only in C++23, so we use this macro when giving a hint to
-// the compiler's optimizer what's true.
-#define ASSUME(x) do { if (!(x)) __builtin_unreachable(); } while (0)
-
-// This is an assert() that is enabled even in the release build.
-#define ASSERT(x)                                       \
-  do {                                                  \
-    if (!(x)) {                                         \
-      std::cerr << "Assertion failed: (" << #x          \
-                << "), function " << __FUNCTION__       \
-                << ", file " << __FILE__                \
-                << ", line " << __LINE__ << ".\n";      \
-      std::abort();                                     \
-    }                                                   \
-  } while (0)
-
 inline uint64_t hash_string(std::string_view str) {
   return XXH3_64bits(str.data(), str.size());
 }
@@ -87,15 +69,12 @@ inline thread_local bool opt_demangle;
 inline u8 *output_buffer_start = nullptr;
 inline u8 *output_buffer_end = nullptr;
 
-inline std::string mold_version;
-extern std::string mold_version_string;
 extern std::string mold_git_hash;
 
 std::string errno_string();
 std::string get_self_path();
 void cleanup();
 void install_signal_handler();
-i64 get_default_thread_count();
 
 static u64 combine_hash(u64 a, u64 b) {
   return a ^ (b + 0x9e3779b9 + (a << 6) + (a >> 2));
@@ -134,8 +113,11 @@ private:
 
 template <typename Context>
 static std::string add_color(Context &ctx, std::string msg) {
-  if (ctx.arg.color_diagnostics)
+  if (ctx.arg.color_diagnostics) {
+    if (msg == "warning")
+      return "mold: \033[0;1;35m" + msg + ":\033[0m ";
     return "mold: \033[0;1;31m" + msg + ":\033[0m ";
+  }
   return "mold: " + msg + ": ";
 }
 
@@ -421,13 +403,11 @@ inline std::vector<T> flatten(std::vector<std::vector<T>> &vec) {
   return ret;
 }
 
-template <typename T>
-inline void sort(T &vec) {
+inline void sort(auto &vec) {
   std::stable_sort(vec.begin(), vec.end());
 }
 
-template <typename T, typename U>
-inline void sort(T &vec, U less) {
+inline void sort(auto &vec, auto less) {
   std::stable_sort(vec.begin(), vec.end(), less);
 }
 
@@ -512,9 +492,6 @@ inline u64 read_uleb(std::string_view str) {
 }
 
 inline i64 uleb_size(u64 val) {
-#if __GNUC__
-#pragma GCC unroll 8
-#endif
   for (int i = 1; i < 9; i++)
     if (val < (1LL << (7 * i)))
       return i;
@@ -546,6 +523,14 @@ inline bool remove_prefix(std::string_view &s, std::string_view prefix) {
   return false;
 }
 
+static inline void pause() {
+#if defined(__x86_64__)
+  asm volatile("pause");
+#elif defined(__arm__) || defined(__aarch64__)
+  asm volatile("yield");
+#endif
+}
+
 //
 // Concurrent Map
 //
@@ -555,17 +540,26 @@ inline bool remove_prefix(std::string_view &s, std::string_view prefix) {
 // So you need to give a correct estimation of the final size before
 // using it. We use this hash map to uniquify pieces of data in
 // mergeable sections.
+//
+// We've implemented this ourselves because the performance of
+// conrurent hash map is critical for our linker.
 template <typename T>
 class ConcurrentMap {
 public:
-  ConcurrentMap() {}
+  ConcurrentMap() = default;
 
   ConcurrentMap(i64 nbuckets) {
     resize(nbuckets);
   }
 
   ~ConcurrentMap() {
-    free(entries_buf);
+    if (entries) {
+#ifdef _WIN32
+      _aligned_free(entries);
+#else
+      munmap(entries, sizeof(Entry) * nbuckets);
+#endif
+    }
   }
 
   // In order to avoid unnecessary cache-line false sharing, we want
@@ -573,35 +567,51 @@ public:
   // power-of-two address.
   struct alignas(32) Entry {
     Atomic<const char *> key;
-    T value;
     u32 keylen;
+    T value;
   };
 
   void resize(i64 nbuckets) {
+    assert(!entries);
     this->nbuckets = std::max<i64>(MIN_NBUCKETS, bit_ceil(nbuckets));
-    free(entries_buf);
+    i64 bufsize = sizeof(Entry) * this->nbuckets;
 
-    // Even though std::aligned_alloc is defined in C++17, MSVC doesn't
-    // seem to provide that function. C11's aligned_alloc may not be always
-    // avialalbe. Therefore, we'll align the buffer ourselves.
-    i64 size = sizeof(Entry) * this->nbuckets;
-    entries_buf = calloc(1, size + alignof(Entry) - 1);
-    entries = (Entry *)align_to((u64)entries_buf, alignof(Entry));
+    // Allocate a zero-initialized buffer. We use mmap() if available
+    // because it's faster than malloc() and memset().
+#ifdef _WIN32
+    entries = (Entry *)_aligned_malloc(bufsize, alignof(Entry));
+    memset((void *)entries, 0, bufsize);
+#else
+    entries = (Entry *)mmap(nullptr, bufsize, PROT_READ | PROT_WRITE,
+                            MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+#endif
   }
 
-  std::pair<T *, bool> insert(std::string_view key, u64 hash, const T &val) {
+  std::pair<T *, bool> insert(std::string_view key, u32 hash, const T &val) {
     assert(has_single_bit(nbuckets));
 
-    i64 idx = hash & (nbuckets - 1);
-    i64 retry = 0;
+    i64 begin = hash & (nbuckets - 1);
+    u64 mask = nbuckets / NUM_SHARDS - 1;
 
-    while (retry < MAX_RETRY) {
+    for (i64 i = 0; i < MAX_RETRY; i++) {
+      i64 idx = (begin & ~mask) | ((begin + i) & mask);
       Entry &ent = entries[idx];
-      const char *ptr = nullptr;
-      bool claimed = ent.key.compare_exchange_weak(ptr, (char *)-1,
-                                                   std::memory_order_acquire);
 
-      // If we successfully claimed the ownership of an unused slot,
+      // It seems avoiding compare-and-swap is faster overall at least
+      // on my Zen4 machine, so do it.
+      if (const char *ptr = ent.key.load(std::memory_order_acquire);
+          ptr != nullptr && ptr != (char *)-1) {
+        if (key == std::string_view(ptr, ent.keylen))
+          return {&ent.value, false};
+        continue;
+      }
+
+      // Otherwise, use CAS to atomically claim the ownership of the slot.
+      const char *ptr = nullptr;
+      bool claimed = ent.key.compare_exchange_strong(ptr, (char *)-1,
+                                                     std::memory_order_acquire);
+
+      // If we successfully claimed the ownership of the slot,
       // copy values to it.
       if (claimed) {
         new (&ent.value) T(val);
@@ -609,10 +619,6 @@ public:
         ent.key.store(key.data(), std::memory_order_release);
         return {&ent.value, true};
       }
-
-      // Loop on a spurious failure.
-      if (ptr == nullptr)
-        continue;
 
       // If someone is copying values to the slot, do busy wait.
       while (ptr == (char *)-1) {
@@ -624,11 +630,6 @@ public:
       // looking for.
       if (key == std::string_view(ptr, ent.keylen))
         return {&ent.value, false};
-
-      // Otherwise, move on to the next slot.
-      u64 mask = nbuckets / NUM_SHARDS - 1;
-      idx = (idx & ~mask) | ((idx + 1) & mask);
-      retry++;
     }
 
     assert(false && "ConcurrentMap is full");
@@ -694,18 +695,8 @@ public:
   static constexpr i64 NUM_SHARDS = 16;
   static constexpr i64 MAX_RETRY = 128;
 
-  void *entries_buf = nullptr;
   Entry *entries = nullptr;
   i64 nbuckets = 0;
-
-private:
-  static void pause() {
-#if defined(__x86_64__)
-    asm volatile("pause");
-#elif defined(__aarch64__)
-    asm volatile("yield");
-#endif
-  }
 };
 
 //
@@ -738,14 +729,9 @@ template <typename Context>
 class MallocOutputFile : public OutputFile<Context> {
 public:
   MallocOutputFile(Context &ctx, std::string path, i64 filesize, i64 perm)
-    : OutputFile<Context>(path, filesize, false), perm(perm) {
-    this->buf = (u8 *)malloc(filesize);
-    if (!this->buf)
-      Fatal(ctx) << "malloc failed";
-  }
-
-  ~MallocOutputFile() {
-    free(this->buf);
+    : OutputFile<Context>(path, filesize, false), ptr(new u8[filesize]),
+      perm(perm) {
+    this->buf = ptr.get();
   }
 
   void close(Context &ctx) override {
@@ -777,6 +763,7 @@ public:
   }
 
 private:
+  std::unique_ptr<u8[]> ptr;
   i64 perm;
 };
 
@@ -786,9 +773,7 @@ private:
 
 class HyperLogLog {
 public:
-  HyperLogLog() : buckets(NBUCKETS) {}
-
-  void insert(u32 hash) {
+  void insert(u64 hash) {
     update_maximum(buckets[hash & (NBUCKETS - 1)], std::countl_zero(hash) + 1);
   }
 
@@ -803,7 +788,7 @@ private:
   static constexpr i64 NBUCKETS = 2048;
   static constexpr double ALPHA = 0.79402;
 
-  std::vector<std::atomic_uint8_t> buckets;
+  Atomic<u8> buckets[NBUCKETS];
 };
 
 //
@@ -851,26 +836,21 @@ private:
   void compile();
   void fix_suffix_links(TrieNode &node);
   void fix_values();
+  i64 find_aho_corasick(std::string_view str);
 
   std::vector<std::string> strings;
   std::unique_ptr<TrieNode> root;
   std::vector<std::pair<Glob, i64>> globs;
   std::once_flag once;
   bool is_compiled = false;
+  bool prefix_match = false;
 };
-
-//
-// uuid.cc
-//
-
-std::array<u8, 16> get_uuid_v4();
 
 //
 // filepath.cc
 //
 
-template <typename T>
-std::filesystem::path filepath(const T &path) {
+std::filesystem::path filepath(const auto &path) {
   return {path, std::filesystem::path::format::generic_format};
 }
 
@@ -884,6 +864,13 @@ std::filesystem::path to_abs_path(std::filesystem::path path);
 
 std::optional<std::string_view> demangle_cpp(std::string_view name);
 std::optional<std::string_view> demangle_rust(std::string_view name);
+
+//
+// jbos.cc
+//
+
+void acquire_global_lock();
+void release_global_lock();
 
 //
 // compress.cc
@@ -933,8 +920,6 @@ public:
   void append(std::string path, std::string_view data);
 
 private:
-  static constexpr i64 BLOCK_SIZE = 512;
-
   TarWriter(FILE *out, std::string basedir) : out(out), basedir(basedir) {}
 
   FILE *out = nullptr;
@@ -947,16 +932,22 @@ private:
 
 // MappedFile represents an mmap'ed input file.
 // mold uses mmap-IO only.
-template <typename Context>
 class MappedFile {
 public:
-  static MappedFile *open(Context &ctx, std::string path);
-  static MappedFile *must_open(Context &ctx, std::string path);
-
   ~MappedFile() { unmap(); }
   void unmap();
 
-  MappedFile *slice(Context &ctx, std::string name, u64 start, u64 size);
+  template <typename Context>
+  MappedFile *slice(Context &ctx, std::string name, u64 start, u64 size) {
+    MappedFile *mf = new MappedFile;
+    mf->name = name;
+    mf->data = data + start;
+    mf->size = size;
+    mf->parent = this;
+
+    ctx.mf_pool.push_back(std::unique_ptr<MappedFile>(mf));
+    return mf;
+  }
 
   std::string_view get_contents() {
     return std::string_view((char *)data, size);
@@ -989,126 +980,37 @@ public:
   bool given_fullpath = true;
   MappedFile *parent = nullptr;
   MappedFile *thin_parent = nullptr;
-  int fd = -1;
+
 #ifdef _WIN32
-  HANDLE file_handle = INVALID_HANDLE_VALUE;
+  HANDLE fd = INVALID_HANDLE_VALUE;
+#else
+  int fd = -1;
 #endif
 };
 
+MappedFile *open_file_impl(const std::string &path, std::string &error);
+
 template <typename Context>
-MappedFile<Context> *MappedFile<Context>::open(Context &ctx, std::string path) {
+MappedFile *open_file(Context &ctx, std::string path) {
   if (path.starts_with('/') && !ctx.arg.chroot.empty())
     path = ctx.arg.chroot + "/" + path_clean(path);
 
-#ifdef _WIN32
-  HANDLE file_handle =
-      CreateFileA(path.c_str(), GENERIC_READ,
-                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (file_handle == INVALID_HANDLE_VALUE) {
-    auto err = GetLastError();
-    if (err != ERROR_FILE_NOT_FOUND)
-      Fatal(ctx) << "opening " << path << " failed: " << err;
-    return nullptr;
-  }
+  std::string error;
+  MappedFile *mf = open_file_impl(path, error);
+  if (!error.empty())
+    Fatal(ctx) << error;
 
-  if (GetFileType(file_handle) != FILE_TYPE_DISK) {
-    CloseHandle(file_handle);
-    return nullptr;
-  }
-
-  DWORD size_hi;
-  DWORD size_lo = GetFileSize(file_handle, &size_hi);
-  if (size_lo == INVALID_FILE_SIZE)
-    Fatal(ctx) << path << ": GetFileSize failed: " << GetLastError();
-
-  u64 size = ((u64)size_hi << 32) + size_lo;
-
-  MappedFile *mf = new MappedFile;
-  ctx.mf_pool.push_back(std::unique_ptr<MappedFile>(mf));
-
-  mf->name = path;
-  mf->size = size;
-  mf->file_handle = file_handle;
-
-  if (size > 0) {
-    HANDLE mapping_handle = CreateFileMapping(file_handle, nullptr,
-                                              PAGE_READONLY, 0, size, nullptr);
-    if (!mapping_handle)
-      Fatal(ctx) << path << ": CreateFileMapping failed: " << GetLastError();
-
-    mf->data = (u8 *)MapViewOfFile(mapping_handle, FILE_MAP_COPY, 0, 0, size);
-    CloseHandle(mapping_handle);
-    if (!mf->data)
-      Fatal(ctx) << path << ": MapViewOfFile failed: " << GetLastError();
-  }
-
-  return mf;
-#else
-  i64 fd = ::open(path.c_str(), O_RDONLY);
-  if (fd == -1) {
-    if (errno != ENOENT)
-      Fatal(ctx) << "opening " << path << " failed: " << errno_string();
-    return nullptr;
-  }
-
-  struct stat st;
-  if (fstat(fd, &st) == -1)
-    Fatal(ctx) << path << ": fstat failed: " << errno_string();
-
-  MappedFile *mf = new MappedFile;
-  ctx.mf_pool.push_back(std::unique_ptr<MappedFile>(mf));
-
-  mf->name = path;
-  mf->size = st.st_size;
-
-  if (st.st_size > 0) {
-    mf->data = (u8 *)mmap(nullptr, st.st_size, PROT_READ | PROT_WRITE,
-                          MAP_PRIVATE, fd, 0);
-    if (mf->data == MAP_FAILED)
-      Fatal(ctx) << path << ": mmap failed: " << errno_string();
-  }
-
-  close(fd);
-  return mf;
-#endif
-}
-
-template <typename Context>
-MappedFile<Context> *
-MappedFile<Context>::must_open(Context &ctx, std::string path) {
-  if (MappedFile *mf = MappedFile::open(ctx, path))
-    return mf;
-  Fatal(ctx) << "cannot open " << path << ": " << errno_string();
-}
-
-template <typename Context>
-MappedFile<Context> *
-MappedFile<Context>::slice(Context &ctx, std::string name, u64 start, u64 size) {
-  MappedFile *mf = new MappedFile;
-  mf->name = name;
-  mf->data = data + start;
-  mf->size = size;
-  mf->parent = this;
-
-  ctx.mf_pool.push_back(std::unique_ptr<MappedFile>(mf));
+  if (mf)
+    ctx.mf_pool.push_back(std::unique_ptr<MappedFile>(mf));
   return mf;
 }
 
 template <typename Context>
-void MappedFile<Context>::unmap() {
-  if (size == 0 || parent || !data)
-    return;
-
-#ifdef _WIN32
-  UnmapViewOfFile(data);
-  if (file_handle != INVALID_HANDLE_VALUE)
-    CloseHandle(file_handle);
-#else
-  munmap(data, size);
-#endif
-
-  data = nullptr;
+MappedFile *must_open_file(Context &ctx, std::string path) {
+  MappedFile *mf = open_file(ctx, path);
+  if (!mf)
+    Fatal(ctx) << "cannot open " << path << ": " << errno_string();
+  return mf;
 }
 
 } // namespace mold
