@@ -12,7 +12,7 @@ cat <<EOF | $CC -o $t/b.o -c -xassembler -
 EOF
 
 cat <<EOF | $CC -o $t/c.o -c -xassembler -
-.section .foobar,"axT"
+.section .foobar,"ax"
 .ascii "bar\0"
 EOF
 
@@ -21,6 +21,4 @@ int main() {}
 EOF
 
 $CC -B. -o $t/exe $t/a.o $t/b.o $t/c.o $t/d.o
-$CC -o $t/exe $t/a.o $t/b.o $t/c.o $t/d.o
-readelf -WS $t/exe
-# readelf -WS $t/exe | grep -q 'foobar.*WAX'
+readelf -W --sections $t/exe | grep -q 'foobar.*WAX'

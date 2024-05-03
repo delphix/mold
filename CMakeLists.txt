@@ -44,7 +44,7 @@
 # features and behave exactly the same.
 
 cmake_minimum_required(VERSION 3.14)
-project(mold VERSION 2.30.0)
+project(mold VERSION 2.31.0)
 
 include(CMakeDependentOption)
 include(CheckSymbolExists)
@@ -107,7 +107,7 @@ endif()
 # This option is intended to be used by `./dist.sh` script to create a
 # mold binary that works on various Linux distros. You probably don't
 # need nor want to set this to ON.
-option(MOLD_MOSTLY_STATIC "Statically link libstdc++ and libcrypto" OFF)
+option(MOLD_MOSTLY_STATIC "Statically link libstdc++ and some other libraries" OFF)
 if(MOLD_MOSTLY_STATIC)
   target_link_options(mold PRIVATE -static-libstdc++)
 endif()
@@ -118,6 +118,7 @@ find_package(ZLIB QUIET)
 if(ZLIB_FOUND AND NOT MOLD_MOSTLY_STATIC)
   target_link_libraries(mold PRIVATE ZLIB::ZLIB)
 else()
+  set(ZLIB_BUILD_EXAMPLES OFF CACHE INTERNAL "")
   add_subdirectory(third-party/zlib EXCLUDE_FROM_ALL)
   target_include_directories(zlibstatic INTERFACE third-party/zlib
     $<TARGET_PROPERTY:zlibstatic,BINARY_DIR>)
@@ -130,9 +131,14 @@ find_package(BLAKE3 QUIET)
 if(BLAKE3_FOUND AND NOT MOLD_MOSTLY_STATIC)
   target_link_libraries(mold PRIVATE BLAKE3::blake3)
 else()
-  add_subdirectory(third-party/blake3/c EXCLUDE_FROM_ALL)
-  target_link_libraries(mold PRIVATE blake3)
-  target_include_directories(mold PUBLIC third-party/blake3/c)
+  function(mold_add_blake3)
+    set(BUILD_SHARED_LIBS OFF)
+    add_subdirectory(third-party/blake3/c EXCLUDE_FROM_ALL)
+    target_link_libraries(mold PRIVATE blake3)
+    target_include_directories(mold PUBLIC third-party/blake3/c)
+  endfunction()
+
+  mold_add_blake3()
 endif()
 
 # Find zstd compression library. If zstd.h is not found, we compile a
@@ -305,9 +311,7 @@ list(APPEND MOLD_ELF_TEMPLATE_FILES
   elf/icf.cc
   elf/input-files.cc
   elf/input-sections.cc
-  elf/jobs.cc
   elf/linker-script.cc
-  elf/lto.cc
   elf/main.cc
   elf/mapfile.cc
   elf/output-chunks.cc
@@ -318,19 +322,11 @@ list(APPEND MOLD_ELF_TEMPLATE_FILES
   elf/tls.cc
   )
 
-list(APPEND MOLD_MACHO_TARGETS X86_64 ARM64)
-
-list(APPEND MOLD_MACHO_TEMPLATE_FILES
-  macho/cmdline.cc
-  macho/dead-strip.cc
-  macho/input-files.cc
-  macho/input-sections.cc
-  macho/lto.cc
-  macho/main.cc
-  macho/mapfile.cc
-  macho/output-chunks.cc
-  macho/tapi.cc
-  )
+if(WIN32)
+  list(APPEND MOLD_ELF_TEMPLATE_FILES elf/lto-win32.cc)
+else()
+  list(APPEND MOLD_ELF_TEMPLATE_FILES elf/lto-unix.cc)
+endif()
 
 function(mold_instantiate_templates SOURCE TARGET)
   set(PATH ${CMAKE_BINARY_DIR}/${SOURCE}.${TARGET}.cc)
@@ -356,11 +352,10 @@ target_sources(mold PRIVATE
   common/filepath.cc
   common/glob.cc
   common/hyperloglog.cc
-  common/main.cc
+  common/malloc.cc
   common/multi-glob.cc
   common/perf.cc
   common/tar.cc
-  common/uuid.cc
   elf/arch-alpha.cc
   elf/arch-arm32.cc
   elf/arch-arm64.cc
@@ -373,10 +368,25 @@ target_sources(mold PRIVATE
   elf/arch-sh4.cc
   elf/arch-sparc64.cc
   elf/arch-x86-64.cc
+  elf/config.cc
   elf/elf.cc
   git-hash.cc
   third-party/rust-demangle/rust-demangle.c
   )
+
+if(WIN32)
+  target_sources(mold PRIVATE
+    common/jobs-win32.cc
+    common/mapped-file-win32.cc
+    common/signal-win32.cc
+    )
+else()
+  target_sources(mold PRIVATE
+    common/jobs-unix.cc
+    common/mapped-file-unix.cc
+    common/signal-unix.cc
+    )
+endif()
 
 # Add frequently included header files for pre-compiling.
 # target_precompile_headers is supported by CMake 3.16.0 or newer.
@@ -391,7 +401,7 @@ endif()
 include(CTest)
 
 if(BUILD_TESTING)
-  # Create the ld and ld64 symlinks required for testing
+  # Create the ld symlinks required for testing
   if(NOT WIN32)
     add_custom_command(
       TARGET mold POST_BUILD
@@ -409,13 +419,8 @@ endif()
 if(NOT CMAKE_SKIP_INSTALL_RULES)
   install(TARGETS mold RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
   install(FILES docs/mold.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1/)
-
-  if(EXISTS "${CMAKE_SOURCE_DIR}/LICENSE")
-    install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
-  endif()
-  if(EXISTS "${CMAKE_SOURCE_DIR}/LICENSE.third-party")
-    install(FILES "LICENSE.third-party" DESTINATION "${CMAKE_INSTALL_DOCDIR}")
-  endif()
+  install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
+  install(FILES "LICENSE.third-party" DESTINATION "${CMAKE_INSTALL_DOCDIR}")
 
   function(mold_install_relative_symlink OLD NEW)
     install(CODE "

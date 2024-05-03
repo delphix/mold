@@ -176,14 +176,14 @@ static const ul32 plt_entry_64[] = {
   0x0000'0e17, // auipc   t3, %pcrel_hi(function@.got.plt)
   0x000e'3e03, // ld      t3, %pcrel_lo(1b)(t3)
   0x000e'0367, // jalr    t1, t3
-  0x0000'0013, // nop
+  0x0010'0073, // ebreak
 };
 
 static const ul32 plt_entry_32[] = {
   0x0000'0e17, // auipc   t3, %pcrel_hi(function@.got.plt)
   0x000e'2e03, // lw      t3, %pcrel_lo(1b)(t3)
   0x000e'0367, // jalr    t1, t3
-  0x0000'0013, // nop
+  0x0010'0073, // ebreak
 };
 
 template <>
@@ -768,7 +768,7 @@ template <>
 void InputSection<E>::copy_contents_riscv(Context<E> &ctx, u8 *buf) {
   // If a section is not relaxed, we can copy it as a one big chunk.
   if (extra.r_deltas.empty()) {
-    uncompress_to(ctx, buf);
+    copy_contents(ctx, buf);
     return;
   }
 

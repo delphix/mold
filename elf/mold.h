@@ -52,6 +52,8 @@ template <typename E> class RelocSection;
 template <typename E>
 std::ostream &operator<<(std::ostream &out, const Symbol<E> &sym);
 
+std::string get_mold_version();
+
 //
 // Mergeable section fragments
 //
@@ -61,7 +63,9 @@ struct SectionFragment {
   SectionFragment(MergedSection<E> *sec, bool is_alive)
     : output_section(*sec), is_alive(is_alive) {}
 
-  u64 get_addr(Context<E> &ctx) const;
+  u64 get_addr(Context<E> &ctx) const {
+    return output_section.shdr.sh_addr + offset;
+  }
 
   MergedSection<E> &output_section;
   u32 offset = -1;
@@ -171,13 +175,12 @@ struct CieRecord {
   }
 
   std::span<ElfRel<E>> get_rels() const {
-    i64 end = rel_idx;
-    while (end < rels.size() && rels[end].r_offset < input_offset + size())
-      end++;
-    return rels.subspan(rel_idx, end - rel_idx);
+    i64 end = input_offset + size();
+    i64 i = rel_idx;
+    while (i < rels.size() && rels[i].r_offset < end)
+      i++;
+    return rels.subspan(rel_idx, i - rel_idx);
   }
-
-  bool equals(const CieRecord &other) const;
 
   ObjectFile<E> &file;
   InputSection<E> &input_section;
@@ -191,13 +194,29 @@ struct CieRecord {
 };
 
 template <typename E>
+bool cie_equals(const CieRecord<E> &a, const CieRecord<E> &b);
+
+template <typename E>
 struct FdeRecord {
   FdeRecord(u32 input_offset, u32 rel_idx)
     : input_offset(input_offset), rel_idx(rel_idx) {}
 
-  i64 size(ObjectFile<E> &file) const;
-  std::string_view get_contents(ObjectFile<E> &file) const;
-  std::span<ElfRel<E>> get_rels(ObjectFile<E> &file) const;
+  i64 size(ObjectFile<E> &file) const {
+    return *(U32<E> *)(file.cies[cie_idx].contents.data() + input_offset) + 4;
+  }
+
+  std::string_view get_contents(ObjectFile<E> &file) const {
+    return file.cies[cie_idx].contents.substr(input_offset, size(file));
+  }
+
+  std::span<ElfRel<E>> get_rels(ObjectFile<E> &file) const {
+    std::span<ElfRel<E>> rels = file.cies[cie_idx].rels;
+    i64 end = input_offset + size(file);
+    i64 i = rel_idx;
+    while (i < rels.size() && rels[i].r_offset < end)
+      i++;
+    return rels.subspan(rel_idx, i - rel_idx);
+  }
 
   u32 input_offset = -1;
   u32 output_offset = -1;
@@ -227,7 +246,7 @@ public:
   InputSection(Context<E> &ctx, ObjectFile<E> &file, i64 shndx);
 
   void uncompress(Context<E> &ctx);
-  void uncompress_to(Context<E> &ctx, u8 *buf);
+  void copy_contents(Context<E> &ctx, u8 *buf);
   void scan_relocations(Context<E> &ctx);
   void write_to(Context<E> &ctx, u8 *buf);
   void apply_reloc_alloc(Context<E> &ctx, u8 *base);
@@ -248,7 +267,7 @@ public:
 
   ObjectFile<E> &file;
   OutputSection<E> *output_section = nullptr;
-  u64 sh_size = -1;
+  i64 sh_size = -1;
 
   std::string_view contents;
 
@@ -257,10 +276,10 @@ public:
   i32 fde_begin = -1;
   i32 fde_end = -1;
 
-  u64 offset = -1;
-  u32 shndx = -1;
-  u32 relsec_idx = -1;
-  u32 reldyn_offset = 0;
+  i64 offset = -1;
+  i32 shndx = -1;
+  i32 relsec_idx = -1;
+  i32 reldyn_offset = 0;
 
   bool uncompressed = false;
 
@@ -282,7 +301,7 @@ public:
   // - `leader == this`: This section was retained.
   // - `leader != this`: This section was merged with another identical section.
   InputSection<E> *leader = nullptr;
-  u32 icf_idx = -1;
+  i32 icf_idx = -1;
   bool icf_eligible = false;
   bool icf_leaf = false;
 
@@ -323,13 +342,12 @@ template <typename E> u64 get_dtp_addr(Context<E> &);
 //
 
 template <typename E>
-u64 get_eflags(Context<E> &ctx);
+u64 get_eflags(Context<E> &ctx) {
+  return 0;
+}
 
 template <typename E>
 i64 to_phdr_flags(Context<E> &ctx, Chunk<E> *chunk);
-
-template <typename E>
-std::string_view get_output_name(Context<E> &ctx, std::string_view name, u64 flags);
 
 template <typename E>
 void write_plt_header(Context<E> &ctx, u8 *buf);
@@ -503,7 +521,7 @@ public:
   std::vector<Symbol<E> *> tlsgd_syms;
   std::vector<Symbol<E> *> tlsdesc_syms;
   std::vector<Symbol<E> *> gottp_syms;
-  u32 tlsld_idx = -1;
+  i64 tlsld_idx = -1;
 };
 
 template <typename E>
@@ -761,8 +779,8 @@ public:
   static constexpr i64 HEADER_SIZE = 16;
   static constexpr i64 BLOOM_SHIFT = 26;
 
-  u32 num_buckets = -1;
-  u32 num_bloom = 1;
+  i64 num_buckets = -1;
+  i64 num_bloom = 1;
 };
 
 template <typename E>
@@ -780,14 +798,13 @@ public:
   void write_to(Context<E> &ctx, u8 *buf) override;
   void print_stats(Context<E> &ctx);
 
+  ConcurrentMap<SectionFragment<E>> map;
   HyperLogLog estimator;
 
 private:
   MergedSection(std::string_view name, i64 flags, i64 type, i64 entsize);
 
-  ConcurrentMap<SectionFragment<E>> map;
   std::vector<i64> shard_offsets;
-  std::once_flag once_flag;
 };
 
 template <typename E>
@@ -821,7 +838,7 @@ public:
   void update_shdr(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
 
-  u32 num_fdes = 0;
+  i64 num_fdes = 0;
 };
 
 template <typename E>
@@ -850,7 +867,6 @@ public:
   }
 
   void add_symbol(Context<E> &ctx, Symbol<E> *sym);
-  void update_shdr(Context<E> &ctx) override;
   i64 get_reldyn_size(Context<E> &ctx) const override { return symbols.size(); }
   void copy_buf(Context<E> &ctx) override;
 
@@ -1057,27 +1073,28 @@ struct ComdatGroup {
 template <typename E>
 struct ComdatGroupRef {
   ComdatGroup *group;
-  u32 sect_idx;
+  i32 sect_idx;
   std::span<U32<E>> members;
 };
 
 template <typename E>
 struct MergeableSection {
   std::pair<SectionFragment<E> *, i64> get_fragment(i64 offset);
+  std::string_view get_contents(i64 idx);
 
   MergedSection<E> *parent;
-  u8 p2align = 0;
-  std::vector<std::string_view> strings;
-  std::vector<u64> hashes;
+  std::string_view contents;
   std::vector<u32> frag_offsets;
+  std::vector<u32> hashes;
   std::vector<SectionFragment<E> *> fragments;
+  u8 p2align = 0;
 };
 
 // InputFile is the base class of ObjectFile and SharedFile.
 template <typename E>
 class InputFile {
 public:
-  InputFile(Context<E> &ctx, MappedFile<Context<E>> *mf);
+  InputFile(Context<E> &ctx, MappedFile *mf);
   InputFile() : filename("<internal>") {}
 
   virtual ~InputFile() = default;
@@ -1097,7 +1114,6 @@ public:
   ElfShdr<E> *find_section(i64 type);
 
   virtual void resolve_symbols(Context<E> &ctx) = 0;
-  void clear_symbols();
 
   virtual void
   mark_live_objects(Context<E> &ctx,
@@ -1106,7 +1122,7 @@ public:
   std::span<Symbol<E> *> get_global_syms();
   std::string_view get_source_name() const;
 
-  MappedFile<Context<E>> *mf = nullptr;
+  MappedFile *mf = nullptr;
   std::span<ElfShdr<E>> elf_sections;
   std::span<ElfSym<E>> elf_syms;
   std::vector<Symbol<E> *> symbols;
@@ -1114,10 +1130,13 @@ public:
 
   std::string filename;
   bool is_dso = false;
-  u32 priority;
+  i64 priority;
   Atomic<bool> is_alive = false;
   std::string_view shstrtab;
   std::string_view symbol_strtab;
+
+  bool has_init_array = false;
+  bool has_ctors = false;
 
   // To create an output .symtab
   u64 local_symtab_idx = 0;
@@ -1155,7 +1174,7 @@ class ObjectFile : public InputFile<E> {
 public:
   ObjectFile() = default;
 
-  static ObjectFile<E> *create(Context<E> &ctx, MappedFile<Context<E>> *mf,
+  static ObjectFile<E> *create(Context<E> &ctx, MappedFile *mf,
                                std::string archive_name, bool is_in_lib);
 
   void parse(Context<E> &ctx);
@@ -1213,7 +1232,7 @@ public:
   [[no_unique_address]] ObjectFileExtras<E> extra;
 
 private:
-  ObjectFile(Context<E> &ctx, MappedFile<Context<E>> *mf,
+  ObjectFile(Context<E> &ctx, MappedFile *mf,
              std::string archive_name, bool is_in_lib);
 
   void initialize_sections(Context<E> &ctx);
@@ -1235,11 +1254,11 @@ private:
 template <typename E>
 class SharedFile : public InputFile<E> {
 public:
-  static SharedFile<E> *create(Context<E> &ctx, MappedFile<Context<E>> *mf);
+  static SharedFile<E> *create(Context<E> &ctx, MappedFile *mf);
 
   void parse(Context<E> &ctx);
   void resolve_symbols(Context<E> &ctx) override;
-  std::span<Symbol<E> *> find_aliases(Symbol<E> *sym);
+  std::span<Symbol<E> *> get_symbols_at(Symbol<E> *sym);
   i64 get_alignment(Symbol<E> *sym);
   bool is_readonly(Symbol<E> *sym);
 
@@ -1254,7 +1273,7 @@ public:
   std::vector<ElfSym<E>> elf_syms2;
 
 private:
-  SharedFile(Context<E> &ctx, MappedFile<Context<E>> *mf);
+  SharedFile(Context<E> &ctx, MappedFile *mf);
 
   std::string get_soname(Context<E> &ctx);
   void maybe_override_symbol(Symbol<E> &sym, const ElfSym<E> &esym);
@@ -1263,9 +1282,9 @@ private:
   std::vector<u16> versyms;
   const ElfShdr<E> *symtab_sec;
 
-  // Used by find_aliases()
-  std::once_flag init_aliases;
-  std::vector<Symbol<E> *> aliases;
+  // Used by get_symbols_at()
+  std::once_flag init_sorted_syms;
+  std::vector<Symbol<E> *> sorted_syms;
 };
 
 //
@@ -1273,14 +1292,14 @@ private:
 //
 
 template <typename E>
-void parse_linker_script(Context<E> &ctx, MappedFile<Context<E>> *mf);
+void parse_linker_script(Context<E> &ctx, MappedFile *mf);
 
 template <typename E>
 std::string_view
-get_script_output_type(Context<E> &ctx, MappedFile<Context<E>> *mf);
+get_script_output_type(Context<E> &ctx, MappedFile *mf);
 
 template <typename E>
-void parse_version_script(Context<E> &ctx, MappedFile<Context<E>> *mf);
+void parse_version_script(Context<E> &ctx, MappedFile *mf);
 
 struct DynamicPattern {
   std::string_view pattern;
@@ -1297,7 +1316,7 @@ parse_dynamic_list(Context<E> &ctx, std::string_view path);
 //
 
 template <typename E>
-ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mb);
+ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile *mb);
 
 template <typename E>
 std::vector<ObjectFile<E> *> do_lto(Context<E> &ctx);
@@ -1344,15 +1363,11 @@ template <typename E>
 void process_run_subcommand(Context<E> &ctx, int argc, char **argv);
 
 //
-// jobs.cc
-//
-
-template <typename E> void acquire_global_lock(Context<E> &ctx);
-template <typename E> void release_global_lock(Context<E> &ctx);
-
-//
 // cmdline.cc
 //
+
+template <typename E>
+std::vector<std::string_view> expand_response_files(Context<E> &ctx, char **argv);
 
 template <typename E>
 std::vector<std::string> parse_nonpositional_args(Context<E> &ctx);
@@ -1368,11 +1383,13 @@ template <typename E> void create_synthetic_sections(Context<E> &);
 template <typename E> void set_file_priority(Context<E> &);
 template <typename E> void resolve_symbols(Context<E> &);
 template <typename E> void kill_eh_frame_sections(Context<E> &);
+template <typename E> void split_section_pieces(Context<E> &);
 template <typename E> void resolve_section_pieces(Context<E> &);
 template <typename E> void convert_common_symbols(Context<E> &);
 template <typename E> void compute_merged_section_sizes(Context<E> &);
 template <typename E> void create_output_sections(Context<E> &);
 template <typename E> void add_synthetic_symbols(Context<E> &);
+template <typename E> void apply_section_align(Context<E> &);
 template <typename E> void check_cet_errors(Context<E> &);
 template <typename E> void print_dependencies(Context<E> &);
 template <typename E> void write_repro_file(Context<E> &);
@@ -1552,6 +1569,14 @@ typedef enum {
 } UnresolvedKind;
 
 typedef enum {
+  BSYMBOLIC_NONE,
+  BSYMBOLIC_ALL,
+  BSYMBOLIC_FUNCTIONS,
+  BSYMBOLIC_NON_WEAK,
+  BSYMBOLIC_NON_WEAK_FUNCTIONS,
+} BsymbolicKind;
+
+typedef enum {
   SEPARATE_LOADABLE_SEGMENTS,
   SEPARATE_CODE,
   NOSEPARATE_CODE,
@@ -1573,7 +1598,7 @@ struct VersionPattern {
   std::string_view pattern;
   std::string_view source;
   std::string_view ver_str;
-  u16 ver_idx = -1;
+  i64 ver_idx = -1;
   bool is_cpp = false;
 };
 
@@ -1647,14 +1672,14 @@ struct Context {
     BuildId build_id;
     CetReportKind z_cet_report = CET_REPORT_NONE;
     CompressKind compress_debug_sections = COMPRESS_NONE;
+    MultiGlob undefined_glob;
     SeparateCodeKind z_separate_code = NOSEPARATE_CODE;
     ShuffleSectionsKind shuffle_sections = SHUFFLE_SECTIONS_NONE;
     Symbol<E> *entry = nullptr;
     Symbol<E> *fini = nullptr;
     Symbol<E> *init = nullptr;
     UnresolvedKind unresolved_symbols = UNRESOLVED_ERROR;
-    bool Bsymbolic = false;
-    bool Bsymbolic_functions = false;
+    BsymbolicKind Bsymbolic = BSYMBOLIC_NONE;
     bool allow_multiple_definition = false;
     bool apply_dynamic_relocs = true;
     bool color_diagnostics = false;
@@ -1726,6 +1751,7 @@ struct Context {
     bool z_rewrite_endbr = false;
     bool z_sectionheader = true;
     bool z_shstk = false;
+    bool z_start_stop_visibility_protected = false;
     bool z_text = false;
     i64 filler = -1;
     i64 spare_dynamic_tags = 5;
@@ -1770,7 +1796,6 @@ struct Context {
   std::vector<DynamicPattern> dynamic_list_patterns;
   i64 default_version = VER_NDX_UNSPECIFIED;
   i64 page_size = E::page_size;
-  std::optional<int> global_lock_fd;
 
   // Reader context
   bool as_needed = false;
@@ -1778,13 +1803,11 @@ struct Context {
   bool is_static;
   bool in_lib = false;
   i64 file_priority = 10000;
-  MappedFile<Context<E>> *script_file = nullptr;
+  MappedFile *script_file = nullptr;
   std::unordered_set<std::string_view> visited;
   tbb::task_group tg;
 
   bool has_error = false;
-  Atomic<bool> has_init_array = false;
-  Atomic<bool> has_ctors = false;
 
   // Symbol table
   tbb::concurrent_hash_map<std::string_view, Symbol<E>, HashCmp> symbol_map;
@@ -1797,7 +1820,7 @@ struct Context {
   tbb::concurrent_vector<std::unique_ptr<ObjectFile<E>>> obj_pool;
   tbb::concurrent_vector<std::unique_ptr<SharedFile<E>>> dso_pool;
   tbb::concurrent_vector<std::unique_ptr<u8[]>> string_pool;
-  tbb::concurrent_vector<std::unique_ptr<MappedFile<Context<E>>>> mf_pool;
+  tbb::concurrent_vector<std::unique_ptr<MappedFile>> mf_pool;
   tbb::concurrent_vector<std::unique_ptr<Chunk<E>>> chunk_pool;
   tbb::concurrent_vector<std::unique_ptr<OutputSection<E>>> osec_pool;
 
@@ -1822,7 +1845,7 @@ struct Context {
   std::vector<Chunk<E> *> chunks;
   Atomic<bool> needs_tlsld = false;
   Atomic<bool> has_textrel = false;
-  Atomic<u32> num_ifunc_dynrels = 0;
+  Atomic<i32> num_ifunc_dynrels = 0;
 
   tbb::concurrent_hash_map<Symbol<E> *, std::vector<std::string>> undef_errors;
 
@@ -1905,16 +1928,16 @@ struct Context {
 };
 
 template <typename E>
-std::string_view get_machine_type(Context<E> &ctx, MappedFile<Context<E>> *mf);
+std::string_view get_machine_type(Context<E> &ctx, MappedFile *mf);
 
 template <typename E>
-MappedFile<Context<E>> *open_library(Context<E> &ctx, std::string path);
+MappedFile *open_library(Context<E> &ctx, std::string path);
 
 template <typename E>
-MappedFile<Context<E>> *find_library(Context<E> &ctx, std::string path);
+MappedFile *find_library(Context<E> &ctx, std::string path);
 
 template <typename E>
-void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf);
+void read_file(Context<E> &ctx, MappedFile *mf);
 
 template <typename E>
 int elf_main(int argc, char **argv);
@@ -2036,7 +2059,7 @@ public:
 
   // A symbol is owned by a file. If two or more files define the
   // same symbol, the one with the strongest definition owns the symbol.
-  // If `file` is null, the symbol is equivalent to nonexistent.
+  // If `file` is null, the symbol is not defined by any input file.
   InputFile<E> *file = nullptr;
 
   // A symbol usually belongs to an input section, but it can belong
@@ -2222,35 +2245,10 @@ std::ostream &operator<<(std::ostream &out, const Symbol<E> &sym) {
 //
 
 template <typename E>
-inline i64 FdeRecord<E>::size(ObjectFile<E> &file) const {
-  return *(U32<E> *)(file.cies[cie_idx].contents.data() + input_offset) + 4;
-}
-
-template <typename E>
-inline std::string_view FdeRecord<E>::get_contents(ObjectFile<E> &file) const {
-  return file.cies[cie_idx].contents.substr(input_offset, size(file));
-}
-
-template <typename E>
-inline std::span<ElfRel<E>>
-FdeRecord<E>::get_rels(ObjectFile<E> &file) const {
-  std::span<ElfRel<E>> rels = file.cies[cie_idx].rels;
-  i64 end = rel_idx;
-  while (end < rels.size() && rels[end].r_offset < input_offset + size(file))
-    end++;
-  return rels.subspan(rel_idx, end - rel_idx);
-}
-
-template <typename E>
 inline std::ostream &
 operator<<(std::ostream &out, const InputSection<E> &isec) {
   out << isec.file << ":(" << isec.name() << ")";
   return out;
-}
-
-template <typename E>
-inline u64 SectionFragment<E>::get_addr(Context<E> &ctx) const {
-  return output_section.shdr.sh_addr + offset;
 }
 
 template <typename E>
@@ -2381,15 +2379,6 @@ InputSection<E>::get_tombstone(Symbol<E> &sym, SectionFragment<E> *frag) {
 }
 
 template <typename E>
-inline bool
-InputSection<E>::is_relr_reloc(Context<E> &ctx, const ElfRel<E> &rel) const {
-  return ctx.arg.pack_dyn_relocs_relr &&
-         !(shdr().sh_flags & SHF_EXECINSTR) &&
-         (shdr().sh_addralign % sizeof(Word<E>)) == 0 &&
-         (rel.r_offset % sizeof(Word<E>)) == 0;
-}
-
-template <typename E>
 inline bool InputSection<E>::is_killed_by_icf() const {
   return this->leader && this->leader != this;
 }
@@ -2401,6 +2390,14 @@ MergeableSection<E>::get_fragment(i64 offset) {
   auto it = std::upper_bound(vec.begin(), vec.end(), offset);
   i64 idx = it - 1 - vec.begin();
   return {fragments[idx], offset - vec[idx]};
+}
+
+template <typename E>
+std::string_view MergeableSection<E>::get_contents(i64 i) {
+  i64 cur = frag_offsets[i];
+  if (i == frag_offsets.size() - 1)
+    return contents.substr(cur);
+  return contents.substr(cur, frag_offsets[i + 1] - cur);
 }
 
 template <typename E>
@@ -2843,8 +2840,11 @@ inline u32 Symbol<E>::get_type() const {
 
 template <typename E>
 inline std::string_view Symbol<E>::get_version() const {
-  if (file->is_dso)
-    return ((SharedFile<E> *)file)->version_strings[ver_idx];
+  if (file->is_dso) {
+    std::span<std::string_view> vers = ((SharedFile<E> *)file)->version_strings;
+    if (!vers.empty())
+      return vers[ver_idx];
+  }
   return "";
 }
 

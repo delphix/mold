@@ -1,6 +1,12 @@
 #include "common.h"
 
+#ifdef _WIN32
+# define ftruncate _chsize_s
+#endif
+
 namespace mold {
+
+static constexpr i64 BLOCK_SIZE = 512;
 
 // A tar file consists of one or more Ustar header followed by data.
 // Each Ustar header represents a single file in an archive.
@@ -11,26 +17,6 @@ namespace mold {
 //
 // For simplicity, we always emit a PAX header even for a short filename.
 struct UstarHeader {
-  UstarHeader() {
-    memset(this, 0, sizeof(*this));
-  }
-
-  void finalize() {
-    memset(checksum, ' ', sizeof(checksum));
-    memcpy(magic, "ustar", 5);
-    memcpy(version, "00", 2);
-
-    // Compute checksum
-    int sum = 0;
-    for (i64 i = 0; i < sizeof(*this); i++)
-      sum += ((u8 *)this)[i];
-
-    // We need to convince the compiler that sum isn't too big to silence
-    // -Werror=format-truncation.
-    ASSUME(sum < 01'000'000);
-    snprintf(checksum, sizeof(checksum), "%06o", sum);
-  }
-
   char name[100];
   char mode[8];
   char uid[8];
@@ -50,7 +36,24 @@ struct UstarHeader {
   char pad[12];
 };
 
-static_assert(sizeof(UstarHeader) == 512);
+static_assert(sizeof(UstarHeader) == BLOCK_SIZE);
+
+static void finalize(UstarHeader &hdr) {
+  memset(hdr.checksum, ' ', sizeof(hdr.checksum));
+  memcpy(hdr.magic, "ustar", 5);
+  memcpy(hdr.version, "00", 2);
+
+  // Compute checksum
+  int sum = 0;
+  for (i64 i = 0; i < sizeof(hdr); i++)
+    sum += ((u8 *)&hdr)[i];
+
+  // We need to convince the compiler that sum isn't too big to silence
+  // -Werror=format-truncation.
+  if (sum >= 01'000'000)
+    unreachable();
+  snprintf(hdr.checksum, sizeof(hdr.checksum), "%06o", sum);
+}
 
 static std::string encode_path(std::string basedir, std::string path) {
   path = path_clean(basedir + "/" + path);
@@ -78,14 +81,13 @@ TarWriter::~TarWriter() {
 
 void TarWriter::append(std::string path, std::string_view data) {
   // Write PAX header
-  static_assert(sizeof(UstarHeader) == BLOCK_SIZE);
-  UstarHeader pax;
+  UstarHeader pax = {};
 
   std::string attr = encode_path(basedir, path);
   snprintf(pax.size, sizeof(pax.size), "%011zo", attr.size());
   pax.name[0] = '/';
   pax.typeflag[0] = 'x';
-  pax.finalize();
+  finalize(pax);
   fwrite(&pax, sizeof(pax), 1, out);
 
   // Write pathname
@@ -93,23 +95,18 @@ void TarWriter::append(std::string path, std::string_view data) {
   fseek(out, align_to(ftell(out), BLOCK_SIZE), SEEK_SET);
 
   // Write Ustar header
-  UstarHeader ustar;
+  UstarHeader ustar = {};
   memcpy(ustar.mode, "0000664", 8);
   snprintf(ustar.size, sizeof(ustar.size), "%011zo", data.size());
-  ustar.finalize();
+  finalize(ustar);
   fwrite(&ustar, sizeof(ustar), 1, out);
 
   // Write file contents
   fwrite(data.data(), data.size(), 1, out);
   fseek(out, align_to(ftell(out), BLOCK_SIZE), SEEK_SET);
 
-  // A tar file must ends with two empty blocks, so write such
-  // terminator and seek back.
-  u8 terminator[BLOCK_SIZE * 2] = {};
-  fwrite(&terminator, BLOCK_SIZE * 2, 1, out);
-  fseek(out, -BLOCK_SIZE * 2, SEEK_END);
-
-  assert(ftell(out) % BLOCK_SIZE == 0);
+  // A tar file must ends with two empty blocks
+  (void)!ftruncate(fileno(out), ftell(out) + BLOCK_SIZE * 2);
 }
 
 } // namespace mold

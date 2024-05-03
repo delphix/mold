@@ -176,7 +176,7 @@ static PluginStatus add_input_file(const char *path) {
   Context<E> &ctx = *gctx<E>;
   static i64 file_priority = 100;
 
-  MappedFile<Context<E>> *mf = MappedFile<Context<E>>::must_open(ctx, path);
+  MappedFile *mf = must_open_file(ctx, path);
 
   ObjectFile<E> *file = ObjectFile<E>::create(ctx, mf, "", false);
   ctx.obj_pool.emplace_back(file);
@@ -427,7 +427,7 @@ get_api_version(const char *plugin_identifier,
   if (LAPI_V1 < minimal_api_supported)
     Fatal(*gctx<E>) << "LTO plugin does not support V0 or V1 API";
 
-  std::string version = mold_version + "\0"s;
+  std::string version = get_mold_version() + "\0"s;
 
   *linker_identifier = "mold";
   *linker_version = version.data();
@@ -582,9 +582,9 @@ static bool supports_v3_api(Context<E> &ctx) {
 
 template <typename E>
 static PluginInputFile
-create_plugin_input_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
+create_plugin_input_file(Context<E> &ctx, MappedFile *mf) {
   PluginInputFile file;
-  MappedFile<Context<E>> *mf2 = mf->parent ? mf->parent : mf;
+  MappedFile *mf2 = mf->parent ? mf->parent : mf;
 
   file.name = save_string(ctx, mf2->name).data();
   file.offset = mf->get_offset();
@@ -600,7 +600,7 @@ create_plugin_input_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 }
 
 template <typename E>
-ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mf) {
+ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile *mf) {
   load_lto_plugin(ctx);
 
   // V0 API's claim_file is not thread-safe.
@@ -644,7 +644,7 @@ ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   // LLVM needs it and takes the ownership of fd. To prevent "too many
   // open files" issue, we close fd only for GCC. This is ugly, though.
   if (!is_llvm(ctx)) {
-    MappedFile<Context<E>> *mf2 = mf->parent ? mf->parent : mf;
+    MappedFile *mf2 = mf->parent ? mf->parent : mf;
     close(mf2->fd);
     mf2->fd = -1;
   }
@@ -721,7 +721,7 @@ std::vector<ObjectFile<E> *> do_lto(Context<E> &ctx) {
   // given to the LTO backend. Such sections contains code and data for
   // peripherails (typically GPUs).
   for (ObjectFile<E> *file : ctx.objs) {
-    if (!file->is_lto_obj && file->is_gcc_offload_obj) {
+    if (file->is_alive && !file->is_lto_obj && file->is_gcc_offload_obj) {
       PluginInputFile pfile = create_plugin_input_file(ctx, file->mf);
       int claimed = false;
       claim_file_hook(&pfile, &claimed);
@@ -746,7 +746,7 @@ void lto_cleanup(Context<E> &ctx) {
 
 using E = MOLD_TARGET;
 
-template ObjectFile<E> *read_lto_object(Context<E> &, MappedFile<Context<E>> *);
+template ObjectFile<E> *read_lto_object(Context<E> &, MappedFile *);
 template std::vector<ObjectFile<E> *> do_lto(Context<E> &);
 template void lto_cleanup(Context<E> &);
 

@@ -1,11 +1,11 @@
 #include "mold.h"
-#include "../common/cmdline.h"
 
 #include <random>
 #include <regex>
 #include <sstream>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <tbb/global_control.h>
 #include <unordered_set>
 
 #ifdef _WIN32
@@ -56,9 +56,12 @@ Options:
                               Trace references to SYMBOL
   --Bdynamic, --dy            Link against shared libraries (default)
   --Bstatic, --dn, --static   Do not link against shared libraries
-  --Bsymbolic                 Bind global symbols locally
-  --Bsymbolic-functions       Bind global functions locally
-  --Bno-symbolic              Cancel --Bsymbolic and --Bsymbolic-functions
+  --Bsymbolic                 Bind all symbols locally
+  --Bsymbolic-functions       Bind function symbols locally
+  --Bsymbolic-non-weak        Bind all but weak symbols locally
+  --Bsymbolic-non-weak-functions
+                              Bind all but weak function symbols locally
+  --Bno-symbolic              Cancel --Bsymbolic options
   --Map FILE                  Write map file to a given file
   --Tbss=ADDR                 Set address to .bss
   --Tdata=ADDR                Set address to .data
@@ -156,6 +159,7 @@ Options:
   --threads                   Use multiple threads (default)
     --no-threads
   --trace                     Print the name of each input file
+  --undefined-glob PATTERN    Force to resolve all symbols that match a given pattern
   --undefined-version         Do not report version scripts that refer to undefined symbols
     --no-undefined-version    Report version scripts that refer to undefined symbols (default)
   --unique PATTERN            Don't merge input sections that match a given pattern
@@ -196,6 +200,8 @@ Options:
     -z nopack-relative-relocs
   -z sectionheader            Do not omit section header (default)
     -z nosectionheader        Omit section header
+  -z start_stop_visibility=[hidden,protected]
+                              Specify symbol visibility for "__start_SECNAME" and "__stop_SECNAME" symbols
   -z separate-loadable-segments
                               Separate all loadable segments onto different pages
     -z separate-code          Separate code and data onto different pages
@@ -209,6 +215,108 @@ Options:
 
 mold: supported targets: elf32-i386 elf64-x86-64 elf32-littlearm elf64-littleaarch64 elf32-littleriscv elf32-bigriscv elf64-littleriscv elf64-bigriscv elf32-powerpc elf64-powerpc elf64-powerpc elf64-powerpcle elf64-s390 elf64-sparc elf32-m68k elf32-sh-linux elf64-alpha elf64-loongarch elf32-loongarch
 mold: supported emulations: elf_i386 elf_x86_64 armelf_linux_eabi aarch64linux aarch64elf elf32lriscv elf32briscv elf64lriscv elf64briscv elf32ppc elf32ppclinux elf64ppc elf64lppc elf64_s390 elf64_sparc m68kelf shlelf_linux elf64alpha elf64loongarch elf32loongarch)";
+
+template <typename E>
+static std::vector<std::string_view>
+read_response_file(Context<E> &ctx, std::string_view path, i64 depth) {
+  if (depth > 10)
+    Fatal(ctx) << path << ": response file nesting too deep";
+
+  std::vector<std::string_view> vec;
+  MappedFile *mf = must_open_file(ctx, std::string(path));
+  std::string_view data((char *)mf->data, mf->size);
+
+  while (!data.empty()) {
+    if (isspace(data[0])) {
+      data = data.substr(1);
+      continue;
+    }
+
+    auto read_quoted = [&]() {
+      char quote = data[0];
+      data = data.substr(1);
+
+      std::string buf;
+      while (!data.empty() && data[0] != quote) {
+        if (data[0] == '\\' && data.size() >= 1) {
+          buf.append(1, data[1]);
+          data = data.substr(2);
+        } else {
+          buf.append(1, data[0]);
+          data = data.substr(1);
+        }
+      }
+      if (data.empty())
+        Fatal(ctx) << path << ": premature end of input";
+      data = data.substr(1);
+      return save_string(ctx, buf);
+    };
+
+    auto read_unquoted = [&] {
+      std::string buf;
+      while (!data.empty()) {
+        if (data[0] == '\\' && data.size() >= 1) {
+          buf.append(1, data[1]);
+          data = data.substr(2);
+          continue;
+        }
+
+        if (!isspace(data[0])) {
+          buf.append(1, data[0]);
+          data = data.substr(1);
+          continue;
+        }
+        break;
+      }
+      return save_string(ctx, buf);
+    };
+
+    std::string_view tok;
+    if (data[0] == '\'' || data[0] == '\"')
+      tok = read_quoted();
+    else
+      tok = read_unquoted();
+
+    if (tok.starts_with('@'))
+      append(vec, read_response_file(ctx, tok.substr(1), depth + 1));
+    else
+      vec.push_back(tok);
+  }
+  return vec;
+}
+
+// Replace "@path/to/some/text/file" with its file contents.
+template <typename E>
+std::vector<std::string_view>
+expand_response_files(Context<E> &ctx, char **argv) {
+  std::vector<std::string_view> vec;
+  for (i64 i = 0; argv[i]; i++) {
+    if (argv[i][0] == '@')
+      append(vec, read_response_file(ctx, argv[i] + 1, 1));
+    else
+      vec.push_back(argv[i]);
+  }
+  return vec;
+}
+
+static i64 get_default_thread_count() {
+  // mold doesn't scale well above 32 threads.
+  int n = tbb::global_control::active_value(
+    tbb::global_control::max_allowed_parallelism);
+  return std::min(n, 32);
+}
+
+static inline std::string_view string_trim(std::string_view str) {
+  size_t pos = str.find_first_not_of(" \t");
+  if (pos == str.npos)
+    return "";
+  str = str.substr(pos);
+
+  pos = str.find_last_not_of(" \t");
+  if (pos == str.npos)
+    return str;
+  return str.substr(0, pos + 1);
+}
 
 static std::vector<std::string> add_dashes(std::string name) {
   // Single-letter option
@@ -297,8 +405,7 @@ split_by_comma_or_colon(std::string_view str) {
 
 template <typename E>
 static void read_retain_symbols_file(Context<E> &ctx, std::string_view path) {
-  MappedFile<Context<E>> *mf =
-    MappedFile<Context<E>>::must_open(ctx, std::string(path));
+  MappedFile *mf = must_open_file(ctx, std::string(path));
   std::string_view data((char *)mf->data, mf->size);
 
   ctx.arg.retain_symbols_file.reset(new std::unordered_set<std::string_view>);
@@ -519,13 +626,13 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("no-dynamic-linker")) {
       ctx.arg.dynamic_linker = "";
     } else if (read_flag("v")) {
-      SyncOut(ctx) << mold_version;
+      SyncOut(ctx) << get_mold_version();
       version_shown = true;
     } else if (read_flag("version")) {
-      SyncOut(ctx) << mold_version;
+      SyncOut(ctx) << get_mold_version();
       exit(0);
     } else if (read_flag("V")) {
-      SyncOut(ctx) << mold_version
+      SyncOut(ctx) << get_mold_version()
                    << "\n  Supported emulations:\n   elf_x86_64\n   elf_i386\n"
                    << "   aarch64linux\n   armelf_linux_eabi\n   elf64lriscv\n"
                    << "   elf64briscv\n   elf32lriscv\n   elf32briscv\n"
@@ -580,12 +687,15 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("no-export-dynamic")) {
       ctx.arg.export_dynamic = false;
     } else if (read_flag("Bsymbolic")) {
-      ctx.arg.Bsymbolic = true;
+      ctx.arg.Bsymbolic = BSYMBOLIC_ALL;
     } else if (read_flag("Bsymbolic-functions")) {
-      ctx.arg.Bsymbolic_functions = true;
+      ctx.arg.Bsymbolic = BSYMBOLIC_FUNCTIONS;
+    } else if (read_flag("Bsymbolic-non-weak")) {
+      ctx.arg.Bsymbolic = BSYMBOLIC_NON_WEAK;
+    } else if (read_flag("Bsymbolic-non-weak-functions")) {
+      ctx.arg.Bsymbolic = BSYMBOLIC_NON_WEAK_FUNCTIONS;
     } else if (read_flag("Bno-symbolic")) {
-      ctx.arg.Bsymbolic = false;
-      ctx.arg.Bsymbolic_functions = false;
+      ctx.arg.Bsymbolic = BSYMBOLIC_NONE;
     } else if (read_arg("exclude-libs")) {
       append(ctx.arg.exclude_libs, split_by_comma_or_colon(arg));
     } else if (read_flag("q") || read_flag("emit-relocs")) {
@@ -670,6 +780,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
         Fatal(ctx) << "unknown --unresolved-symbols argument: " << arg;
     } else if (read_arg("undefined") || read_arg("u")) {
       ctx.arg.undefined.push_back(get_symbol(ctx, arg));
+    } else if (read_arg("undefined-glob")) {
+      if (!ctx.arg.undefined_glob.add(arg, 0))
+        Fatal(ctx) << "--undefined-glob: invalid pattern: " << arg;
     } else if (read_arg("require-defined")) {
       ctx.arg.require_defined.push_back(get_symbol(ctx, arg));
     } else if (read_arg("init")) {
@@ -832,9 +945,10 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.page_size = parse_number(ctx, "-z max-page-size", arg);
       if (!has_single_bit(ctx.page_size))
         Fatal(ctx) << "-z max-page-size " << arg << ": value must be a power of 2";
-    } else if (read_z_arg("start-stop-visibility")) {
-      if (arg != "hidden")
-        Fatal(ctx) << "-z start-stop-visibility: unsupported visibility: " << arg;
+    } else if (read_z_flag("start-stop-visibility=protected")) {
+      ctx.arg.z_start_stop_visibility_protected = true;
+    } else if (read_z_flag("start-stop-visibility=hidden")) {
+      ctx.arg.z_start_stop_visibility_protected = false;
     } else if (read_z_flag("noexecstack")) {
       ctx.arg.z_execstack = false;
     } else if (read_z_flag("relro")) {
@@ -1109,6 +1223,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("warn-constructors")) {
     } else if (read_flag("warn-execstack")) {
     } else if (read_flag("no-warn-execstack")) {
+    } else if (read_flag("long-plt")) {
     } else if (read_flag("secure-plt")) {
     } else if (read_arg("rpath-link")) {
     } else if (read_z_flag("combreloc")) {
@@ -1126,7 +1241,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       // cannot be done right here.
       remaining.push_back("--version-script=" + std::string(arg));
     } else if (read_arg("dynamic-list")) {
-      ctx.arg.Bsymbolic = true;
+      ctx.arg.Bsymbolic = BSYMBOLIC_ALL;
       append(ctx.dynamic_list_patterns, parse_dynamic_list(ctx, arg));
     } else if (read_arg("export-dynamic-symbol")) {
       ctx.dynamic_list_patterns.push_back({arg, "<command line>"});
@@ -1296,6 +1411,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
 
 using E = MOLD_TARGET;
 
+template std::vector<std::string_view> expand_response_files(Context<E> &, char **);
 template std::vector<std::string> parse_nonpositional_args(Context<E> &ctx);
 
 } // namespace mold::elf
