@@ -157,7 +157,7 @@ void create_synthetic_sections(Context<E> &ctx) {
     ctx.eh_frame_reloc = push(new EhFrameRelocSection<E>);
 
   if (ctx.arg.shared || !ctx.dsos.empty() || ctx.arg.pie) {
-    ctx.dynamic = push(new DynamicSection<E>);
+    ctx.dynamic = push(new DynamicSection<E>(ctx));
 
     // If .dynamic exists, .dynsym and .dynstr must exist as well
     // since .dynamic refers to them.
@@ -205,6 +205,7 @@ static void mark_live_objects(Context<E> &ctx) {
         for (Symbol<E> *sym : file->get_global_syms()) {
           if (sym->file == file && ctx.arg.undefined_glob.find(sym->name())) {
             file->is_alive = true;
+            sym->gc_root = true;
             break;
           }
         }
@@ -995,7 +996,7 @@ void check_cet_errors(Context<E> &ctx) {
 
 template <typename E>
 void print_dependencies(Context<E> &ctx) {
-  SyncOut(ctx) <<
+  Out(ctx) <<
 R"(# This is an output of the mold linker's --print-dependencies option.
 #
 # Each line consists of 4 fields, <section1>, <section2>, <symbol-type> and
@@ -1009,13 +1010,13 @@ R"(# This is an output of the mold linker's --print-dependencies option.
 
   auto println = [&](auto &src, Symbol<E> &sym, ElfSym<E> &esym) {
     if (InputSection<E> *isec = sym.get_input_section())
-      SyncOut(ctx) << src << "\t" << *isec
-                   << "\t" << (esym.is_weak() ? 'w' : 'u')
-                   << "\t" << sym;
+      Out(ctx) << src << "\t" << *isec
+               << "\t" << (esym.is_weak() ? 'w' : 'u')
+               << "\t" << sym;
     else
-      SyncOut(ctx) << src << "\t" << *sym.file
-                   << "\t" << (esym.is_weak() ? 'w' : 'u')
-                   << "\t" << sym;
+      Out(ctx) << src << "\t" << *sym.file
+               << "\t" << (esym.is_weak() ? 'w' : 'u')
+               << "\t" << sym;
   };
 
   for (ObjectFile<E> *file : ctx.objs) {
@@ -1431,9 +1432,11 @@ void compute_section_sizes(Context<E> &ctx) {
 }
 
 // Find all unresolved symbols and attach them to the most appropriate files.
-// Note that even a symbol that will be reported as an undefined symbol will
-// get an owner file in this function. Such symbol will be reported by
-// ObjectFile<E>::scan_relocations().
+//
+// Note that even a symbol that will be reported as an undefined symbol
+// will get an owner file in this function. Such symbol will be reported
+// by ObjectFile<E>::scan_relocations(). This is because we want to report
+// errors only on symbols that are actually referenced.
 template <typename E>
 void claim_unresolved_symbols(Context<E> &ctx) {
   Timer t(ctx, "claim_unresolved_symbols");
@@ -1474,9 +1477,9 @@ void claim_unresolved_symbols(Context<E> &ctx) {
 
       auto claim = [&](bool is_imported) {
         if (sym.is_traced)
-          SyncOut(ctx) << "trace-symbol: " << *file << ": unresolved"
-                       << (esym.is_weak() ? " weak" : "")
-                       << " symbol " << sym;
+          Out(ctx) << "trace-symbol: " << *file << ": unresolved"
+                   << (esym.is_weak() ? " weak" : "")
+                   << " symbol " << sym;
 
         sym.file = file;
         sym.origin = 0;
@@ -1511,7 +1514,8 @@ void claim_unresolved_symbols(Context<E> &ctx) {
       // promoted to dynamic symbols for compatibility with other linkers.
       // Some major programs, notably Firefox, depend on the behavior
       // (they use this loophole to export symbols from libxul.so).
-      if (ctx.arg.shared && sym.visibility != STV_HIDDEN && !ctx.arg.z_defs) {
+      if (ctx.arg.shared && sym.visibility != STV_HIDDEN &&
+          ctx.arg.unresolved_symbols != UNRESOLVED_ERROR) {
         claim(true);
         continue;
       }
@@ -1635,7 +1639,10 @@ void compute_imported_symbol_weakness(Context<E> &ctx) {
 // Report all undefined symbols, grouped by symbol.
 template <typename E>
 void report_undef_errors(Context<E> &ctx) {
-  constexpr i64 max_errors = 3;
+  constexpr i64 MAX_ERRORS = 3;
+
+  if (ctx.arg.unresolved_symbols == UNRESOLVED_IGNORE)
+    return;
 
   for (auto &pair : ctx.undef_errors) {
     Symbol<E> *sym = pair.first;
@@ -1646,16 +1653,20 @@ void report_undef_errors(Context<E> &ctx) {
        << (ctx.arg.demangle ? demangle(*sym) : sym->name())
        << "\n";
 
-    for (i64 i = 0; i < errors.size() && i < max_errors; i++)
+    for (i64 i = 0; i < errors.size() && i < MAX_ERRORS; i++)
       ss << errors[i];
 
-    if (errors.size() > max_errors)
-      ss << ">>> referenced " << (errors.size() - max_errors) << " more times\n";
+    if (MAX_ERRORS < errors.size())
+      ss << ">>> referenced " << (errors.size() - MAX_ERRORS) << " more times\n";
+
+    // Remove the trailing '\n' because Error/Warn adds it automatically
+    std::string msg = ss.str();
+    msg.pop_back();
 
     if (ctx.arg.unresolved_symbols == UNRESOLVED_ERROR)
-      Error(ctx) << ss.str();
-    else if (ctx.arg.unresolved_symbols == UNRESOLVED_WARN)
-      Warn(ctx) << ss.str();
+      Error(ctx) << msg;
+    else
+      Warn(ctx) << msg;
   }
 
   ctx.checkpoint();
@@ -2996,7 +3007,7 @@ void write_dependency_file(Context<E> &ctx) {
   std::unordered_set<std::string> seen;
 
   for (std::unique_ptr<MappedFile> &mf : ctx.mf_pool)
-    if (!mf->parent)
+    if (mf->is_dependency && !mf->parent)
       if (std::string path = path_clean(mf->name); seen.insert(path).second)
         deps.push_back(path);
 
