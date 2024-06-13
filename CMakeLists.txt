@@ -44,7 +44,7 @@
 # features and behave exactly the same.
 
 cmake_minimum_required(VERSION 3.14)
-project(mold VERSION 2.31.0)
+project(mold VERSION 2.32.0)
 
 include(CMakeDependentOption)
 include(CheckSymbolExists)
@@ -355,6 +355,7 @@ target_sources(mold PRIVATE
   common/malloc.cc
   common/multi-glob.cc
   common/perf.cc
+  common/random.cc
   common/tar.cc
   elf/arch-alpha.cc
   elf/arch-arm32.cc

@@ -64,7 +64,6 @@ using namespace std::literals::string_view_literals;
 template <typename Context> class OutputFile;
 
 inline char *output_tmpfile;
-inline thread_local bool opt_demangle;
 
 inline u8 *output_buffer_start = nullptr;
 inline u8 *output_buffer_end = nullptr;
@@ -84,106 +83,126 @@ static u64 combine_hash(u64 a, u64 b) {
 // Error output
 //
 
-template <typename Context>
-class SyncOut {
+// Some C++ stdlibs don't support std::osyncstream even though
+// it's is in the C++20 standard. So we implement it ourselves.
+class SyncStream {
 public:
-  SyncOut(Context &ctx, std::ostream *out = &std::cout) : out(out) {
-    opt_demangle = ctx.arg.demangle;
+  SyncStream(std::ostream &out) : out(out) {}
+
+  ~SyncStream() {
+    emit();
   }
 
-  ~SyncOut() {
-    if (out) {
-      std::scoped_lock lock(mu);
-      *out << ss.str() << "\n";
-    }
-  }
-
-  template <class T> SyncOut &operator<<(T &&val) {
-    if (out)
-      ss << std::forward<T>(val);
+  template <typename T> SyncStream &operator<<(T &&val) {
+    ss << std::forward<T>(val);
     return *this;
   }
 
-  static inline std::mutex mu;
+  void emit() {
+    if (emitted)
+      return;
+
+    std::scoped_lock lock(mu);
+    out << ss.str() << '\n';
+    emitted = true;
+  }
 
 private:
-  std::ostream *out;
+  std::ostream &out;
   std::stringstream ss;
+  bool emitted = false;
+  static inline std::mutex mu;
 };
 
 template <typename Context>
-static std::string add_color(Context &ctx, std::string msg) {
-  if (ctx.arg.color_diagnostics) {
-    if (msg == "warning")
-      return "mold: \033[0;1;35m" + msg + ":\033[0m ";
-    return "mold: \033[0;1;31m" + msg + ":\033[0m ";
-  }
-  return "mold: " + msg + ": ";
-}
-
-template <typename Context>
-class Fatal {
+class Out {
 public:
-  Fatal(Context &ctx) : out(ctx, &std::cerr) {
-    out << add_color(ctx, "fatal");
-  }
+  Out(Context &ctx) {}
 
-  [[noreturn]] ~Fatal() {
-    out.~SyncOut();
-    cleanup();
-    _exit(1);
-  }
-
-  template <class T> Fatal &operator<<(T &&val) {
+  template <typename T> Out &operator<<(T &&val) {
     out << std::forward<T>(val);
     return *this;
   }
 
 private:
-  SyncOut<Context> out;
+  SyncStream out{std::cout};
+};
+
+static std::string_view fatal_mono = "mold: fatal: ";
+static std::string_view fatal_color = "mold: \033[0;1;31mfatal:\033[0m ";
+static std::string_view error_mono = "mold: error: ";
+static std::string_view error_color = "mold: \033[0;1;31merror:\033[0m ";
+static std::string_view warning_mono = "mold: warning: ";
+static std::string_view warning_color = "mold: \033[0;1;35mwarning:\033[0m ";
+
+template <typename Context>
+class Fatal {
+public:
+  Fatal(Context &ctx) {
+    out << (ctx.arg.color_diagnostics ? fatal_color : fatal_mono);
+  }
+
+  [[noreturn]] ~Fatal() {
+    out.emit();
+    cleanup();
+    _exit(1);
+  }
+
+  template <typename T> Fatal &operator<<(T &&val) {
+    out << std::forward<T>(val);
+    return *this;
+  }
+
+private:
+  SyncStream out{std::cerr};
 };
 
 template <typename Context>
 class Error {
 public:
-  Error(Context &ctx) : out(ctx, &std::cerr) {
+  Error(Context &ctx) {
     if (ctx.arg.noinhibit_exec) {
-      out << add_color(ctx, "warning");
+      out << (ctx.arg.color_diagnostics ? warning_color : warning_mono);
     } else {
-      out << add_color(ctx, "error");
+      out << (ctx.arg.color_diagnostics ? error_color : error_mono);
       ctx.has_error = true;
     }
   }
 
-  template <class T> Error &operator<<(T &&val) {
+  template <typename T> Error &operator<<(T &&val) {
     out << std::forward<T>(val);
     return *this;
   }
 
 private:
-  SyncOut<Context> out;
+  SyncStream out{std::cerr};
 };
 
 template <typename Context>
 class Warn {
 public:
-  Warn(Context &ctx)
-    : out(ctx, ctx.arg.suppress_warnings ? nullptr : &std::cerr) {
+  Warn(Context &ctx) {
+    if (ctx.arg.suppress_warnings)
+      return;
+
+    out.emplace(std::cerr);
+
     if (ctx.arg.fatal_warnings) {
-      out << add_color(ctx, "error");
+      *out << (ctx.arg.color_diagnostics ? error_color : error_mono);
       ctx.has_error = true;
     } else {
-      out << add_color(ctx, "warning");
+      *out << (ctx.arg.color_diagnostics ? warning_color : warning_mono);
     }
   }
 
-  template <class T> Warn &operator<<(T &&val) {
-    out << std::forward<T>(val);
+  template <typename T> Warn &operator<<(T &&val) {
+    if (out)
+      *out << std::forward<T>(val);
     return *this;
   }
 
 private:
-  SyncOut<Context> out;
+  std::optional<SyncStream> out;
 };
 
 //
@@ -526,7 +545,9 @@ inline bool remove_prefix(std::string_view &s, std::string_view prefix) {
 static inline void pause() {
 #if defined(__x86_64__)
   asm volatile("pause");
-#elif defined(__arm__) || defined(__aarch64__)
+#elif defined(__aarch64__)
+  asm volatile("yield");
+#elif defined(__ARM_ARCH_7A__) || defined(__ARM_ARCH_8A__)
   asm volatile("yield");
 #endif
 }
@@ -698,6 +719,12 @@ public:
   Entry *entries = nullptr;
   i64 nbuckets = 0;
 };
+
+//
+// random.cc
+//
+
+void get_random_bytes(u8 *buf, i64 size);
 
 //
 // output-file.h
@@ -980,6 +1007,9 @@ public:
   bool given_fullpath = true;
   MappedFile *parent = nullptr;
   MappedFile *thin_parent = nullptr;
+
+  // For --dependency-file
+  bool is_dependency = true;
 
 #ifdef _WIN32
   HANDLE fd = INVALID_HANDLE_VALUE;
