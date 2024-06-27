@@ -124,8 +124,10 @@ public:
 };
 
 struct ThunkRef {
-  i16 thunk_idx = -1;
-  i16 sym_idx = -1;
+  static constexpr i64 MAX_SYM_IDX = (1 << 17) - 1;
+
+  i32 thunk_idx : 14 = -1;
+  i32 sym_idx : 18 = -1;
 };
 
 //
@@ -262,8 +264,10 @@ public:
   std::string_view get_func_name(Context<E> &ctx, i64 offset) const;
   bool is_relr_reloc(Context<E> &ctx, const ElfRel<E> &rel) const;
   bool is_killed_by_icf() const;
-
   bool record_undef_error(Context<E> &ctx, const ElfRel<E> &rel);
+
+  std::pair<SectionFragment<E> *, i64>
+  get_fragment(Context<E> &ctx, const ElfRel<E> &rel);
 
   ObjectFile<E> &file;
   OutputSection<E> *output_section = nullptr;
@@ -321,9 +325,6 @@ private:
 
   void copy_contents_riscv(Context<E> &ctx, u8 *buf);
 
-  std::pair<SectionFragment<E> *, i64>
-  get_fragment(Context<E> &ctx, const ElfRel<E> &rel);
-
   u64 get_thunk_addr(i64 idx);
 
   std::optional<u64> get_tombstone(Symbol<E> &sym, SectionFragment<E> *frag);
@@ -340,6 +341,12 @@ template <typename E> u64 get_dtp_addr(Context<E> &);
 //
 // output-chunks.cc
 //
+
+template <typename E>
+OutputSection<E> *find_section(Context<E> &ctx, u32 sh_type);
+
+template <typename E>
+OutputSection<E> *find_section(Context<E> &ctx, std::string_view name);
 
 template <typename E>
 u64 get_eflags(Context<E> &ctx) {
@@ -684,13 +691,19 @@ private:
 template <typename E>
 class DynamicSection : public Chunk<E> {
 public:
-  DynamicSection() {
+  DynamicSection(Context<E> &ctx) {
     this->name = ".dynamic";
-    this->is_relro = true;
     this->shdr.sh_type = SHT_DYNAMIC;
-    this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
     this->shdr.sh_addralign = sizeof(Word<E>);
     this->shdr.sh_entsize = sizeof(ElfDyn<E>);
+
+    if (ctx.arg.z_rodynamic) {
+      this->shdr.sh_flags = SHF_ALLOC;
+      this->is_relro = false;
+    } else {
+      this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
+      this->is_relro = true;
+    }
   }
 
   void update_shdr(Context<E> &ctx) override;
@@ -771,7 +784,6 @@ public:
     this->shdr.sh_addralign = sizeof(Word<E>);
   }
 
-  std::span<Symbol<E> *> get_exported_symbols(Context<E> &ctx);
   void update_shdr(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
 
@@ -1678,7 +1690,7 @@ struct Context {
     Symbol<E> *entry = nullptr;
     Symbol<E> *fini = nullptr;
     Symbol<E> *init = nullptr;
-    UnresolvedKind unresolved_symbols = UNRESOLVED_ERROR;
+    UnresolvedKind unresolved_symbols = UNRESOLVED_IGNORE;
     BsymbolicKind Bsymbolic = BSYMBOLIC_NONE;
     bool allow_multiple_definition = false;
     bool apply_dynamic_relocs = true;
@@ -1733,7 +1745,6 @@ struct Context {
     bool warn_once = false;
     bool warn_textrel = false;
     bool z_copyreloc = true;
-    bool z_defs = false;
     bool z_delete = true;
     bool z_dlopen = true;
     bool z_dump = true;
@@ -1749,6 +1760,7 @@ struct Context {
     bool z_origin = false;
     bool z_relro = true;
     bool z_rewrite_endbr = false;
+    bool z_rodynamic = false;
     bool z_sectionheader = true;
     bool z_shstk = false;
     bool z_start_stop_visibility_protected = false;
@@ -1988,8 +2000,11 @@ template <typename E>
 class Symbol {
 public:
   Symbol() = default;
-  Symbol(std::string_view name) : nameptr(name.data()), namelen(name.size()) {}
-  Symbol(const Symbol<E> &other) : Symbol(other.name()) {}
+
+  Symbol(std::string_view name, bool demangle)
+    : nameptr(name.data()), namelen(name.size()), demangle(demangle) {}
+
+  Symbol(const Symbol<E> &other) : Symbol(other.name(), other.demangle) {}
 
   u64 get_addr(Context<E> &ctx, i64 flags = 0) const;
   u64 get_got_addr(Context<E> &ctx) const;
@@ -2210,12 +2225,18 @@ public:
   bool has_copyrel : 1 = false;
   bool is_copyrel_readonly : 1 = false;
 
+  // For --gc-sections
+  bool gc_root : 1 = false;
+
   // For LTO. True if the symbol is referenced by a regular object (as
   // opposed to IR object).
   bool referenced_by_regular_obj : 1 = false;
 
   // For `-z rewrite-endbr`
   bool address_taken : 1 = false;
+
+  // If true, we try to dmenagle the sybmol when printing.
+  bool demangle : 1 = false;
 
   // Target-dependent extra members.
   [[no_unique_address]] SymbolExtras<E> extra;
@@ -2232,13 +2253,7 @@ template <typename E>
 std::string_view demangle(const Symbol<E> &sym);
 
 template <typename E>
-std::ostream &operator<<(std::ostream &out, const Symbol<E> &sym) {
-  if (opt_demangle)
-    out << demangle(sym);
-  else
-    out << sym.name();
-  return out;
-}
+std::ostream &operator<<(std::ostream &out, const Symbol<E> &sym);
 
 //
 // Inline objects and functions
@@ -2291,7 +2306,7 @@ i64 get_addend(InputSection<E> &isec, const ElfRel<E> &rel) {
 template <typename E>
 void write_addend(u8 *loc, i64 val, const ElfRel<E> &rel);
 
-template <typename E> requires E::is_rela
+template <typename E> requires E::is_rela && (!is_sh4<E>)
 void write_addend(u8 *loc, i64 val, const ElfRel<E> &rel) {}
 
 template <typename E>
@@ -2453,24 +2468,6 @@ inline i64 ObjectFile<E>::get_shndx(const ElfSym<E> &esym) {
 template <typename E>
 inline InputSection<E> *ObjectFile<E>::get_section(const ElfSym<E> &esym) {
   return sections[get_shndx(esym)].get();
-}
-
-template <typename E>
-OutputSection<E> *find_section(Context<E> &ctx, u32 sh_type) {
-  for (Chunk<E> *chunk : ctx.chunks)
-    if (OutputSection<E> *osec = chunk->to_osec())
-      if (osec->shdr.sh_type == sh_type)
-        return osec;
-  return nullptr;
-}
-
-template <typename E>
-OutputSection<E> *find_section(Context<E> &ctx, std::string_view name) {
-  for (Chunk<E> *chunk : ctx.chunks)
-    if (OutputSection<E> *osec = chunk->to_osec())
-      if (osec->name == name)
-        return osec;
-  return nullptr;
 }
 
 template <typename E>

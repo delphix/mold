@@ -8,11 +8,11 @@
 #include <tbb/global_control.h>
 #include <unordered_set>
 
-#ifdef _WIN32
+#if __has_include(<unistd.h>)
+# include <unistd.h>
+#else
 # define isatty _isatty
 # define STDERR_FILENO (_fileno(stderr))
-#else
-# include <unistd.h>
 #endif
 
 namespace mold::elf {
@@ -209,6 +209,7 @@ Options:
   -z stack-size=VALUE         Set the size of the stack segment
   -z relro                    Make some sections read-only after relocation (default)
     -z norelro
+  -z rodynamic                Make the .dynamic section read-only
   -z text                     Report error if DT_TEXTREL is set
     -z notext
     -z textoff
@@ -225,6 +226,8 @@ read_response_file(Context<E> &ctx, std::string_view path, i64 depth) {
   std::vector<std::string_view> vec;
   MappedFile *mf = must_open_file(ctx, std::string(path));
   std::string_view data((char *)mf->data, mf->size);
+
+  mf->is_dependency = false;
 
   while (!data.empty()) {
     if (isspace(data[0])) {
@@ -519,7 +522,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
 
   bool version_shown = false;
   bool warn_shared_textrel = false;
+  bool error_unresolved_symbols = true;
   std::optional<SeparateCodeKind> z_separate_code;
+  std::optional<bool> report_undefined;
   std::optional<bool> z_relro;
   std::optional<u64> shuffle_sections_seed;
   std::unordered_set<std::string_view> rpaths;
@@ -537,10 +542,19 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if constexpr (is_riscv<E>)
     ctx.arg.discard_locals = true;
 
-  // It looks like the SPARC's dynamic linker takes both RELA's r_addend
-  // and the value at the relocated place. So we don't want to write
-  // values to relocated places.
-  if constexpr (is_sparc<E>)
+  // We generally don't need to write addends to relocated places if the
+  // relocation type is RELA because RELA records contain addends.
+  // However, there are too much code that wrongly assumes that addends
+  // are written to both RELA records and relocated places, so we write
+  // addends to relocated places by default. There are a few exceptions:
+  //
+  // - It looks like the SPARC's dynamic linker takes both RELA's r_addend
+  //   and the value at the relocated place. So we don't want to write
+  //   values to relocated places.
+  //
+  // - Static PIE binaries crash on startup in some RISC-V environment if
+  //   we write addends to relocated places.
+  if constexpr (is_sparc<E> || is_riscv<E>)
     ctx.arg.apply_dynamic_relocs = false;
 
   auto read_arg = [&](std::string name) {
@@ -614,8 +628,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
 
   while (!args.empty()) {
     if (read_flag("help")) {
-      SyncOut(ctx) << "Usage: " << ctx.cmdline_args[0]
-                   << " [options] file...\n" << helpmsg;
+      Out(ctx) << "Usage: " << ctx.cmdline_args[0]
+               << " [options] file...\n" << helpmsg;
       exit(0);
     }
 
@@ -626,19 +640,19 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("no-dynamic-linker")) {
       ctx.arg.dynamic_linker = "";
     } else if (read_flag("v")) {
-      SyncOut(ctx) << get_mold_version();
+      Out(ctx) << get_mold_version();
       version_shown = true;
     } else if (read_flag("version")) {
-      SyncOut(ctx) << get_mold_version();
+      Out(ctx) << get_mold_version();
       exit(0);
     } else if (read_flag("V")) {
-      SyncOut(ctx) << get_mold_version()
-                   << "\n  Supported emulations:\n   elf_x86_64\n   elf_i386\n"
-                   << "   aarch64linux\n   armelf_linux_eabi\n   elf64lriscv\n"
-                   << "   elf64briscv\n   elf32lriscv\n   elf32briscv\n"
-                   << "   elf32ppc\n   elf64ppc\n   elf64lppc\n   elf64_s390\n"
-                   << "   elf64_sparc\n   m68kelf\n   shlelf_linux\n"
-                   << "   elf64alpha\n   elf64loongarch\n   elf32loongarch";
+      Out(ctx) << get_mold_version()
+               << "\n  Supported emulations:\n   elf_x86_64\n   elf_i386\n"
+               << "   aarch64linux\n   armelf_linux_eabi\n   elf64lriscv\n"
+               << "   elf64briscv\n   elf32lriscv\n   elf32briscv\n"
+               << "   elf32ppc\n   elf64ppc\n   elf64lppc\n   elf64_s390\n"
+               << "   elf64_sparc\n   m68kelf\n   shlelf_linux\n"
+               << "   elf64alpha\n   elf64loongarch\n   elf32loongarch";
       version_shown = true;
     } else if (read_arg("m")) {
       if (arg == "elf_x86_64") {
@@ -773,9 +787,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.unique = std::move(*pat);
     } else if (read_arg("unresolved-symbols")) {
       if (arg == "report-all" || arg == "ignore-in-shared-libs")
-        ctx.arg.unresolved_symbols = UNRESOLVED_ERROR;
+        report_undefined = true;
       else if (arg == "ignore-all" || arg == "ignore-in-object-files")
-        ctx.arg.unresolved_symbols = UNRESOLVED_IGNORE;
+        report_undefined = false;
       else
         Fatal(ctx) << "unknown --unresolved-symbols argument: " << arg;
     } else if (read_arg("undefined") || read_arg("u")) {
@@ -955,10 +969,10 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       z_relro = true;
     } else if (read_z_flag("norelro")) {
       z_relro = false;
-    } else if (read_z_flag("defs")) {
-      ctx.arg.z_defs = true;
+    } else if (read_z_flag("defs") || read_flag("no-undefined")) {
+      report_undefined = true;
     } else if (read_z_flag("undefs")) {
-      ctx.arg.z_defs = false;
+      report_undefined = false;
     } else if (read_z_flag("nodlopen")) {
       ctx.arg.z_dlopen = false;
     } else if (read_z_flag("nodelete")) {
@@ -1008,8 +1022,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.z_sectionheader = false;
     } else if (read_z_flag("rewrite-endbr")) {
       ctx.arg.z_rewrite_endbr = true;
-    } else if (read_flag("no-undefined")) {
-      ctx.arg.z_defs = true;
+    } else if (read_z_flag("rodynamic")) {
+      ctx.arg.z_rodynamic = true;
     } else if (read_flag("nmagic")) {
       ctx.arg.nmagic = true;
     } else if (read_flag("no-nmagic")) {
@@ -1139,9 +1153,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("strip-debug") || read_flag("S")) {
       ctx.arg.strip_debug = true;
     } else if (read_flag("warn-unresolved-symbols")) {
-      ctx.arg.unresolved_symbols = UNRESOLVED_WARN;
+      error_unresolved_symbols = false;
     } else if (read_flag("error-unresolved-symbols")) {
-      ctx.arg.unresolved_symbols = UNRESOLVED_ERROR;
+      error_unresolved_symbols = true;
     } else if (read_arg("rpath")) {
       add_rpath(arg);
     } else if (read_arg("R")) {
@@ -1300,6 +1314,18 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if (ctx.arg.pic)
     ctx.arg.image_base = 0;
 
+  if (!report_undefined)
+    report_undefined = !ctx.arg.shared;
+
+  if (*report_undefined) {
+    if (error_unresolved_symbols)
+      ctx.arg.unresolved_symbols = UNRESOLVED_ERROR;
+    else
+      ctx.arg.unresolved_symbols = UNRESOLVED_WARN;
+  } else {
+    ctx.arg.unresolved_symbols = UNRESOLVED_IGNORE;
+  }
+
   if (ctx.arg.retain_symbols_file) {
     ctx.arg.strip_all = false;
     ctx.arg.discard_all = false;
@@ -1338,7 +1364,10 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       Fatal(ctx) << "-auxiliary may not be used without -shared";
   }
 
-  if constexpr (!E::is_rela)
+  // Even though SH4 is RELA, addends in its relocation records are always
+  // zero, and actual addends are written to relocated places. So we need
+  // to handle it as an exception.
+  if constexpr (!E::is_rela || is_sh4<E>)
     if (!ctx.arg.apply_dynamic_relocs)
       Fatal(ctx) << "--no-apply-dynamic-relocs may not be used on "
                  << E::target_name;
@@ -1403,6 +1432,13 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     if (!ctx.arg.dependency_file.empty())
       ctx.arg.dependency_file = ctx.arg.chroot + "/" + ctx.arg.dependency_file;
   }
+
+  // Mark GC root symbols
+  for (Symbol<E> *sym : ctx.arg.undefined)
+    sym->gc_root = true;
+  for (Symbol<E> *sym : ctx.arg.require_defined)
+    sym->gc_root = true;
+  ctx.arg.entry->gc_root = true;
 
   if (version_shown && remaining.empty())
     exit(0);

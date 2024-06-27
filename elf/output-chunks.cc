@@ -4,7 +4,6 @@
 #include "blake3.h"
 
 #include <cctype>
-#include <random>
 #include <set>
 #include <shared_mutex>
 #include <span>
@@ -33,6 +32,24 @@ static u32 djb_hash(std::string_view name) {
   for (u8 c : name)
     h = (h << 5) + h + c;
   return h;
+}
+
+template <typename E>
+OutputSection<E> *find_section(Context<E> &ctx, u32 sh_type) {
+  for (Chunk<E> *chunk : ctx.chunks)
+    if (OutputSection<E> *osec = chunk->to_osec())
+      if (osec->shdr.sh_type == sh_type)
+        return osec;
+  return nullptr;
+}
+
+template <typename E>
+OutputSection<E> *find_section(Context<E> &ctx, std::string_view name) {
+  for (Chunk<E> *chunk : ctx.chunks)
+    if (OutputSection<E> *osec = chunk->to_osec())
+      if (osec->name == name)
+        return osec;
+  return nullptr;
 }
 
 template <typename E>
@@ -254,7 +271,7 @@ static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
 
   // Add PT_DYNAMIC
   if (ctx.dynamic && ctx.dynamic->shdr.sh_size)
-    define(PT_DYNAMIC, PF_R | PF_W, ctx.dynamic);
+    define(PT_DYNAMIC, to_phdr_flags(ctx, ctx.dynamic), ctx.dynamic);
 
   // Add PT_GNU_EH_FRAME
   if (ctx.eh_frame_hdr)
@@ -823,7 +840,7 @@ static std::vector<Word<E>> create_dynamic_section(Context<E> &ctx) {
 
   // GDB needs a DT_DEBUG entry in an executable to store a word-size
   // data for its own purpose. Its content is not important.
-  if (!ctx.arg.shared)
+  if (!ctx.arg.shared && !ctx.arg.z_rodynamic)
     define(DT_DEBUG, 0);
 
   define(DT_NULL, 0);
@@ -1786,10 +1803,10 @@ void HashSection<E>::copy_buf(Context<E> &ctx) {
 }
 
 template <typename E>
-std::span<Symbol<E> *>
-GnuHashSection<E>::get_exported_symbols(Context<E> &ctx) {
+static std::span<Symbol<E> *> get_exported_symbols(Context<E> &ctx) {
   std::span<Symbol<E> *> syms = ctx.dynsym->symbols;
-  auto it = std::partition_point(syms.begin() + 1, syms.end(), [](Symbol<E> *sym) {
+  auto it = std::partition_point(syms.begin() + 1, syms.end(),
+                                 [](Symbol<E> *sym) {
     return !sym->is_exported;
   });
   return syms.subspan(it - syms.begin());
@@ -1835,7 +1852,7 @@ void GnuHashSection<E>::copy_buf(Context<E> &ctx) {
   for (i64 i = 0; i < syms.size(); i++) {
     constexpr i64 word_bits = sizeof(Word<E>) * 8;
 
-    i64 h = syms[i]->get_djb_hash(ctx);
+    u32 h = syms[i]->get_djb_hash(ctx);
     indices[i] = h % num_buckets;
 
     i64 idx = (h / word_bits) % num_bloom;
@@ -2025,9 +2042,9 @@ void MergedSection<E>::print_stats(Context<E> &ctx) {
     if (map.entries[i].key)
       used++;
 
-  SyncOut(ctx) << this->name
-               << " estimation=" << estimator.get_cardinality()
-               << " actual=" << used;
+  Out(ctx) << this->name
+           << " estimation=" << estimator.get_cardinality()
+           << " actual=" << used;
 }
 
 template <typename E>
@@ -2582,9 +2599,7 @@ void BuildIdSection<E>::write_buildid(Context<E> &ctx) {
     return;
   }
   case BuildId::UUID: {
-    std::random_device rand;
-    u32 tmp[4] = { rand(), rand(), rand(), rand() };
-    memcpy(buf, tmp, 16);
+    get_random_bytes(buf, 16);
 
     // Indicate that this is UUIDv4 as defined by RFC4122
     buf[6] = (buf[6] & 0b0000'1111) | 0b0100'0000;
@@ -2795,33 +2810,41 @@ void RelocSection<E>::update_shdr(Context<E> &ctx) {
 
 template <typename E>
 void RelocSection<E>::copy_buf(Context<E> &ctx) {
-  auto write = [&](ElfRel<E> &out, InputSection<E> &isec, const ElfRel<E> &rel) {
+  auto get_symidx_addend = [&](InputSection<E> &isec, const ElfRel<E> &rel)
+      -> std::pair<i64, i64> {
     Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
-    i64 symidx = 0;
-    i64 addend = 0;
+
+    if (!(isec.shdr().sh_flags & SHF_ALLOC)) {
+      SectionFragment<E> *frag;
+      i64 frag_addend;
+      std::tie(frag, frag_addend) = isec.get_fragment(ctx, rel);
+      if (frag)
+        return {frag->output_section.shndx, frag->offset + frag_addend};
+    }
 
     if (sym.esym().st_type == STT_SECTION) {
-      if (SectionFragment<E> *frag = sym.get_frag()) {
-        symidx = frag->output_section.shndx;
-        addend = frag->offset + sym.value + get_addend(isec, rel);
-      } else {
-        InputSection<E> *target = sym.get_input_section();
+      if (SectionFragment<E> *frag = sym.get_frag())
+        return {frag->output_section.shndx,
+                frag->offset + sym.value + get_addend(isec, rel)};
 
-        if (OutputSection<E> *osec = target->output_section) {
-          symidx = osec->shndx;
-          addend = get_addend(isec, rel) + target->offset;
-        } else if (isec.name() == ".eh_frame") {
-          symidx = ctx.eh_frame->shndx;
-          addend = get_addend(isec, rel);
-        } else {
-          // This is usually a dead debug section referring a
-          // COMDAT-eliminated section.
-        }
-      }
-    } else if (sym.write_to_symtab) {
-      symidx = sym.get_output_sym_idx(ctx);
-      addend = get_addend(isec, rel);
+      InputSection<E> *isec2 = sym.get_input_section();
+      if (OutputSection<E> *osec = isec2->output_section)
+        return {osec->shndx, get_addend(isec, rel) + isec2->offset};
+
+      // This is usually a dead debug section referring to a
+      // COMDAT-eliminated section.
+      return {0, 0};
     }
+
+    if (sym.write_to_symtab)
+      return {sym.get_output_sym_idx(ctx), get_addend(isec, rel)};
+    return {0, 0};
+  };
+
+  auto write = [&](ElfRel<E> &out, InputSection<E> &isec, const ElfRel<E> &rel) {
+    i64 symidx;
+    i64 addend;
+    std::tie(symidx, addend) = get_symidx_addend(isec, rel);
 
     if constexpr (is_alpha<E>)
       if (rel.r_type == R_ALPHA_GPDISP || rel.r_type == R_ALPHA_LITUSE)
@@ -2903,6 +2926,9 @@ template class GdbIndexSection<E>;
 template class CompressedSection<E>;
 template class RelocSection<E>;
 template class ComdatGroupSection<E>;
+
+template OutputSection<E> *find_section(Context<E> &, u32);
+template OutputSection<E> *find_section(Context<E> &, std::string_view);
 template i64 to_phdr_flags(Context<E> &ctx, Chunk<E> *chunk);
 template ElfSym<E> to_output_esym(Context<E> &, Symbol<E> &, u32, U32<E> *);
 
