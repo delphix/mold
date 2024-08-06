@@ -1,2 +1,3 @@
 fix-armhf-build.diff
 encoded-package-metadata.diff
+env-package-metadata.diff
