@@ -1,7 +1,7 @@
 mold (2.32.1+dfsg-3) UNRELEASED; urgency=medium
 
   * Add --encoded-package-metadata option (pulled from upstream, #1308).
-  * When No package-metadata option is given, fall-back to the
+  * When no package-metadata option is given, fall-back to the
     envvar ELF_PACKAGE_METADATA.
 
  -- Matthias Klose <doko@debian.org>  Tue, 06 Aug 2024 13:29:29 +0200
