@@ -1,6 +1,5 @@
 #include "mold.h"
 #include "../common/archive-file.h"
-#include "../common/cmdline.h"
 #include "../common/output-file.h"
 
 #include <cstring>
@@ -17,9 +16,15 @@
 
 #ifdef _WIN32
 # include <direct.h>
-# define _chdir chdir
+# define chdir _chdir
 #else
 # include <unistd.h>
+#endif
+
+#ifdef MOLD_X86_64
+int main(int argc, char **argv) {
+  return mold::elf::elf_main<mold::elf::X86_64>(argc, argv);
+}
 #endif
 
 namespace mold::elf {
@@ -27,7 +32,7 @@ namespace mold::elf {
 // Read the beginning of a given file and returns its machine type
 // (e.g. EM_X86_64 or EM_386).
 template <typename E>
-std::string_view get_machine_type(Context<E> &ctx, MappedFile<Context<E>> *mf) {
+std::string_view get_machine_type(Context<E> &ctx, MappedFile *mf) {
   auto get_elf_type = [&](u8 *buf) -> std::string_view {
     bool is_le = (((ElfEhdr<I386> *)buf)->e_ident[EI_DATA] == ELFDATA2LSB);
     bool is_64;
@@ -70,10 +75,6 @@ std::string_view get_machine_type(Context<E> &ctx, MappedFile<Context<E>> *mf) {
       return SH4::target_name;
     case EM_ALPHA:
       return ALPHA::target_name;
-    case EM_MIPS:
-      if (is_64)
-        return is_le ? MIPS64LE::target_name : MIPS64BE::target_name;
-      return "";
     case EM_LOONGARCH:
       return is_64 ? LOONGARCH64::target_name : LOONGARCH32::target_name;
     default:
@@ -87,13 +88,15 @@ std::string_view get_machine_type(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   case FileType::GCC_LTO_OBJ:
     return get_elf_type(mf->data);
   case FileType::AR:
-    for (MappedFile<Context<E>> *child : read_fat_archive_members(ctx, mf))
-      if (get_file_type(ctx, child) == FileType::ELF_OBJ)
+    for (MappedFile *child : read_fat_archive_members(ctx, mf))
+      if (FileType ty = get_file_type(ctx, child);
+          ty == FileType::ELF_OBJ || ty == FileType::GCC_LTO_OBJ)
         return get_elf_type(child->data);
     return "";
   case FileType::THIN_AR:
-    for (MappedFile<Context<E>> *child : read_thin_archive_members(ctx, mf))
-      if (get_file_type(ctx, child) == FileType::ELF_OBJ)
+    for (MappedFile *child : read_thin_archive_members(ctx, mf))
+      if (FileType ty = get_file_type(ctx, child);
+          ty == FileType::ELF_OBJ || ty == FileType::GCC_LTO_OBJ)
         return get_elf_type(child->data);
     return "";
   case FileType::TEXT:
@@ -105,7 +108,7 @@ std::string_view get_machine_type(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 
 template <typename E>
 static void
-check_file_compatibility(Context<E> &ctx, MappedFile<Context<E>> *mf) {
+check_file_compatibility(Context<E> &ctx, MappedFile *mf) {
   std::string_view target = get_machine_type(ctx, mf);
   if (target != ctx.arg.emulation)
     Fatal(ctx) << mf->name << ": incompatible file type: "
@@ -113,7 +116,7 @@ check_file_compatibility(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 }
 
 template <typename E>
-static ObjectFile<E> *new_object_file(Context<E> &ctx, MappedFile<Context<E>> *mf,
+static ObjectFile<E> *new_object_file(Context<E> &ctx, MappedFile *mf,
                                       std::string archive_name) {
   static Counter count("parsed_objs");
   count++;
@@ -125,12 +128,12 @@ static ObjectFile<E> *new_object_file(Context<E> &ctx, MappedFile<Context<E>> *m
   file->priority = ctx.file_priority++;
   ctx.tg.run([file, &ctx] { file->parse(ctx); });
   if (ctx.arg.trace)
-    SyncOut(ctx) << "trace: " << *file;
+    Out(ctx) << "trace: " << *file;
   return file;
 }
 
 template <typename E>
-static ObjectFile<E> *new_lto_obj(Context<E> &ctx, MappedFile<Context<E>> *mf,
+static ObjectFile<E> *new_lto_obj(Context<E> &ctx, MappedFile *mf,
                                   std::string archive_name) {
   static Counter count("parsed_lto_objs");
   count++;
@@ -143,27 +146,26 @@ static ObjectFile<E> *new_lto_obj(Context<E> &ctx, MappedFile<Context<E>> *mf,
   file->archive_name = archive_name;
   file->is_in_lib = ctx.in_lib || (!archive_name.empty() && !ctx.whole_archive);
   file->is_alive = !file->is_in_lib;
-  ctx.has_lto_object = true;
   if (ctx.arg.trace)
-    SyncOut(ctx) << "trace: " << *file;
+    Out(ctx) << "trace: " << *file;
   return file;
 }
 
 template <typename E>
 static SharedFile<E> *
-new_shared_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
+new_shared_file(Context<E> &ctx, MappedFile *mf) {
   check_file_compatibility(ctx, mf);
 
   SharedFile<E> *file = SharedFile<E>::create(ctx, mf);
   file->priority = ctx.file_priority++;
   ctx.tg.run([file, &ctx] { file->parse(ctx); });
   if (ctx.arg.trace)
-    SyncOut(ctx) << "trace: " << *file;
+    Out(ctx) << "trace: " << *file;
   return file;
 }
 
 template <typename E>
-void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
+void read_file(Context<E> &ctx, MappedFile *mf) {
   if (ctx.visited.contains(mf->name))
     return;
 
@@ -177,7 +179,7 @@ void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
     return;
   case FileType::AR:
   case FileType::THIN_AR:
-    for (MappedFile<Context<E>> *child : read_archive_members(ctx, mf)) {
+    for (MappedFile *child : read_archive_members(ctx, mf)) {
       switch (get_file_type(ctx, child)) {
       case FileType::ELF_OBJ:
         ctx.objs.push_back(new_object_file(ctx, child, mf->name));
@@ -195,7 +197,8 @@ void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
         break;
       }
     }
-    ctx.visited.insert(mf->name);
+    if (!ctx.whole_archive)
+      ctx.visited.insert(mf->name);
     return;
   case FileType::TEXT:
     parse_linker_script(ctx, mf);
@@ -212,36 +215,47 @@ void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 
 template <typename E>
 static std::string_view
-deduce_machine_type(Context<E> &ctx, std::span<std::string> args) {
-  for (std::string_view arg : args)
-    if (!arg.starts_with('-'))
-      if (auto *mf = MappedFile<Context<E>>::open(ctx, std::string(arg)))
+detect_machine_type(Context<E> &ctx, std::vector<std::string> paths) {
+  std::erase(paths, "-");
+
+  for (const std::string &path : paths)
+    if (auto *mf = open_file(ctx, path))
+      if (get_file_type(ctx, mf) != FileType::TEXT)
         if (std::string_view target = get_machine_type(ctx, mf);
             !target.empty())
           return target;
+
+  for (const std::string &path : paths)
+    if (auto *mf = open_file(ctx, path))
+      if (get_file_type(ctx, mf) == FileType::TEXT)
+        if (std::string_view target = get_script_output_type(ctx, mf);
+            !target.empty())
+          return target;
+
   Fatal(ctx) << "-m option is missing";
 }
 
 template <typename E>
-MappedFile<Context<E>> *open_library(Context<E> &ctx, std::string path) {
-  MappedFile<Context<E>> *mf = MappedFile<Context<E>>::open(ctx, path);
+MappedFile *open_library(Context<E> &ctx, std::string path) {
+  MappedFile *mf = open_file(ctx, path);
   if (!mf)
     return nullptr;
 
   std::string_view target = get_machine_type(ctx, mf);
-  if (target.empty() || target == E::target_name)
-    return mf;
-  Warn(ctx) << path << ": skipping incompatible file " << target
-            << " " << (int)E::e_machine;
-  return nullptr;
+  if (!target.empty() && target != E::target_name) {
+    Warn(ctx) << path << ": skipping incompatible file: " << target
+              << " (e_machine " << (int)E::e_machine << ")";
+    return nullptr;
+  }
+  return mf;
 }
 
 template <typename E>
-MappedFile<Context<E>> *find_library(Context<E> &ctx, std::string name) {
+MappedFile *find_library(Context<E> &ctx, std::string name) {
   if (name.starts_with(':')) {
     for (std::string_view dir : ctx.arg.library_paths) {
       std::string path = std::string(dir) + "/" + name.substr(1);
-      if (MappedFile<Context<E>> *mf = open_library(ctx, path))
+      if (MappedFile *mf = open_library(ctx, path))
         return mf;
     }
     Fatal(ctx) << "library not found: " << name;
@@ -250,22 +264,22 @@ MappedFile<Context<E>> *find_library(Context<E> &ctx, std::string name) {
   for (std::string_view dir : ctx.arg.library_paths) {
     std::string stem = std::string(dir) + "/lib" + name;
     if (!ctx.is_static)
-      if (MappedFile<Context<E>> *mf = open_library(ctx, stem + ".so"))
+      if (MappedFile *mf = open_library(ctx, stem + ".so"))
         return mf;
-    if (MappedFile<Context<E>> *mf = open_library(ctx, stem + ".a"))
+    if (MappedFile *mf = open_library(ctx, stem + ".a"))
       return mf;
   }
   Fatal(ctx) << "library not found: " << name;
 }
 
 template <typename E>
-MappedFile<Context<E>> *find_from_search_paths(Context<E> &ctx, std::string name) {
-  if (MappedFile<Context<E>> *mf = MappedFile<Context<E>>::open(ctx, name))
+MappedFile *find_from_search_paths(Context<E> &ctx, std::string name) {
+  if (MappedFile *mf = open_file(ctx, name))
     return mf;
 
   for (std::string_view dir : ctx.arg.library_paths)
-    if (MappedFile<Context<E>> *mf =
-        MappedFile<Context<E>>::open(ctx, std::string(dir) + "/" + name))
+    if (MappedFile *mf =
+        open_file(ctx, std::string(dir) + "/" + name))
       return mf;
   return nullptr;
 }
@@ -298,26 +312,10 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
     } else if (arg == "--end-lib") {
       ctx.in_lib = false;
     } else if (remove_prefix(arg, "--version-script=")) {
-      MappedFile<Context<E>> *mf = find_from_search_paths(ctx, std::string(arg));
+      MappedFile *mf = find_from_search_paths(ctx, std::string(arg));
       if (!mf)
         Fatal(ctx) << "--version-script: file not found: " << arg;
       parse_version_script(ctx, mf);
-    } else if (remove_prefix(arg, "--dynamic-list=")) {
-      MappedFile<Context<E>> *mf = find_from_search_paths(ctx, std::string(arg));
-      if (!mf)
-        Fatal(ctx) << "--dynamic-list: file not found: " << arg;
-      parse_dynamic_list(ctx, mf);
-    } else if (remove_prefix(arg, "--export-dynamic-symbol=")) {
-      if (arg == "*")
-        ctx.default_version = VER_NDX_GLOBAL;
-      else
-        ctx.version_patterns.push_back({arg, "--export-dynamic-symbol",
-                                        "global", VER_NDX_GLOBAL, false});
-    } else if (remove_prefix(arg, "--export-dynamic-symbol-list=")) {
-      MappedFile<Context<E>> *mf = find_from_search_paths(ctx, std::string(arg));
-      if (!mf)
-        Fatal(ctx) << "--export-dynamic-symbol-list: file not found: " << arg;
-      parse_dynamic_list(ctx, mf);
     } else if (arg == "--push-state") {
       state.push_back({ctx.as_needed, ctx.whole_archive, ctx.is_static,
                        ctx.in_lib});
@@ -328,11 +326,11 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
         state.back();
       state.pop_back();
     } else if (remove_prefix(arg, "-l")) {
-      MappedFile<Context<E>> *mf = find_library(ctx, std::string(arg));
+      MappedFile *mf = find_library(ctx, std::string(arg));
       mf->given_fullpath = false;
       read_file(ctx, mf);
     } else {
-      read_file(ctx, MappedFile<Context<E>>::must_open(ctx, std::string(arg)));
+      read_file(ctx, must_open_file(ctx, std::string(arg)));
     }
   }
 
@@ -340,52 +338,6 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
     Fatal(ctx) << "no input files";
 
   ctx.tg.wait();
-}
-
-// Since elf_main is a template, we can't run it without a type parameter.
-// We speculatively run elf_main with X86_64, and if the speculation was
-// wrong, re-run it with an actual machine type.
-template <typename E>
-static int redo_main(int argc, char **argv, std::string_view target) {
-  if (target == I386::target_name)
-    return elf_main<I386>(argc, argv);
-  if (target == ARM64::target_name)
-    return elf_main<ARM64>(argc, argv);
-  if (target == ARM32::target_name)
-    return elf_main<ARM32>(argc, argv);
-  if (target == RV64LE::target_name)
-    return elf_main<RV64LE>(argc, argv);
-  if (target == RV64BE::target_name)
-    return elf_main<RV64BE>(argc, argv);
-  if (target == RV32LE::target_name)
-    return elf_main<RV32LE>(argc, argv);
-  if (target == RV32BE::target_name)
-    return elf_main<RV32BE>(argc, argv);
-  if (target == PPC32::target_name)
-    return elf_main<PPC32>(argc, argv);
-  if (target == PPC64V1::target_name)
-    return elf_main<PPC64V1>(argc, argv);
-  if (target == PPC64V2::target_name)
-    return elf_main<PPC64V2>(argc, argv);
-  if (target == S390X::target_name)
-    return elf_main<S390X>(argc, argv);
-  if (target == SPARC64::target_name)
-    return elf_main<SPARC64>(argc, argv);
-  if (target == M68K::target_name)
-    return elf_main<M68K>(argc, argv);
-  if (target == SH4::target_name)
-    return elf_main<SH4>(argc, argv);
-  if (target == ALPHA::target_name)
-    return elf_main<ALPHA>(argc, argv);
-  if (target == MIPS64LE::target_name)
-    return elf_main<MIPS64LE>(argc, argv);
-  if (target == MIPS64BE::target_name)
-    return elf_main<MIPS64BE>(argc, argv);
-  if (target == LOONGARCH32::target_name)
-    return elf_main<LOONGARCH32>(argc, argv);
-  if (target == LOONGARCH64::target_name)
-    return elf_main<LOONGARCH64>(argc, argv);
-  unreachable();
 }
 
 template <typename E>
@@ -406,12 +358,12 @@ int elf_main(int argc, char **argv) {
 
   // If no -m option is given, deduce it from input files.
   if (ctx.arg.emulation.empty())
-    ctx.arg.emulation = deduce_machine_type(ctx, file_args);
+    ctx.arg.emulation = detect_machine_type(ctx, file_args);
 
   // Redo if -m is not x86-64.
   if constexpr (is_x86_64<E>)
     if (ctx.arg.emulation != X86_64::target_name)
-      return redo_main<E>(argc, argv, ctx.arg.emulation);
+      return redo_main(ctx, argc, argv);
 
   Timer t_all(ctx, "all");
 
@@ -430,7 +382,7 @@ int elf_main(int argc, char **argv) {
     on_complete = fork_child();
 #endif
 
-  acquire_global_lock(ctx);
+  acquire_global_lock();
 
   tbb::global_control tbb_cont(tbb::global_control::max_allowed_parallelism,
                                ctx.arg.thread_count);
@@ -482,6 +434,9 @@ int elf_main(int argc, char **argv) {
   // "Kill" .eh_frame input sections after symbol resolution.
   kill_eh_frame_sections(ctx);
 
+  // Split mergeable section contents into section pieces.
+  split_section_pieces(ctx);
+
   // Resolve mergeable section pieces to merge them.
   resolve_section_pieces(ctx);
 
@@ -505,9 +460,9 @@ int elf_main(int argc, char **argv) {
   // Set is_imported and is_exported bits for each symbol.
   compute_import_export(ctx);
 
-  // Read address-significant section information.
-  if (ctx.arg.icf && !ctx.arg.icf_all)
-    mark_addrsig(ctx);
+  // Set "address-taken" bits for input sections.
+  if (ctx.arg.icf)
+    compute_address_significance(ctx);
 
   // Garbage-collect unreachable sections.
   if (ctx.arg.gc_sections)
@@ -535,6 +490,10 @@ int elf_main(int argc, char **argv) {
 
   // Bin input sections into output sections.
   create_output_sections(ctx);
+
+  // Handle --section-align options.
+  if (!ctx.arg.section_align.empty())
+    apply_section_align(ctx);
 
   // Add synthetic symbols such as __ehdr_start or __end.
   add_synthetic_symbols(ctx);
@@ -572,9 +531,9 @@ int elf_main(int argc, char **argv) {
     write_repro_file(ctx);
 
   // Handle --require-defined
-  for (std::string_view name : ctx.arg.require_defined)
-    if (!get_symbol(ctx, name)->file)
-      Error(ctx) << "--require-defined: undefined symbol: " << name;
+  for (Symbol<E> *sym : ctx.arg.require_defined)
+    if (!sym->file)
+      Error(ctx) << "--require-defined: undefined symbol: " << *sym;
 
   // .init_array and .fini_array contents have to be sorted by
   // a special rule. Sort them.
@@ -583,6 +542,10 @@ int elf_main(int argc, char **argv) {
   // Likewise, .ctors and .dtors have to be sorted. They are rare
   // because they are superceded by .init_array/.fini_array, though.
   sort_ctor_dtor(ctx);
+
+  // If .ctors/.dtors are to be placed to .init_array/.fini_array,
+  // we need to reverse their contents.
+  fixup_ctors_in_init_array(ctx);
 
   // Handle --shuffle-sections
   if (ctx.arg.shuffle_sections != SHUFFLE_SECTIONS_NONE)
@@ -606,6 +569,9 @@ int elf_main(int argc, char **argv) {
   // Scan relocations to find symbols that need entries in .got, .plt,
   // .got.plt, .dynsym, .dynstr, etc.
   scan_relocations(ctx);
+
+  // Compute the is_weak bit for each imported symbol.
+  compute_imported_symbol_weakness(ctx);
 
   // Compute sizes of output sections while assigning offsets
   // within an output section to input sections.
@@ -645,10 +611,6 @@ int elf_main(int argc, char **argv) {
   // unlike other sections that are regarded as opaque bytes.
   // Here, we construct output .eh_frame contents.
   ctx.eh_frame->construct(ctx);
-
-  // Handle --gdb-index.
-  if (ctx.arg.gdb_index)
-    ctx.gdb_index->construct(ctx);
 
   // If --emit-relocs is given, we'll copy relocation sections from input
   // files to an output file.
@@ -695,11 +657,8 @@ int elf_main(int argc, char **argv) {
   // Copy input sections to the output file and apply relocations.
   copy_chunks(ctx);
 
-  // Some part of .gdb_index couldn't be computed until other debug
-  // sections are complete. We have complete debug sections now, so
-  // write the rest of .gdb_index.
-  if (ctx.gdb_index)
-    ctx.gdb_index->write_address_areas(ctx);
+  if (ctx.arg.z_rewrite_endbr)
+    rewrite_endbr(ctx);
 
   // Dynamic linker works better with sorted .rela.dyn section,
   // so we sort them.
@@ -707,6 +666,12 @@ int elf_main(int argc, char **argv) {
 
   // Zero-clear paddings between sections
   clear_padding(ctx);
+
+  // .gdb_index's contents cannot be constructed before applying
+  // relocations to other debug sections. We have relocated debug
+  // sections now, so write the .gdb_index section.
+  if (ctx.gdb_index)
+    write_gdb_index(ctx);
 
   // .note.gnu.build-id section contains a cryptographic hash of the
   // entire output file. Now that we wrote everything except build-id,
@@ -724,7 +689,7 @@ int elf_main(int argc, char **argv) {
   if (!ctx.arg.dependency_file.empty())
     write_dependency_file(ctx);
 
-  if (ctx.has_lto_object)
+  if (!ctx.arg.plugin.empty())
     lto_cleanup(ctx);
 
   t_all.stop();
@@ -741,10 +706,11 @@ int elf_main(int argc, char **argv) {
 
   std::cout << std::flush;
   std::cerr << std::flush;
+
   if (on_complete)
     on_complete();
 
-  release_global_lock(ctx);
+  release_global_lock();
 
   if (ctx.arg.quick_exit)
     _exit(0);
@@ -757,39 +723,6 @@ int elf_main(int argc, char **argv) {
 
 using E = MOLD_TARGET;
 
-template void read_file(Context<E> &, MappedFile<Context<E>> *);
-template MappedFile<Context<E>> *open_library(Context<E> &, std::string);
-
-#ifdef MOLD_X86_64
-
-extern template int elf_main<I386>(int, char **);
-extern template int elf_main<ARM32>(int, char **);
-extern template int elf_main<ARM64>(int, char **);
-extern template int elf_main<RV32BE>(int, char **);
-extern template int elf_main<RV32LE>(int, char **);
-extern template int elf_main<RV64LE>(int, char **);
-extern template int elf_main<RV64BE>(int, char **);
-extern template int elf_main<PPC32>(int, char **);
-extern template int elf_main<PPC64V1>(int, char **);
-extern template int elf_main<PPC64V2>(int, char **);
-extern template int elf_main<S390X>(int, char **);
-extern template int elf_main<SPARC64>(int, char **);
-extern template int elf_main<M68K>(int, char **);
-extern template int elf_main<SH4>(int, char **);
-extern template int elf_main<ALPHA>(int, char **);
-extern template int elf_main<MIPS64LE>(int, char **);
-extern template int elf_main<MIPS64BE>(int, char **);
-extern template int elf_main<LOONGARCH32>(int, char **);
-extern template int elf_main<LOONGARCH64>(int, char **);
-
-int main(int argc, char **argv) {
-  return elf_main<X86_64>(argc, argv);
-}
-
-#else
-
 template int elf_main<E>(int, char **);
-
-#endif
 
 } // namespace mold::elf

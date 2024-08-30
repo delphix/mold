@@ -52,10 +52,10 @@ void write_plt_header(Context<E> &ctx, u8 *buf) {
     0xf940'0211, // ldr  x17, [x16, .got.plt[2]]
     0x9100'0210, // add  x16, x16, .got.plt[2]
     0xd61f'0220, // br   x17
-    0xd503'201f, // nop
-    0xd503'201f, // nop
-    0xd503'201f, // nop
-  };
+    0xd420'7d00, // brk
+    0xd420'7d00, // brk
+    0xd420'7d00, // brk
+ };
 
   u64 gotplt = ctx.gotplt->shdr.sh_addr + 16;
   u64 plt = ctx.plt->shdr.sh_addr;
@@ -90,10 +90,10 @@ void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
     0x9000'0010, // adrp x16, GOT[n]
     0xf940'0211, // ldr  x17, [x16, GOT[n]]
     0xd61f'0220, // br   x17
-    0xd503'201f, // nop
+    0xd420'7d00, // brk
   };
 
-  u64 got = sym.get_got_addr(ctx);
+  u64 got = sym.get_got_pltgot_addr(ctx);
   u64 plt = sym.get_plt_addr(ctx);
 
   memcpy(buf, insn, sizeof(insn));
@@ -238,10 +238,12 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       // :lo12: foo` instruction pair to materialize a PC-relative address
       // in a register can be relaxed to `NOP` followed by `ADR x0, foo`
       // if foo is in PC ± 1 MiB.
-      if (ctx.arg.relax && i + 1 < rels.size() &&
-          sign_extend(S + A - P - 4, 20) == S + A - P - 4) {
+      if (ctx.arg.relax && sym.is_pcrel_linktime_const(ctx) &&
+          i + 1 < rels.size()) {
+        i64 val = S + A - P - 4;
         const ElfRel<E> &rel2 = rels[i + 1];
-        if (rel2.r_type == R_AARCH64_ADD_ABS_LO12_NC &&
+        if (sign_extend(val, 20) == val &&
+            rel2.r_type == R_AARCH64_ADD_ABS_LO12_NC &&
             rel2.r_sym == rel.r_sym &&
             rel2.r_offset == rel.r_offset + 4 &&
             rel2.r_addend == rel.r_addend &&
@@ -252,7 +254,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
           if (reg1 == reg2) {
             *(ul32 *)loc = 0xd503'201f;              // nop
             *(ul32 *)(loc + 4) = 0x1000'0000 | reg1; // adr
-            write_adr(loc + 4, S + A - P - 4);
+            write_adr(loc + 4, val);
             i++;
             break;
           }
@@ -369,38 +371,65 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul32 *)loc |= bits(sym.get_tlsgd_addr(ctx) + A, 11, 0) << 10;
       break;
     case R_AARCH64_TLSDESC_ADR_PAGE21:
+      // ARM64 TLSDESC uses the following code sequence to materialize
+      // a TP-relative address in x0.
+      //
+      //   adrp    x0, 0
+      //       R_AARCH64_TLSDESC_ADR_PAGE21 foo
+      //   ldr     x1, [x0]
+      //       R_AARCH64_TLSDESC_LD64_LO12  foo
+      //   add     x0, x0, #0
+      //       R_AARCH64_TLSDESC_ADD_LO12   foo
+      //   blr     x1
+      //       R_AARCH64_TLSDESC_CALL       foo
+      //
+      // We may relax the instructions to the following for non-dlopen'd DSO
+      //
+      //   nop
+      //   nop
+      //   adrp    x0, :gottprel:foo
+      //   ldr     x0, [x0, :gottprel_lo12:foo]
+      //
+      // or to the following for executable.
+      //
+      //   nop
+      //   nop
+      //   movz    x0, :tls_offset_hi:foo, lsl #16
+      //   movk    x0, :tls_offset_lo:foo
       if (sym.has_tlsdesc(ctx)) {
         i64 val = page(sym.get_tlsdesc_addr(ctx) + A) - page(P);
         check(val, -(1LL << 32), 1LL << 32);
         write_adrp(loc, val);
       } else {
-        // adrp x0, 0 -> movz x0, #tls_ofset_hi, lsl #16
-        i64 val = (S + A - ctx.tp_addr);
-        check(val, -(1LL << 32), 1LL << 32);
-        *(ul32 *)loc = 0xd2a0'0000 | (bits(val, 32, 16) << 5);
+        *(ul32 *)loc = 0xd503'201f; // nop
       }
       break;
     case R_AARCH64_TLSDESC_LD64_LO12:
-      if (sym.has_tlsdesc(ctx)) {
+      if (sym.has_tlsdesc(ctx))
         *(ul32 *)loc |= bits(sym.get_tlsdesc_addr(ctx) + A, 11, 3) << 10;
-      } else {
-        // ldr x2, [x0] -> movk x0, #tls_ofset_lo
-        u32 offset_lo = (S + A - ctx.tp_addr) & 0xffff;
-        *(ul32 *)loc = 0xf280'0000 | (offset_lo << 5);
-      }
+      else
+        *(ul32 *)loc = 0xd503'201f; // nop
       break;
     case R_AARCH64_TLSDESC_ADD_LO12:
       if (sym.has_tlsdesc(ctx)) {
         *(ul32 *)loc |= bits(sym.get_tlsdesc_addr(ctx) + A, 11, 0) << 10;
+      } else if (sym.has_gottp(ctx)) {
+        *(ul32 *)loc = 0x9000'0000; // adrp x0, 0
+        write_adrp(loc, page(sym.get_gottp_addr(ctx) + A) - page(P));
       } else {
-        // add x0, x0, #0 -> nop
-        *(ul32 *)loc = 0xd503'201f;
+        *(ul32 *)loc = 0xd2a0'0000; // movz x0, 0, lsl #16
+        *(ul32 *)loc |= bits(S + A - ctx.tp_addr, 32, 16) << 5;
       }
       break;
     case R_AARCH64_TLSDESC_CALL:
-      if (!sym.has_tlsdesc(ctx)) {
-        // blr x2 -> nop
-        *(ul32 *)loc = 0xd503'201f;
+      if (sym.has_tlsdesc(ctx)) {
+        // Do nothing
+      } else if (sym.has_gottp(ctx)) {
+        *(ul32 *)loc = 0xf940'0000; // ldr x0, [x0, 0]
+        *(ul32 *)loc |= bits(sym.get_gottp_addr(ctx) + A, 11, 3) << 10;
+      } else {
+        *(ul32 *)loc = 0xf280'0000; // movk x0, 0
+        *(ul32 *)loc |= bits(S + A - ctx.tp_addr, 15, 0) << 5;
       }
       break;
     default:
@@ -487,8 +516,8 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       // symbol's address from GOT. If the GOT value is a link-time
       // constant, we may be able to rewrite the ADRP+LDR instruction pair
       // with an ADRP+ADD, eliminating a GOT memory load.
-      if (ctx.arg.relax && sym.is_relative() && !sym.is_imported &&
-          !sym.is_ifunc() && i + 1 < rels.size()) {
+      if (ctx.arg.relax && sym.is_pcrel_linktime_const(ctx) &&
+          i + 1 < rels.size()) {
         // ADRP+LDR must be consecutive and use the same register to relax.
         const ElfRel<E> &rel2 = rels[i + 1];
         if (rel2.r_type == R_AARCH64_LD64_GOT_LO12_NC &&
@@ -531,8 +560,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       sym.flags |= NEEDS_TLSGD;
       break;
     case R_AARCH64_TLSDESC_CALL:
-      if (!relax_tlsdesc(ctx, sym))
-        sym.flags |= NEEDS_TLSDESC;
+      scan_tlsdesc(ctx, sym);
       break;
     case R_AARCH64_TLSLE_MOVW_TPREL_G2:
     case R_AARCH64_TLSLE_ADD_TPREL_LO12:
@@ -574,25 +602,27 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 }
 
 template <>
-void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
-
-  static const ul32 data[] = {
+void Thunk<E>::copy_buf(Context<E> &ctx) {
+  static const ul32 insn[] = {
     0x9000'0010, // adrp x16, 0   # R_AARCH64_ADR_PREL_PG_HI21
     0x9100'0210, // add  x16, x16 # R_AARCH64_ADD_ABS_LO12_NC
     0xd61f'0200, // br   x16
+    0xd420'7d00, // brk
   };
 
-  static_assert(E::thunk_size == sizeof(data));
+  static_assert(E::thunk_size == sizeof(insn));
 
-  for (i64 i = 0; i < symbols.size(); i++) {
-    u64 S = symbols[i]->get_addr(ctx);
-    u64 P = output_section.shdr.sh_addr + offset + i * E::thunk_size;
+  u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
+  u64 P = output_section.shdr.sh_addr + offset;
 
-    u8 *loc = buf + i * E::thunk_size;
-    memcpy(loc, data, sizeof(data));
-    write_adrp(loc, page(S) - page(P));
-    *(ul32 *)(loc + 4) |= bits(S, 11, 0) << 10;
+  for (Symbol<E> *sym : symbols) {
+    u64 S = sym->get_addr(ctx);
+    memcpy(buf, insn, E::thunk_size);
+    write_adrp(buf, page(S) - page(P));
+    *(ul32 *)(buf + 4) |= bits(S, 11, 0) << 10;
+
+    buf += E::thunk_size;
+    P += E::thunk_size;
   }
 }
 

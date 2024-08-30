@@ -39,11 +39,16 @@ open_or_create_file(Context &ctx, std::string path, i64 filesize, i64 perm) {
       Fatal(ctx) << "cannot open " << path2 << ": " << errno_string();
   }
 
-  if (ftruncate(fd, filesize))
-    Fatal(ctx) << "ftruncate failed: " << errno_string();
-
   if (fchmod(fd, (perm & ~get_umask())) == -1)
     Fatal(ctx) << "fchmod failed: " << errno_string();
+
+#ifdef __linux__
+  if (fallocate(fd, 0, 0, filesize) == 0)
+    return {fd, path2};
+#endif
+
+  if (ftruncate(fd, filesize) == -1)
+    Fatal(ctx) << "ftruncate failed: " << errno_string();
   return {fd, path2};
 }
 
@@ -52,14 +57,13 @@ class MemoryMappedOutputFile : public OutputFile<Context> {
 public:
   MemoryMappedOutputFile(Context &ctx, std::string path, i64 filesize, i64 perm)
     : OutputFile<Context>(path, filesize, true) {
-    i64 fd;
-    std::tie(fd, output_tmpfile) = open_or_create_file(ctx, path, filesize, perm);
+    std::tie(this->fd, output_tmpfile) =
+      open_or_create_file(ctx, path, filesize, perm);
 
     this->buf = (u8 *)mmap(nullptr, filesize, PROT_READ | PROT_WRITE,
-                           MAP_SHARED, fd, 0);
+                           MAP_SHARED, this->fd, 0);
     if (this->buf == MAP_FAILED)
       Fatal(ctx) << path << ": mmap failed: " << errno_string();
-    ::close(fd);
 
     mold::output_buffer_start = this->buf;
     mold::output_buffer_end = this->buf + filesize;
@@ -76,6 +80,15 @@ public:
     if (!this->is_unmapped)
       munmap(this->buf, this->filesize);
 
+    if (this->buf2.empty()) {
+      ::close(this->fd);
+    } else {
+      FILE *out = fdopen(this->fd, "w");
+      fseek(out, 0, SEEK_END);
+      fwrite(&this->buf2[0], this->buf2.size(), 1, out);
+      fclose(out);
+    }
+
     // If an output file already exists, open a file and then remove it.
     // This is the fastest way to unlink a file, as it does not make the
     // system to immediately release disk blocks occupied by the file.
@@ -90,39 +103,6 @@ public:
 
 private:
   int fd2 = -1;
-};
-
-template <typename Context>
-class MallocOutputFile : public OutputFile<Context> {
-public:
-  MallocOutputFile(Context &ctx, std::string path, i64 filesize, i64 perm)
-    : OutputFile<Context>(path, filesize, false), perm(perm) {
-    this->buf = (u8 *)mmap(NULL, filesize, PROT_READ | PROT_WRITE,
-                           MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (this->buf == MAP_FAILED)
-      Fatal(ctx) << "mmap failed: " << errno_string();
-  }
-
-  void close(Context &ctx) override {
-    Timer t(ctx, "close_file");
-
-    if (this->path == "-") {
-      fwrite(this->buf, this->filesize, 1, stdout);
-      fclose(stdout);
-      return;
-    }
-
-    i64 fd = ::open(this->path.c_str(), O_RDWR | O_CREAT, perm);
-    if (fd == -1)
-      Fatal(ctx) << "cannot open " << this->path << ": " << errno_string();
-
-    FILE *fp = fdopen(fd, "w");
-    fwrite(this->buf, this->filesize, 1, fp);
-    fclose(fp);
-  }
-
-private:
-  i64 perm;
 };
 
 template <typename Context>

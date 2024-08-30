@@ -1,10 +1,11 @@
 #!/bin/bash
 . $(dirname $0)/common.inc
 
+[ $MACHINE = m68k ] && skip
 [ $MACHINE = sh4 ] && skip
 
 static=
-test_cflags -static && static=-static
+test_cxxflags -static && static=-static
 
 # I don't know why, but we need -pthread on m68k
 static="$static -pthread"
@@ -62,7 +63,7 @@ if [ $MACHINE = x86_64 -o $MACHINE = aarch64 ]; then
 fi
 
 # riscv64-linux-gnu-strip crashes for some reason
-if [ $MACHINE != riscv32 ] && [[ $MACHINE != mips* ]]; then
+if [ $MACHINE != riscv32 ]; then
   $CXX -B. -o $t/exe11 $t/b.o -pie
   $STRIP $t/exe11
   $QEMU $t/exe11

@@ -126,7 +126,7 @@ static PluginStatus message(PluginLevel level, const char *fmt, ...) {
 
   switch (level) {
   case LDPL_INFO:
-    SyncOut(ctx) << buf;
+    Out(ctx) << buf;
     break;
   case LDPL_WARNING:
     Warn(ctx) << buf;
@@ -176,7 +176,7 @@ static PluginStatus add_input_file(const char *path) {
   Context<E> &ctx = *gctx<E>;
   static i64 file_priority = 100;
 
-  MappedFile<Context<E>> *mf = MappedFile<Context<E>>::must_open(ctx, path);
+  MappedFile *mf = must_open_file(ctx, path);
 
   ObjectFile<E> *file = ObjectFile<E>::create(ctx, mf, "", false);
   ctx.obj_pool.emplace_back(file);
@@ -200,10 +200,7 @@ static PluginStatus release_input_file(const void *handle) {
   LOG << "release_input_file\n";
 
   ObjectFile<E> &file = *(ObjectFile<E> *)handle;
-  if (file.mf->fd != -1) {
-    close(file.mf->fd);
-    file.mf->fd = -1;
-  }
+  file.mf->close_fd();
   return LDPS_OK;
 }
 
@@ -427,7 +424,7 @@ get_api_version(const char *plugin_identifier,
   if (LAPI_V1 < minimal_api_supported)
     Fatal(*gctx<E>) << "LTO plugin does not support V0 or V1 API";
 
-  std::string version = mold_version + "\0"s;
+  std::string version = get_mold_version() + "\0"s;
 
   *linker_identifier = "mold";
   *linker_version = version.data();
@@ -439,72 +436,77 @@ get_api_version(const char *plugin_identifier,
   return LAPI_V0;
 }
 
+// dlopen the linker plugin file
 template <typename E>
-static void load_plugin(Context<E> &ctx) {
-  assert(phase == 0);
-  phase = 1;
-  gctx<E> = &ctx;
+static void load_lto_plugin(Context<E> &ctx) {
+  static std::once_flag flag;
 
-  void *handle = dlopen(ctx.arg.plugin.c_str(), RTLD_NOW | RTLD_GLOBAL);
-  if (!handle)
-    Fatal(ctx) << "could not open plugin file: " << dlerror();
+  std::call_once(flag, [&] {
+    assert(phase == 0);
+    phase = 1;
+    gctx<E> = &ctx;
 
-  OnloadFn *onload = (OnloadFn *)dlsym(handle, "onload");
-  if (!onload)
-    Fatal(ctx) << "failed to load plugin " << ctx.arg.plugin << ": "
-               << dlerror();
+    void *handle = dlopen(ctx.arg.plugin.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!handle)
+      Fatal(ctx) << "could not open plugin file: " << dlerror();
 
-  auto save = [&](std::string_view str) {
-    return save_string(ctx, std::string(str).c_str()).data();
-  };
+    OnloadFn *onload = (OnloadFn *)dlsym(handle, "onload");
+    if (!onload)
+      Fatal(ctx) << "failed to load plugin " << ctx.arg.plugin << ": "
+                 << dlerror();
 
-  std::vector<PluginTagValue> tv;
-  tv.emplace_back(LDPT_MESSAGE, message<E>);
+    auto save = [&](std::string_view str) {
+      return save_string(ctx, std::string(str).c_str()).data();
+    };
 
-  if (ctx.arg.shared)
-    tv.emplace_back(LDPT_LINKER_OUTPUT, LDPO_DYN);
-  else if (ctx.arg.pie)
-    tv.emplace_back(LDPT_LINKER_OUTPUT, LDPO_PIE);
-  else
-    tv.emplace_back(LDPT_LINKER_OUTPUT, LDPO_EXEC);
+    std::vector<PluginTagValue> tv;
+    tv.emplace_back(LDPT_MESSAGE, message<E>);
 
-  for (std::string_view opt : ctx.arg.plugin_opt)
-    tv.emplace_back(LDPT_OPTION, save(opt));
+    if (ctx.arg.shared)
+      tv.emplace_back(LDPT_LINKER_OUTPUT, LDPO_DYN);
+    else if (ctx.arg.pie)
+      tv.emplace_back(LDPT_LINKER_OUTPUT, LDPO_PIE);
+    else
+      tv.emplace_back(LDPT_LINKER_OUTPUT, LDPO_EXEC);
 
-  tv.emplace_back(LDPT_REGISTER_CLAIM_FILE_HOOK, register_claim_file_hook<E>);
-  tv.emplace_back(LDPT_REGISTER_ALL_SYMBOLS_READ_HOOK,
-                  register_all_symbols_read_hook<E>);
-  tv.emplace_back(LDPT_REGISTER_CLEANUP_HOOK, register_cleanup_hook<E>);
-  tv.emplace_back(LDPT_ADD_SYMBOLS, add_symbols);
-  tv.emplace_back(LDPT_GET_SYMBOLS, get_symbols_v1);
-  tv.emplace_back(LDPT_ADD_INPUT_FILE, add_input_file<E>);
-  tv.emplace_back(LDPT_GET_INPUT_FILE, get_input_file);
-  tv.emplace_back(LDPT_RELEASE_INPUT_FILE, release_input_file<E>);
-  tv.emplace_back(LDPT_ADD_INPUT_LIBRARY, add_input_library);
-  tv.emplace_back(LDPT_OUTPUT_NAME, save(ctx.arg.output));
-  tv.emplace_back(LDPT_SET_EXTRA_LIBRARY_PATH, set_extra_library_path);
-  tv.emplace_back(LDPT_GET_VIEW, get_view<E>);
-  tv.emplace_back(LDPT_GET_INPUT_SECTION_COUNT, get_input_section_count);
-  tv.emplace_back(LDPT_GET_INPUT_SECTION_TYPE, get_input_section_type);
-  tv.emplace_back(LDPT_GET_INPUT_SECTION_NAME, get_input_section_name);
-  tv.emplace_back(LDPT_GET_INPUT_SECTION_CONTENTS, get_input_section_contents);
-  tv.emplace_back(LDPT_UPDATE_SECTION_ORDER, update_section_order);
-  tv.emplace_back(LDPT_ALLOW_SECTION_ORDERING, allow_section_ordering);
-  tv.emplace_back(LDPT_ADD_SYMBOLS_V2, add_symbols);
-  tv.emplace_back(LDPT_GET_SYMBOLS_V2, get_symbols_v2<E>);
-  tv.emplace_back(LDPT_ALLOW_UNIQUE_SEGMENT_FOR_SECTIONS,
-                  allow_unique_segment_for_sections);
-  tv.emplace_back(LDPT_UNIQUE_SEGMENT_FOR_SECTIONS, unique_segment_for_sections);
-  tv.emplace_back(LDPT_GET_SYMBOLS_V3, get_symbols_v3<E>);
-  tv.emplace_back(LDPT_GET_INPUT_SECTION_ALIGNMENT, get_input_section_alignment);
-  tv.emplace_back(LDPT_GET_INPUT_SECTION_SIZE, get_input_section_size);
-  tv.emplace_back(LDPT_REGISTER_NEW_INPUT_HOOK, register_new_input_hook<E>);
-  tv.emplace_back(LDPT_GET_WRAP_SYMBOLS, get_wrap_symbols);
-  tv.emplace_back(LDPT_GET_API_VERSION, get_api_version<E>);
-  tv.emplace_back(LDPT_NULL, 0);
+    for (std::string_view opt : ctx.arg.plugin_opt)
+      tv.emplace_back(LDPT_OPTION, save(opt));
 
-  [[maybe_unused]] PluginStatus status = onload(tv.data());
-  assert(status == LDPS_OK);
+    tv.emplace_back(LDPT_REGISTER_CLAIM_FILE_HOOK, register_claim_file_hook<E>);
+    tv.emplace_back(LDPT_REGISTER_ALL_SYMBOLS_READ_HOOK,
+                    register_all_symbols_read_hook<E>);
+    tv.emplace_back(LDPT_REGISTER_CLEANUP_HOOK, register_cleanup_hook<E>);
+    tv.emplace_back(LDPT_ADD_SYMBOLS, add_symbols);
+    tv.emplace_back(LDPT_GET_SYMBOLS, get_symbols_v1);
+    tv.emplace_back(LDPT_ADD_INPUT_FILE, add_input_file<E>);
+    tv.emplace_back(LDPT_GET_INPUT_FILE, get_input_file);
+    tv.emplace_back(LDPT_RELEASE_INPUT_FILE, release_input_file<E>);
+    tv.emplace_back(LDPT_ADD_INPUT_LIBRARY, add_input_library);
+    tv.emplace_back(LDPT_OUTPUT_NAME, save(ctx.arg.output));
+    tv.emplace_back(LDPT_SET_EXTRA_LIBRARY_PATH, set_extra_library_path);
+    tv.emplace_back(LDPT_GET_VIEW, get_view<E>);
+    tv.emplace_back(LDPT_GET_INPUT_SECTION_COUNT, get_input_section_count);
+    tv.emplace_back(LDPT_GET_INPUT_SECTION_TYPE, get_input_section_type);
+    tv.emplace_back(LDPT_GET_INPUT_SECTION_NAME, get_input_section_name);
+    tv.emplace_back(LDPT_GET_INPUT_SECTION_CONTENTS, get_input_section_contents);
+    tv.emplace_back(LDPT_UPDATE_SECTION_ORDER, update_section_order);
+    tv.emplace_back(LDPT_ALLOW_SECTION_ORDERING, allow_section_ordering);
+    tv.emplace_back(LDPT_ADD_SYMBOLS_V2, add_symbols);
+    tv.emplace_back(LDPT_GET_SYMBOLS_V2, get_symbols_v2<E>);
+    tv.emplace_back(LDPT_ALLOW_UNIQUE_SEGMENT_FOR_SECTIONS,
+                    allow_unique_segment_for_sections);
+    tv.emplace_back(LDPT_UNIQUE_SEGMENT_FOR_SECTIONS, unique_segment_for_sections);
+    tv.emplace_back(LDPT_GET_SYMBOLS_V3, get_symbols_v3<E>);
+    tv.emplace_back(LDPT_GET_INPUT_SECTION_ALIGNMENT, get_input_section_alignment);
+    tv.emplace_back(LDPT_GET_INPUT_SECTION_SIZE, get_input_section_size);
+    tv.emplace_back(LDPT_REGISTER_NEW_INPUT_HOOK, register_new_input_hook<E>);
+    tv.emplace_back(LDPT_GET_WRAP_SYMBOLS, get_wrap_symbols);
+    tv.emplace_back(LDPT_GET_API_VERSION, get_api_version<E>);
+    tv.emplace_back(LDPT_NULL, 0);
+
+    [[maybe_unused]] PluginStatus status = onload(tv.data());
+    assert(status == LDPS_OK);
+  });
 }
 
 template <typename E>
@@ -565,7 +567,11 @@ static ElfSym<E> to_elf_sym(PluginSymbol &psym) {
 // Returns false if it's GCC.
 template <typename E>
 static bool is_llvm(Context<E> &ctx) {
+#ifdef __MINGW32__
+  return ctx.arg.plugin.ends_with("LLVMgold.dll");
+#else
   return ctx.arg.plugin.ends_with("LLVMgold.so");
+#endif
 }
 
 // Returns true if a given linker plugin supports the get_symbols_v3 API.
@@ -576,7 +582,28 @@ static bool supports_v3_api(Context<E> &ctx) {
 }
 
 template <typename E>
-ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mf) {
+static PluginInputFile
+create_plugin_input_file(Context<E> &ctx, MappedFile *mf) {
+  PluginInputFile file;
+  MappedFile *mf2 = mf->parent ? mf->parent : mf;
+
+  file.name = save_string(ctx, mf2->name).data();
+  file.offset = mf->get_offset();
+  file.filesize = mf->size;
+
+  mf2->reopen_fd(file.name);
+
+  file.fd = mf2->fd;
+
+  if (!file.fd)
+    Fatal(ctx) << "cannot open " << file.name << ": " << errno_string();
+  return file;
+}
+
+template <typename E>
+ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile *mf) {
+  load_lto_plugin(ctx);
+
   // V0 API's claim_file is not thread-safe.
   static std::mutex mu;
   std::unique_lock lock(mu, std::defer_lock);
@@ -589,10 +616,6 @@ ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mf) {
                << "added -flto not only for creating object files but also for "
                << "creating the final executable.";
 
-  // dlopen the linker plugin file
-  static std::once_flag flag;
-  std::call_once(flag, [&] { load_plugin(ctx); });
-
   // Create mold's object instance
   ObjectFile<E> *obj = new ObjectFile<E>;
   ctx.obj_pool.emplace_back(obj);
@@ -602,23 +625,10 @@ ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   obj->first_global = 1;
   obj->is_lto_obj = true;
   obj->mf = mf;
+  obj->archive_name = mf->parent ? mf->parent->name : "";
 
   // Create plugin's object instance
-  PluginInputFile file = {};
-
-  MappedFile<Context<E>> *mf2 = mf->parent ? mf->parent : mf;
-  file.name = save_string(ctx, mf2->name).data();
-  if (mf2->fd == -1)
-    mf2->fd = open(file.name, O_RDONLY);
-  file.fd = mf2->fd;
-  if (file.fd == -1)
-    Fatal(ctx) << "cannot open " << file.name << ": " << errno_string();
-
-  if (mf->parent)
-    obj->archive_name = mf->parent->name;
-
-  file.offset = mf->get_offset();
-  file.filesize = mf->size;
+  PluginInputFile file = create_plugin_input_file(ctx, mf);
   file.handle = (void *)obj;
 
   LOG << "read_lto_symbols: "<< mf->name << "\n";
@@ -635,40 +645,33 @@ ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   // LLVM needs it and takes the ownership of fd. To prevent "too many
   // open files" issue, we close fd only for GCC. This is ugly, though.
   if (!is_llvm(ctx)) {
-    close(mf2->fd);
-    mf2->fd = -1;
+    MappedFile *mf2 = mf->parent ? mf->parent : mf;
+    mf2->close_fd();
   }
 
-  // Initialize object symbols
-  std::vector<ElfSym<E>> *esyms = new std::vector<ElfSym<E>>(1);
-  obj->has_symver.resize(plugin_symbols.size());
-  obj->lto_symbol_versions.resize(plugin_symbols.size());
+  // Create a symbol strtab
+  i64 strtab_size = 1;
+  for (PluginSymbol &psym : plugin_symbols)
+    strtab_size += strlen(psym.name) + 1;
+  std::string strtab(strtab_size, '\0');
+
+  // Initialize esyms
+  obj->lto_elf_syms.resize(plugin_symbols.size() + 1);
+  i64 strtab_offset = 1;
 
   for (i64 i = 0; i < plugin_symbols.size(); i++) {
     PluginSymbol &psym = plugin_symbols[i];
-    esyms->push_back(to_elf_sym<E>(psym));
+    obj->lto_elf_syms[i + 1] = to_elf_sym<E>(psym);
+    obj->lto_elf_syms[i + 1].st_name = strtab_offset;
 
-    std::string_view key = save_string(ctx, psym.name);
-    std::string_view name = key;
-
-    // Parse symbol version after atsign
-    if (i64 pos = name.find('@'); pos != name.npos) {
-      std::string_view ver = name.substr(pos);
-      name = name.substr(0, pos);
-
-      if (ver != "@" && ver != "@@") {
-        if (ver.starts_with("@@"))
-          key = name;
-        obj->has_symver.set(i);
-        obj->lto_symbol_versions[i] = ver.substr(1);
-      }
-    }
-
-    obj->symbols.push_back(get_symbol(ctx, key, name));
+    i64 len = strlen(psym.name);
+    memcpy(strtab.data() + strtab_offset, psym.name, len);
+    strtab_offset += len + 1;
   }
 
-  obj->elf_syms = *esyms;
-  obj->has_symver.resize(esyms->size());
+  obj->symbol_strtab = save_string(ctx, strtab);
+  obj->elf_syms = obj->lto_elf_syms;
+  obj->initialize_symbols(ctx);
   plugin_symbols.clear();
   return obj;
 }
@@ -677,6 +680,7 @@ ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 template <typename E>
 std::vector<ObjectFile<E> *> do_lto(Context<E> &ctx) {
   Timer t(ctx, "do_lto");
+  load_lto_plugin(ctx);
 
   if (!ctx.arg.lto_pass2 && !supports_v3_api(ctx))
     restart_process(ctx);
@@ -709,6 +713,22 @@ std::vector<ObjectFile<E> *> do_lto(Context<E> &ctx) {
     get_symbol(ctx, y)->referenced_by_regular_obj = true;
   }
 
+  // Keep some symbols
+  for (Symbol<E> *sym : ctx.arg.undefined)
+    sym->referenced_by_regular_obj = true;
+
+  // Object files containing .gnu.offload_lto_.* sections need to be
+  // given to the LTO backend. Such sections contains code and data for
+  // peripherails (typically GPUs).
+  for (ObjectFile<E> *file : ctx.objs) {
+    if (file->is_alive && !file->is_lto_obj && file->is_gcc_offload_obj) {
+      PluginInputFile pfile = create_plugin_input_file(ctx, file->mf);
+      int claimed = false;
+      claim_file_hook(&pfile, &claimed);
+      assert(!claimed);
+    }
+  }
+
   // all_symbols_read_hook() calls add_input_file() and add_input_library()
   LOG << "all symbols read\n";
   if (PluginStatus st = all_symbols_read_hook(); st != LDPS_OK)
@@ -720,14 +740,13 @@ std::vector<ObjectFile<E> *> do_lto(Context<E> &ctx) {
 template <typename E>
 void lto_cleanup(Context<E> &ctx) {
   Timer t(ctx, "lto_cleanup");
-
   if (cleanup_hook)
     cleanup_hook();
 }
 
 using E = MOLD_TARGET;
 
-template ObjectFile<E> *read_lto_object(Context<E> &, MappedFile<Context<E>> *);
+template ObjectFile<E> *read_lto_object(Context<E> &, MappedFile *);
 template std::vector<ObjectFile<E> *> do_lto(Context<E> &);
 template void lto_cleanup(Context<E> &);
 

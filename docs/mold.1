@@ -1,6 +1,6 @@
 .\" generated with Ronn-NG/v0.9.1
 .\" http://github.com/apjanke/ronn-ng/tree/0.9.1
-.TH "MOLD" "1" "July 2023" ""
+.TH "MOLD" "1" "May 2024" ""
 .SH "NAME"
 \fBmold\fR \- a modern linker
 .SH "SYNOPSIS"
@@ -49,6 +49,10 @@ Whether good or bad, you should keep these semantics in mind to understand Unix 
 \fBmold\fR's output is deterministic\. That is, if you pass the same object files and the same command\-line options to the same version of \fBmold\fR, it is guaranteed that \fBmold\fR produces the bit\-by\-bit identical output\. The linker's internal randomness, such as the timing of thread scheduling or iteration orders of hash tables, doesn't affect the output\.
 .P
 \fBmold\fR does not have any host\-specific default settings\. This is contrary to the GNU linkers, for which some configurable values, such as system\-dependent library search paths, are hard\-coded\. \fBmold\fR depends only on its command\-line arguments\.
+.SH "OPTION NOTATIONS"
+Multi\-letter long options may precede either a single dash or double dashes, except for those starting with the letter "o"\. For historical reasons, long options beginning with "o" must precede double dashes\.
+.P
+For example, you can spell \fB\-\-as\-needed\fR as \fB\-as\-needed\fR, but \fB\-\-omagic\fR must not be spelled as \fB\-omagic\fR\. \fB\-omagic\fR will be interpreted not as \fB\-\-omagic\fR but as \fB\-o magic\fR\.
 .SH "MOLD\-SPECIFIC OPTIONS"
 .TP
 \fB\-\-chroot\fR=\fIdir\fR
@@ -74,6 +78,11 @@ Print out dependency information for input files\.
 .IP
 Each line of the output for this option shows which file depends on which file to use a specific symbol\. This option is useful for debugging why some object file in a static archive got linked or why some shared library is kept in an output file's dependency list even with \fB\-\-as\-needed\fR\.
 .TP
+\fB\-\-relocatable\-merge\-sections\fR
+By default, \fBmold\fR doesn't merge input sections by name when merging input object files into a single output object file for \fB\-r\fR\. For example, \fB\.text\.foo\fR and \fB\.text\.bar\fR aren't merged for \fB\-r\fR even though they are merged into \fB\.text\fR based on the default section merging rules\.
+.IP
+This option changes the behavior so that \fBmold\fR merges input sections by name by the default section merging rules\.
+.TP
 \fB\-\-repro\fR
 Archive input files, as well as a text file containing command line options, in a tar file so that you can run \fBmold\fR with the exact same inputs again\. This is useful for reporting a bug with a reproducer\. The output filename is \fBpath/to/output\.tar\fR, where \fBpath/to/output\fR is an output filename specified by \fB\-o\fR\.
 .TP
@@ -93,6 +102,11 @@ Randomize the output by shuffling the order of input sections before assigning t
 This option is useful for benchmarking\. Modern CPUs are sensitive to a program's memory layout\. A seemingly benign change in program layout, such as a small size increase of a function in the middle of a program, can affect the program's performance\. Therefore, even if you write new code and get a good benchmark result, it is hard to say whether the new code improves the program's performance; it is possible that the new memory layout happens to perform better\.
 .IP
 By running a benchmark multiple times with randomized memory layouts using \fB\-\-shuffle\-sections\fR, you can isolate your program's real performance number from the randomness caused by memory layout changes\.
+.TP
+\fB\-\-spare\-program\-headers\fR=\fInumber\fR
+Append the given number of \fBPT_NULL\fR entries to the end of the program header, so that post\-link processing tools can easily add new segments by overwriting the null entries\.
+.IP
+Note that ELF requires all \fBPT_LOAD\fR segments to be sorted by \fBp_vaddr\fR\. Therefore, if you add a new LOAD segment, you may need to sort the entire program header\.
 .TP
 \fB\-\-stats\fR
 Print input statistics\.
@@ -168,16 +182,14 @@ Use \fIfile\fR as the output file name instead of the default name \fBa\.out\fR\
 \fB\-r\fR, \fB\-\-relocatable\fR
 Instead of generating an executable or a shared object file, combine input object files to generate another object file that can be used as an input to a linker\.
 .TP
-\fB\-\-relocatable\-merge\-sections\fR
-By default, \fBmold\fR doesn't merge input sections by name when merging input object files into a single output object file for \fB\-r\fR\. For example, \fB\.text\.foo\fR and \fB\.text\.bar\fR aren't merged for \fB\-r\fR even though they are merged into \fB\.text\fR according to the default section merging rules\.
-.IP
-This option changes the behavior so that \fBmold\fR merges input sections by name by the default section merging rules\.
-.TP
 \fB\-s\fR, \fB\-\-strip\-all\fR
 Omit \fB\.symtab\fR section from the output file\.
 .TP
 \fB\-u\fR \fIsymbol\fR, \fB\-\-undefined\fR=\fIsymbol\fR
 If \fIsymbol\fR remains as an undefined symbol after reading all object files, and if there is a static archive that contains an object file defining \fIsymbol\fR, pull out the object file and link it so that the output file contains a definition of \fIsymbol\fR\.
+.TP
+\fB\-y\fR \fIsymbol\fR, \fB\-\-trace\-symbol\fR=\fIsymbol\fR
+Trace references to \fIsymbol\fR\.
 .TP
 \fB\-\-Bdynamic\fR
 Link against shared libraries\.
@@ -191,8 +203,14 @@ When creating a shared library, make global symbols export\-only (i\.e\. do not 
 \fB\-\-Bsymbolic\-functions\fR
 This option has the same effect as \fB\-\-Bsymbolic\fR but works only for function symbols\. Data symbols remain being both imported and exported\.
 .TP
+\fB\-\-Bsymbolic\-non\-weak\fR
+This option has the same effect as \fB\-\-Bsymbolic\fR but works only for non\-weak symbols\. Weak symbols remain being both imported and exported\.
+.TP
+\fB\-\-Bsymbolic\-non\-weak\-functions\fR
+This option has the same effect as \fB\-\-Bsymbolic\fR but works only for non\-weak function symbols\. Data symbols and weak function symbols remain being both imported and exported\.
+.TP
 \fB\-\-Bno\-symbolic\fR
-Cancel \fB\-\-Bsymbolic\fR and \fB\-\-Bsymbolic\-functions\fR\.
+Cancel \fB\-\-Bsymbolic\fR, \fB\-\-Bsymbolic\-functions\fR, \fB\-\-Bsymbolic\-non\-weak\fR and \fB\-\-Bsymbolic\-non\-weak\-functions\fR\.
 .TP
 \fB\-\-Map\fR=\fIfile\fR
 Write map file to \fIfile\fR\.
@@ -352,7 +370,7 @@ Set \fIaddress\fR to section\. \fIaddress\fR is a hexadecimal number that may st
 Create a share library\.
 .TP
 \fB\-\-spare\-dynamic\-tags\fR=\fInumber\fR
-Reserve the given \fInumber\fR of tags in \fB\.dynamic\fR section\.
+Append the given number of \fBDT_NULL\fR entries to the end of the \fB\.dynamic\fR section, so that post\-link processing tools can easily add new dynamic tags by overwriting the null entries\.
 .TP
 \fB\-\-start\-lib\fR, \fB\-\-end\-lib\fR
 Handle object files between \fB\-\-start\-lib\fR and \fB\-\-end\-lib\fR as if they were in an archive file\. That means object files between them are linked only when they are needed to resolve undefined symbols\. The options are useful if you want to link object files only when they are needed but want to avoid the overhead of running ar(3)\.
@@ -365,6 +383,9 @@ Set target system root directory to \fIdir\fR\.
 .TP
 \fB\-\-trace\fR
 Print name of each input file\.
+.TP
+\fB\-\-undefined\-glob\fR=\fIpattern\fR
+Synonym for \fB\-\-undefined\fR, except that \fB\-\-undefined\-glob\fR takes a glob pattern instead of just a single symbol name\.
 .TP
 \fB\-\-undefined\-version\fR, \fB\-\-no\-undefined\-version\fR
 By default, \fBmold\fR warns on a symbol specified by a version script or by \fB\-\-export\-dynamic\-symbol\fR if it is not defined\. You can silence the warning by \fB\-\-undefined\-version\fR\.
@@ -418,8 +439,11 @@ By default, the pages for the stack area (i\.e\. the pages where local variables
 \fB\-z keep\-text\-section\-prefix\fR, \fB\-z nokeep\-text\-section\-prefix\fR
 Keep \fB\.text\.hot\fR, \fB\.text\.unknown\fR, \fB\.text\.unlikely\fR, \fB\.text\.startup\fR, and \fB\.text\.exit\fR as separate sections in the final binary instead of merging them as \fB\.text\fR\.
 .TP
+\fB\-z rodynamic\fR
+Make the \fB\.dynamic\fR section read\-only\.
+.TP
 \fB\-z relro\fR, \fB\-z norelro\fR
-Some sections such as \fB\.dynamic\fR have to be writable only during an executable or a shared library file is being loaded to memory\. Once the dynamic linker finishes its job, such sections won't be mutated by anyone\. As a security mitigation, it is preferred to make such segments read\-only during program execution\.
+Some sections such as \fB\.dynamic\fR have to be writable only during a module is being loaded to memory\. Once the dynamic linker finishes its job, such sections won't be mutated by anyone\. As a security mitigation, it is preferred to make such segments read\-only during program execution\.
 .IP
 \fB\-z relro\fR puts such sections into a special segment called \fBrelro\fR\. The dynamic linker makes a relro segment read\-only after it finishes its job\.
 .IP
@@ -443,11 +467,16 @@ Report undefined symbols (even with \fB\-\-shared\fR)\.
 \fB\-z shstk\fR
 Enforce shadow stack by turning \fBGNU_PROPERTY_X86_FEATURE_1_SHSTK\fR bit in \fB\.note\.gnu\.property\fR output section\. Shadow stack is part of Intel Control\-flow Enforcement Technology (CET), which is available since Tiger Lake (2020)\.
 .TP
+\fB\-z start_stop_visibility\fR=[ \fBhidden\fR | \fBprotected\fR ]
+If a section name is valid as a C identifier (i\.e\., it matches \fB/^[_a\-zA\-Z][_a\-zA\-Z0\-9]*$/\fR), mold creates \fB__start_SECNAME\fR and \fB__stop_SECNAME\fR symbols to mark the beginning and end of the section, where \fBSECNAME\fR is the section name\.
+.IP
+You can make these marker symbols visible from other ELF modules by passing \fB\-z start_stop_visibility=protected\fR\. Default is \fBhidden\fR\.
+.TP
 \fB\-z text\fR, \fB\-z notext\fR, \fB\-z textoff\fR
 \fBmold\fR by default reports an error if dynamic relocations are created in read\-only sections\. If \fB\-z notext\fR or \fB\-z textoff\fR are given, \fBmold\fR creates such dynamic relocations without reporting an error\. \fB\-z text\fR restores the default behavior\.
 .TP
 \fB\-z max\-page\-size\fR=\fInumber\fR
-Some CPU ISAs support multiple different memory page sizes\. This option specifies the maximum page size that an output binary can run on\. The default value is 4 KiB for i386, x86\-64, and RISC\-V, and 64 KiB for ARM64\.
+Some CPU ISAs support multiple memory page sizes\. This option specifies the maximum page size that an output binary can run on\. In general, binaries built for a larger page size can run on a system with a smaller page size, but not vice versa\. The default value is 4 KiB for i386, x86\-64, and RISC\-V, and 64 KiB for ARM64\.
 .TP
 \fB\-z nodefaultlib\fR
 Make the dynamic loader ignore default search paths\.
@@ -470,18 +499,18 @@ Mark DSO to be initialized first at runtime\.
 \fB\-z interpose\fR
 Mark object to interpose all DSOs but executable\.
 .TP
-\fB\-(\fR, \fB\-)\fR, \fB\-EL\fR, \fB\-O\fR\fInumber\fR, \fB\-\-allow\-shlib\-undefined\fR, \fB\-\-dc\fR, \fB\-\-dp\fR, \fB\-\-end\-group\fR, \fB\-\-no\-add\-needed\fR, \fB\-\-no\-allow\-shlib\-undefined\fR, \fB\-\-no\-copy\-dt\-needed\-entries\fR, \fB\-\-no\-fatal\-warnings\fR, \fB\-\-nostdlib\fR, \fB\-\-rpath\-link=Ar dir\fR, \fB\-\-sort\-common\fR, \fB\-\-sort\-section\fR, \fB\-\-start\-group\fR, \fB\-\-warn\-constructors\fR, \fB\-\-warn\-once\fR, \fB\-\-fix\-cortex\-a53\-835769\fR, \fB\-\-fix\-cortex\-a53\-843419\fR, \fB\-z combreloc\fR, \fB\-z common\-page\-size\fR, \fB\-z nocombreloc\fR
+\fB\-(\fR, \fB\-)\fR, \fB\-EL\fR, \fB\-O\fR\fInumber\fR, \fB\-\-allow\-shlib\-undefined\fR, \fB\-\-dc\fR, \fB\-\-dp\fR, \fB\-\-end\-group\fR, \fB\-\-no\-add\-needed\fR, \fB\-\-no\-allow\-shlib\-undefined\fR, \fB\-\-no\-copy\-dt\-needed\-entries\fR, \fB\-\-nostdlib\fR, \fB\-\-rpath\-link=Ar dir\fR, \fB\-\-sort\-common\fR, \fB\-\-sort\-section\fR, \fB\-\-start\-group\fR, \fB\-\-warn\-constructors\fR, \fB\-\-warn\-once\fR, \fB\-\-fix\-cortex\-a53\-835769\fR, \fB\-\-fix\-cortex\-a53\-843419\fR, \fB\-z combreloc\fR, \fB\-z common\-page\-size\fR, \fB\-z nocombreloc\fR
 Ignored
 .SH "ENVIRONMENT VARIABLES"
 .TP
 \fBMOLD_JOBS\fR
-If this variable is set to \fB1\fR, only one process of \fBmold\fR runs actively\. A mold process invoked while another active mold process is running will wait before doing anything until the active process exits\.
+If this variable is set to \fB1\fR, only one \fBmold\fR process will run at a time\. If a new mold process is initiated while another is already active, the new process will wait until the active one completes before starting\.
 .IP
-The purpose of this environment variable is to reduce peak memory usage\. Since mold is highly parallelized, there's no point in running it simultaneously\. If you run N instances of mold in parallel, it would take N times more time and N times more memory\. If you run them serially, it would still take N times more to finish, but their peak memory usage is reduced to normal\.
+The primary reason for this environment variable is to minimize peak memory usage\. Since mold is designed to operate with high parallelism, running multiple mold instances simultaneously may not be beneficial\. If you execute N instances of mold concurrently, it could require N times the time and N times the memory\. On the other hand, running them one after the other might still take N times longer, but the peak memory usage would be the same as running just a single instance\.
 .IP
-If your build system tends to invoke multiple linker processes simultaneously, you may want to try to set this environment variable to \fB1\fR to see if it could improve overall performance\.
+If your build system invokes multiple linker processes simultaneously and some of them often get killed due to out\-of\-memory errors, you might consider setting this environment variable to \fB1\fR to see if it addresses the OOM issue\.
 .IP
-Currently, any value other than 1 is silently ignored\.
+Currently, any value other than \fB1\fR is silently ignored\.
 .TP
 \fBMOLD_DEBUG\fR
 If this variable is set to a non\-empty string, \fBmold\fR embeds its command\-line options in the output file's \fB\.comment\fR section\.

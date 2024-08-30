@@ -164,7 +164,7 @@ void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
       0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, // (padding)
     };
     memcpy(buf, insn, sizeof(insn));
-    *(ul32 *)(buf + 6) = sym.get_got_addr(ctx) - ctx.got->shdr.sh_addr;
+    *(ul32 *)(buf + 6) = sym.get_got_pltgot_addr(ctx) - ctx.got->shdr.sh_addr;
   } else {
     static const u8 insn[] = {
       0xf3, 0x0f, 0x1e, 0xfb,             // endbr32
@@ -172,7 +172,7 @@ void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
       0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, // (padding)
     };
     memcpy(buf, insn, sizeof(insn));
-    *(ul32 *)(buf + 6) = sym.get_got_addr(ctx);
+    *(ul32 *)(buf + 6) = sym.get_got_pltgot_addr(ctx);
   }
 }
 
@@ -252,6 +252,34 @@ static void relax_ld_to_le(u8 *loc, ElfRel<E> rel, u64 val) {
   default:
     unreachable();
   }
+}
+
+static u32 relax_tlsdesc_to_ie(u8 *loc) {
+  switch ((loc[0] << 8) | loc[1]) {
+  case 0x8d83: return 0x8b83; // lea 0(%ebx), %eax -> mov 0(%ebx), %eax
+  case 0x8d9b: return 0x8b9b; // lea 0(%ebx), %ebx -> mov 0(%ebx), %ebx
+  case 0x8d8b: return 0x8b8b; // lea 0(%ebx), %ecx -> mov 0(%ebx), %ecx
+  case 0x8d93: return 0x8b93; // lea 0(%ebx), %edx -> mov 0(%ebx), %edx
+  case 0x8db3: return 0x8bb3; // lea 0(%ebx), %esi -> mov 0(%ebx), %esi
+  case 0x8dbb: return 0x8bbb; // lea 0(%ebx), %edi -> mov 0(%ebx), %edi
+  case 0x8da3: return 0x8ba3; // lea 0(%ebx), %esp -> mov 0(%ebx), %esp
+  case 0x8dab: return 0x8bab; // lea 0(%ebx), %ebp -> mov 0(%ebx), %ebp
+  }
+  return 0;
+}
+
+static u32 relax_tlsdesc_to_le(u8 *loc) {
+  switch ((loc[0] << 8) | loc[1]) {
+  case 0x8d83: return 0x90b8; // lea 0(%ebx), %eax -> mov $0, %eax
+  case 0x8d9b: return 0x90bb; // lea 0(%ebx), %ebx -> mov $0, %ebx
+  case 0x8d8b: return 0x90b9; // lea 0(%ebx), %ecx -> mov $0, %ecx
+  case 0x8d93: return 0x90ba; // lea 0(%ebx), %edx -> mov $0, %edx
+  case 0x8db3: return 0x90be; // lea 0(%ebx), %esi -> mov $0, %esi
+  case 0x8dbb: return 0x90bf; // lea 0(%ebx), %edi -> mov $0, %edi
+  case 0x8da3: return 0x90bc; // lea 0(%ebx), %esp -> mov $0, %esp
+  case 0x8dab: return 0x90bd; // lea 0(%ebx), %ebp -> mov $0, %ebp
+  }
+  return 0;
 }
 
 template <>
@@ -338,20 +366,16 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul32 *)loc = sym.get_gottp_addr(ctx) + A;
       break;
     case R_386_TLS_GD:
-      if (sym.has_tlsgd(ctx)) {
+      if (sym.has_tlsgd(ctx))
         *(ul32 *)loc = sym.get_tlsgd_addr(ctx) + A - GOT;
-      } else {
-        relax_gd_to_le(loc, rels[i + 1], S - ctx.tp_addr);
-        i++;
-      }
+      else
+        relax_gd_to_le(loc, rels[++i], S - ctx.tp_addr);
       break;
     case R_386_TLS_LDM:
-      if (ctx.got->has_tlsld(ctx)) {
+      if (ctx.got->has_tlsld(ctx))
         *(ul32 *)loc = ctx.got->get_tlsld_addr(ctx) + A - GOT;
-      } else {
-        relax_ld_to_le(loc, rels[i + 1], ctx.tp_addr - ctx.tls_begin);
-        i++;
-      }
+        else
+        relax_ld_to_le(loc, rels[++i], ctx.tp_addr - ctx.tls_begin);
       break;
     case R_386_TLS_LDO_32:
       *(ul32 *)loc = S + A - ctx.dtp_addr;
@@ -360,13 +384,47 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul32 *)loc = sym.esym().st_size + A;
       break;
     case R_386_TLS_GOTDESC:
+      // i386 TLSDESC uses the following code sequence to materialize
+      // a TP-relative address in %eax.
+      //
+      //   lea    0(%ebx), %eax
+      //       R_386_TLS_GOTDESC   foo
+      //   call   *(%eax)
+      //       R_386_TLS_DESC_CALL foo
+      //
+      // We may relax the instructions to the following for non-dlopen'd DSO
+      //
+      //   mov     foo@GOTTPOFF(%ebx), %eax
+      //   nop
+      //
+      // or to the following for executable.
+      //
+      //   mov     $foo@TPOFF, %eax
+      //   nop
+      //
+      // We allow the following alternative code sequence too because
+      // LLVM emits such code.
+      //
+      //   lea    0(%ebx), %reg
+      //       R_386_TLS_GOTDESC   foo
+      //   mov    %reg, %eax
+      //   call   *(%eax)
+      //       R_386_TLS_DESC_CALL foo
       if (sym.has_tlsdesc(ctx)) {
         *(ul32 *)loc = sym.get_tlsdesc_addr(ctx) + A - GOT;
+      } else if (sym.has_gottp(ctx)) {
+        u32 insn = relax_tlsdesc_to_ie(loc - 2);
+        if (!insn)
+          Fatal(ctx) << *this << ": illegal instruction sequence for TLSDESC";
+        loc[-2] = insn >> 8;
+        loc[-1] = insn;
+        *(ul32 *)loc = sym.get_gottp_addr(ctx) + A - GOT;
       } else {
-        static const u8 insn[] = {
-          0x8d, 0x05, 0, 0, 0, 0, // lea 0, %eax
-        };
-        memcpy(loc - 2, insn, sizeof(insn));
+        u32 insn = relax_tlsdesc_to_le(loc - 2);
+        if (!insn)
+          Fatal(ctx) << *this << ": illegal instruction sequence for TLSDESC";
+        loc[-2] = insn >> 8;
+        loc[-1] = insn;
         *(ul32 *)loc = S + A - ctx.tp_addr;
       }
       break;
@@ -476,6 +534,16 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     if (sym.is_ifunc())
       sym.flags |= NEEDS_GOT | NEEDS_PLT;
 
+    if (rel.r_type == R_386_TLS_GD || rel.r_type == R_386_TLS_LDM) {
+      if (i + 1 == rels.size())
+        Fatal(ctx) << *this << ": " << rel << " must be followed by PLT or GOT32";
+
+      if (u32 ty = rels[i + 1].r_type;
+          ty != R_386_PLT32 && ty != R_386_PC32 &&
+          ty != R_386_GOT32 && ty != R_386_GOT32X)
+        Fatal(ctx) << *this << ": " << rel << " must be followed by PLT or GOT32";
+    }
+
     switch (rel.r_type) {
     case R_386_8:
     case R_386_16:
@@ -493,15 +561,15 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_386_GOTPC:
       sym.flags |= NEEDS_GOT;
       break;
-    case R_386_GOT32X: {
-      // We always want to relax GOT32X because static PIE doesn't
-      // work without it.
-      bool do_relax = !sym.is_imported && sym.is_relative() &&
-                      relax_got32x(loc - 2);
-      if (!do_relax)
+    case R_386_GOT32X:
+      // We always want to relax GOT32X even if --no-relax is given
+      // because static PIE doesn't work without it.
+      if (sym.is_pcrel_linktime_const(ctx) && relax_got32x(loc - 2)) {
+        // Do nothing
+      } else {
         sym.flags |= NEEDS_GOT;
+      }
       break;
-    }
     case R_386_PLT32:
       if (sym.is_imported)
         sym.flags |= NEEDS_PLT;
@@ -511,31 +579,15 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       sym.flags |= NEEDS_GOTTP;
       break;
     case R_386_TLS_GD:
-      if (i + 1 == rels.size())
-        Fatal(ctx) << *this << ": TLS_GD reloc must be followed by PLT or GOT32";
-
-      if (u32 ty = rels[i + 1].r_type;
-          ty != R_386_PLT32 && ty != R_386_PC32 &&
-          ty != R_386_GOT32 && ty != R_386_GOT32X)
-        Fatal(ctx) << *this << ": TLS_GD reloc must be followed by PLT or GOT32";
-
       // We always relax if -static because libc.a doesn't contain
       // __tls_get_addr().
-      if (ctx.arg.is_static ||
-          (ctx.arg.relax && !ctx.arg.shared && !sym.is_imported))
+      if ((ctx.arg.relax && sym.is_tprel_linktime_const(ctx)) ||
+          ctx.arg.is_static)
         i++;
       else
         sym.flags |= NEEDS_TLSGD;
       break;
     case R_386_TLS_LDM:
-      if (i + 1 == rels.size())
-        Fatal(ctx) << *this << ": TLS_LDM reloc must be followed by PLT or GOT32";
-
-      if (u32 ty = rels[i + 1].r_type;
-          ty != R_386_PLT32 && ty != R_386_PC32 &&
-          ty != R_386_GOT32 && ty != R_386_GOT32X)
-        Fatal(ctx) << *this << ": TLS_LDM reloc must be followed by PLT or GOT32";
-
       // We always relax if -static because libc.a doesn't contain
       // __tls_get_addr().
       if (ctx.arg.is_static || (ctx.arg.relax && !ctx.arg.shared))
@@ -544,8 +596,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
         ctx.needs_tlsld = true;
       break;
     case R_386_TLS_GOTDESC:
-      if (!relax_tlsdesc(ctx, sym))
-        sym.flags |= NEEDS_TLSDESC;
+      scan_tlsdesc(ctx, sym);
       break;
     case R_386_TLS_LE:
       check_tlsle(ctx, sym, rel);

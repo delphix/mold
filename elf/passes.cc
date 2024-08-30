@@ -13,6 +13,50 @@
 
 namespace mold::elf {
 
+// Since elf_main is a template, we can't run it without a type parameter.
+// We speculatively run elf_main with X86_64, and if the speculation was
+// wrong, re-run it with an actual machine type.
+template <typename E>
+int redo_main(Context<E> &ctx, int argc, char **argv) {
+  std::string_view target = ctx.arg.emulation;
+
+  if (target == I386::target_name)
+    return elf_main<I386>(argc, argv);
+  if (target == ARM64::target_name)
+    return elf_main<ARM64>(argc, argv);
+  if (target == ARM32::target_name)
+    return elf_main<ARM32>(argc, argv);
+  if (target == RV64LE::target_name)
+    return elf_main<RV64LE>(argc, argv);
+  if (target == RV64BE::target_name)
+    return elf_main<RV64BE>(argc, argv);
+  if (target == RV32LE::target_name)
+    return elf_main<RV32LE>(argc, argv);
+  if (target == RV32BE::target_name)
+    return elf_main<RV32BE>(argc, argv);
+  if (target == PPC32::target_name)
+    return elf_main<PPC32>(argc, argv);
+  if (target == PPC64V1::target_name)
+    return elf_main<PPC64V1>(argc, argv);
+  if (target == PPC64V2::target_name)
+    return elf_main<PPC64V2>(argc, argv);
+  if (target == S390X::target_name)
+    return elf_main<S390X>(argc, argv);
+  if (target == SPARC64::target_name)
+    return elf_main<SPARC64>(argc, argv);
+  if (target == M68K::target_name)
+    return elf_main<M68K>(argc, argv);
+  if (target == SH4::target_name)
+    return elf_main<SH4>(argc, argv);
+  if (target == ALPHA::target_name)
+    return elf_main<ALPHA>(argc, argv);
+  if (target == LOONGARCH32::target_name)
+    return elf_main<LOONGARCH32>(argc, argv);
+  if (target == LOONGARCH64::target_name)
+    return elf_main<LOONGARCH64>(argc, argv);
+  unreachable();
+}
+
 template <typename E>
 void apply_exclude_libs(Context<E> &ctx) {
   Timer t(ctx, "apply_exclude_libs");
@@ -23,17 +67,24 @@ void apply_exclude_libs(Context<E> &ctx) {
   std::unordered_set<std::string_view> set(ctx.arg.exclude_libs.begin(),
                                            ctx.arg.exclude_libs.end());
 
-  for (ObjectFile<E> *file : ctx.objs) {
+  for (ObjectFile<E> *file : ctx.objs)
     if (!file->archive_name.empty())
       if (set.contains("ALL") ||
           set.contains(filepath(file->archive_name).filename().string()))
         file->exclude_libs = true;
-  }
+}
+
+template <typename E>
+static bool has_debug_info_section(Context<E> &ctx) {
+  for (ObjectFile<E> *file : ctx.objs)
+    if (file->debug_info)
+      return true;
+  return false;
 }
 
 template <typename E>
 void create_synthetic_sections(Context<E> &ctx) {
-  auto push = [&]<typename T>(T *x) {
+  auto push = [&](auto *x) {
     ctx.chunks.push_back(x);
     ctx.chunk_pool.emplace_back(x);
     return x;
@@ -91,7 +142,7 @@ void create_synthetic_sections(Context<E> &ctx) {
     ctx.buildid = push(new BuildIdSection<E>);
   if (ctx.arg.eh_frame_hdr)
     ctx.eh_frame_hdr = push(new EhFrameHdrSection<E>);
-  if (ctx.arg.gdb_index)
+  if (ctx.arg.gdb_index && has_debug_info_section(ctx))
     ctx.gdb_index = push(new GdbIndexSection<E>);
   if (ctx.arg.z_relro && ctx.arg.section_order.empty() &&
       ctx.arg.z_separate_code != SEPARATE_LOADABLE_SEGMENTS)
@@ -105,8 +156,14 @@ void create_synthetic_sections(Context<E> &ctx) {
   if (ctx.arg.emit_relocs)
     ctx.eh_frame_reloc = push(new EhFrameRelocSection<E>);
 
-  if (ctx.arg.shared || !ctx.dsos.empty() || ctx.arg.pie)
-    ctx.dynamic = push(new DynamicSection<E>);
+  if (ctx.arg.shared || !ctx.dsos.empty() || ctx.arg.pie) {
+    ctx.dynamic = push(new DynamicSection<E>(ctx));
+
+    // If .dynamic exists, .dynsym and .dynstr must exist as well
+    // since .dynamic refers to them.
+    ctx.dynstr->shdr.sh_size = 1;
+    ctx.dynsym->symbols.resize(1);
+  }
 
   ctx.versym = push(new VersymSection<E>);
   ctx.verneed = push(new VerneedSection<E>);
@@ -119,6 +176,9 @@ void create_synthetic_sections(Context<E> &ctx) {
   if constexpr (is_ppc64v1<E>)
     ctx.extra.opd = push(new PPC64OpdSection);
 
+  if constexpr (is_ppc64v2<E>)
+    ctx.extra.save_restore = push(new PPC64SaveRestoreSection);
+
   if constexpr (is_sparc<E>) {
     if (ctx.arg.is_static)
       ctx.extra.tls_get_addr_sec = push(new SparcTlsGetAddrSection);
@@ -127,34 +187,31 @@ void create_synthetic_sections(Context<E> &ctx) {
 
   if constexpr (is_alpha<E>)
     ctx.extra.got = push(new AlphaGotSection);
-
-  if constexpr (is_mips<E>) {
-    ctx.extra.quickstart = push(new MipsQuickstartSection<E>);
-    ctx.extra.abi_flags = push(new MipsABIFlagsSection<E>);
-
-    for (ObjectFile<E> *file : ctx.objs)
-      file->extra.got = push(new MipsGotSection<E>(ctx, *file));
-  }
-
-  // If .dynamic exists, .dynsym and .dynstr must exist as well
-  // since .dynamic refers them.
-  if (ctx.dynamic) {
-    ctx.dynstr->keep();
-    ctx.dynsym->keep();
-  }
 }
 
 template <typename E>
 static void mark_live_objects(Context<E> &ctx) {
-  auto mark_symbol = [&](std::string_view name) {
-    if (InputFile<E> *file = get_symbol(ctx, name)->file)
-      file->is_alive = true;
-  };
+  for (Symbol<E> *sym : ctx.arg.undefined)
+    if (sym->file)
+      sym->file->is_alive = true;
 
-  for (std::string_view name : ctx.arg.undefined)
-    mark_symbol(name);
-  for (std::string_view name : ctx.arg.require_defined)
-    mark_symbol(name);
+  for (Symbol<E> *sym : ctx.arg.require_defined)
+    if (sym->file)
+      sym->file->is_alive = true;
+
+  if (!ctx.arg.undefined_glob.empty()) {
+    tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+      if (!file->is_alive) {
+        for (Symbol<E> *sym : file->get_global_syms()) {
+          if (sym->file == file && ctx.arg.undefined_glob.find(sym->name())) {
+            file->is_alive = true;
+            sym->gc_root = true;
+            break;
+          }
+        }
+      }
+    });
+  }
 
   std::vector<InputFile<E> *> roots;
 
@@ -168,17 +225,37 @@ static void mark_live_objects(Context<E> &ctx) {
 
   tbb::parallel_for_each(roots, [&](InputFile<E> *file,
                                     tbb::feeder<InputFile<E> *> &feeder) {
-    if (file->is_alive)
-      file->mark_live_objects(ctx, [&](InputFile<E> *obj) { feeder.add(obj); });
+    file->mark_live_objects(ctx, [&](InputFile<E> *obj) { feeder.add(obj); });
+  });
+}
+
+template <typename E>
+static void clear_symbols(Context<E> &ctx) {
+  std::vector<InputFile<E> *> files;
+  append(files, ctx.objs);
+  append(files, ctx.dsos);
+
+  tbb::parallel_for_each(files, [](InputFile<E> *file) {
+    for (Symbol<E> *sym : file->get_global_syms()) {
+      if (__atomic_load_n(&sym->file, __ATOMIC_ACQUIRE) == file) {
+        sym->origin = 0;
+        sym->value = -1;
+        sym->sym_idx = -1;
+        sym->ver_idx = VER_NDX_UNSPECIFIED;
+        sym->is_weak = false;
+        sym->is_imported = false;
+        sym->is_exported = false;
+        __atomic_store_n(&sym->file, nullptr, __ATOMIC_RELEASE);
+      }
+    }
   });
 }
 
 template <typename E>
 void do_resolve_symbols(Context<E> &ctx) {
-  auto for_each_file = [&](std::function<void(InputFile<E> *)> fn) {
-    tbb::parallel_for_each(ctx.objs, fn);
-    tbb::parallel_for_each(ctx.dsos, fn);
-  };
+  std::vector<InputFile<E> *> files;
+  append(files, ctx.objs);
+  append(files, ctx.dsos);
 
   // Due to legacy reasons, archive members will only get included in the final
   // binary if they satisfy one of the undefined symbols in a non-archive object
@@ -203,7 +280,9 @@ void do_resolve_symbols(Context<E> &ctx) {
     Timer t(ctx, "extract_archive_members");
 
     // Register symbols
-    for_each_file([&](InputFile<E> *file) { file->resolve_symbols(ctx); });
+    tbb::parallel_for_each(files, [&](InputFile<E> *file) {
+      file->resolve_symbols(ctx);
+    });
 
     // Mark reachable objects to decide which files to include into an output.
     // This also merges symbol visibility.
@@ -212,10 +291,11 @@ void do_resolve_symbols(Context<E> &ctx) {
     // Cleanup. The rule used for archive extraction isn't accurate for the
     // general case of symbol extraction, so reset the resolution to be redone
     // later.
-    for_each_file([](InputFile<E> *file) { file->clear_symbols(); });
+    clear_symbols(ctx);
 
     // Now that the symbol references are gone, remove the eliminated files from
     // the file list.
+    std::erase_if(files, [](InputFile<E> *file) { return !file->is_alive; });
     std::erase_if(ctx.objs, [](InputFile<E> *file) { return !file->is_alive; });
     std::erase_if(ctx.dsos, [](InputFile<E> *file) { return !file->is_alive; });
   }
@@ -247,7 +327,9 @@ void do_resolve_symbols(Context<E> &ctx) {
   // Since we have turned on object files live bits, their symbols
   // may now have higher priority than before. So run the symbol
   // resolution pass again to get the final resolution result.
-  for_each_file([&](InputFile<E> *file) { file->resolve_symbols(ctx); });
+  tbb::parallel_for_each(files, [&](InputFile<E> *file) {
+    file->resolve_symbols(ctx);
+  });
 }
 
 template <typename E>
@@ -259,7 +341,12 @@ void resolve_symbols(Context<E> &ctx) {
 
   do_resolve_symbols(ctx);
 
-  if (ctx.has_lto_object) {
+  bool has_lto_obj = false;
+  for (ObjectFile<E> *file : objs)
+    if (file->is_alive && (file->is_lto_obj || file->is_gcc_offload_obj))
+      has_lto_obj = true;
+
+  if (has_lto_obj) {
     // Do link-time optimization. We pass all IR object files to the
     // compiler backend to compile them into a few ELF object files.
     //
@@ -282,13 +369,7 @@ void resolve_symbols(Context<E> &ctx) {
     append(ctx.objs, lto_objs);
 
     // Redo name resolution from scratch.
-    tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-      file->clear_symbols();
-    });
-
-    tbb::parallel_for_each(ctx.dsos, [&](SharedFile<E> *file) {
-      file->clear_symbols();
-    });
+    clear_symbols(ctx);
 
     // Remove IR object files.
     for (ObjectFile<E> *file : ctx.objs)
@@ -304,6 +385,7 @@ void resolve_symbols(Context<E> &ctx) {
 // .eh_frame sections are parsed and regenerated by the linker for the purpose
 // of deduplication and garbage collection. As such, the input sections should
 // not be copied over.
+//
 // However, in very rare cases (e.g. GCC CRT compiled with LTO) we might need
 // to resolve cross-object .eh_frame section references (they only point to
 // begin or end and don't depend on the actual section contents).
@@ -313,14 +395,17 @@ template <typename E>
 void kill_eh_frame_sections(Context<E> &ctx) {
   Timer t(ctx, "kill_eh_frame_sections");
 
+  for (ObjectFile<E> *file : ctx.objs)
+    for (InputSection<E> *sec : file->eh_frame_sections)
+      sec->is_alive = false;
+}
+
+template <typename E>
+void split_section_pieces(Context<E> &ctx) {
+  Timer t(ctx, "split_section_pieces");
+
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    for (i64 i = 0; i < file->sections.size(); i++) {
-      if (std::unique_ptr<InputSection<E>> &isec = file->sections[i]) {
-        if (isec && isec->is_alive && isec->name() == ".eh_frame") {
-          isec->is_alive = false;
-        }
-      }
-    }
+    file->initialize_mergeable_sections(ctx);
   });
 }
 
@@ -328,9 +413,9 @@ template <typename E>
 void resolve_section_pieces(Context<E> &ctx) {
   Timer t(ctx, "resolve_section_pieces");
 
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    file->initialize_mergeable_sections(ctx);
-  });
+  // We aim 2/3 occupation ratio
+  for (std::unique_ptr<MergedSection<E>> &sec : ctx.merged_sections)
+    sec->map.resize(sec->estimator.get_cardinality() * 3 / 2);
 
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     file->resolve_section_pieces(ctx);
@@ -359,7 +444,10 @@ template <typename E>
 void add_comment_string(Context<E> &ctx, std::string str) {
   MergedSection<E> *sec =
     MergedSection<E>::get_instance(ctx, ".comment", SHT_PROGBITS,
-                                   SHF_MERGE | SHF_STRINGS);
+                                   SHF_MERGE | SHF_STRINGS, 1, 1);
+
+  if (sec->map.nbuckets == 0)
+    sec->map.resize(4096);
 
   std::string_view buf = save_string(ctx, str);
   std::string_view data(buf.data(), buf.size() + 1);
@@ -372,7 +460,7 @@ void compute_merged_section_sizes(Context<E> &ctx) {
 
   // Add an identification string to .comment.
   if (!ctx.arg.oformat_binary)
-    add_comment_string(ctx, mold_version);
+    add_comment_string(ctx, get_mold_version());
 
   // Embed command line arguments for debugging.
   if (char *env = getenv("MOLD_DEBUG"); env && env[0])
@@ -399,7 +487,20 @@ static std::vector<std::span<T>> split(std::vector<T> &input, i64 unit) {
 }
 
 template <typename E>
+static bool has_ctors_and_init_array(Context<E> &ctx) {
+  bool x = false;
+  bool y = false;
+  for (ObjectFile<E> *file : ctx.objs) {
+    x |= file->has_ctors;
+    y |= file->has_init_array;
+  }
+  return x && y;
+}
+
+template <typename E>
 static u64 canonicalize_type(std::string_view name, u64 type) {
+  // Some old assemblers don't recognize these section names and
+  // create them as SHT_PROGBITS.
   if (type == SHT_PROGBITS) {
     if (name == ".init_array" || name.starts_with(".init_array."))
       return SHT_INIT_ARRAY;
@@ -407,24 +508,33 @@ static u64 canonicalize_type(std::string_view name, u64 type) {
       return SHT_FINI_ARRAY;
   }
 
+  // The x86-64 psABI defines SHT_X86_64_UNWIND for .eh_frame, allowing
+  // the linker to recognize the section not by name but by section type.
+  // However, that spec change was generally considered a mistake; it has
+  // just complicated the situation. As a result, .eh_frame on x86-64 may
+  // be either SHT_PROGBITS or SHT_X86_64_UNWIND. We use SHT_PROGBITS
+  // consistently.
   if constexpr (is_x86_64<E>)
     if (type == SHT_X86_64_UNWIND)
       return SHT_PROGBITS;
+
   return type;
 }
 
 struct OutputSectionKey {
+  bool operator==(const OutputSectionKey &) const = default;
   std::string_view name;
   u64 type;
-  u64 flags;
 
-  bool operator==(const OutputSectionKey &other) const {
-    return name == other.name && type == other.type && flags == other.flags;
-  }
+  struct Hash {
+    size_t operator()(const OutputSectionKey &k) const {
+      return combine_hash(hash_string(k.name), std::hash<u64>{}(k.type));
+    }
+  };
 };
 
 template <typename E>
-std::string_view
+static std::string_view
 get_output_name(Context<E> &ctx, std::string_view name, u64 flags) {
   if (ctx.arg.relocatable && !ctx.arg.relocatable_merge_sections)
     return name;
@@ -477,21 +587,52 @@ get_output_name(Context<E> &ctx, std::string_view name, u64 flags) {
 
 template <typename E>
 static OutputSectionKey
-get_output_section_key(Context<E> &ctx, InputSection<E> &isec) {
+get_output_section_key(Context<E> &ctx, InputSection<E> &isec,
+                       bool ctors_in_init_array) {
+  // If .init_array/.fini_array exist, .ctors/.dtors must be merged
+  // with them.
+  //
+  // CRT object files contain .ctors/.dtors sections without any
+  // relocations. They contain sentinel values, 0 and -1, to mark the
+  // beginning and the end of the initializer/finalizer pointer arrays.
+  // We do not place them into .init_array/.fini_array because such
+  // invalid pointer values would simply make the program to crash.
+  if (ctors_in_init_array && !isec.get_rels(ctx).empty()) {
+    std::string_view name = isec.name();
+    if (name == ".ctors" || name.starts_with(".ctors."))
+      return {".init_array", SHT_INIT_ARRAY};
+    if (name == ".dtors" || name.starts_with(".dtors."))
+      return {".fini_array", SHT_FINI_ARRAY};
+  }
+
   const ElfShdr<E> &shdr = isec.shdr();
   std::string_view name = get_output_name(ctx, isec.name(), shdr.sh_flags);
   u64 type = canonicalize_type<E>(name, shdr.sh_type);
-  u64 flags = shdr.sh_flags & ~(u64)SHF_COMPRESSED;
+  return {name, type};
+}
 
-  if (!ctx.arg.relocatable)
-    flags &= ~(u64)SHF_GROUP & ~(u64)SHF_GNU_RETAIN;
+template <typename E>
+static bool is_relro(OutputSection<E> &osec) {
+  // PT_GNU_RELRO segment is a security mechanism to make more pages
+  // read-only than we could have done without it.
+  //
+  // Traditionally, sections are either read-only or read-write. If a
+  // section contains dynamic relocations, it must have been put into a
+  // read-write segment so that the program loader can mutate its
+  // contents in memory, even if no one will write to it at runtime.
+  //
+  // RELRO segment allows us to make such pages writable only when a
+  // program is being loaded. After that, the page becomes read-only.
+  //
+  // Some sections, such as .init, .fini, .got, .dynamic, contain
+  // dynamic relocations but doesn't have to be writable at runtime,
+  // so they are put into a RELRO segment.
+  u32 type = osec.shdr.sh_type;
+  u32 flags = osec.shdr.sh_flags;
 
-  // .init_array is usually writable. We don't want to create multiple
-  // .init_array output sections, so make it always writable.
-  // So is .fini_array.
-  if (type == SHT_INIT_ARRAY || type == SHT_FINI_ARRAY)
-    flags |= SHF_WRITE;
-  return {name, type, flags};
+  return osec.name == ".toc" || osec.name.ends_with(".rel.ro") ||
+         type == SHT_INIT_ARRAY || type == SHT_FINI_ARRAY ||
+         type == SHT_PREINIT_ARRAY || (flags & SHF_TLS);
 }
 
 // Create output sections for input sections.
@@ -499,23 +640,18 @@ template <typename E>
 void create_output_sections(Context<E> &ctx) {
   Timer t(ctx, "create_output_sections");
 
-  struct Hash {
-    size_t operator()(const OutputSectionKey &k) const {
-      u64 h = hash_string(k.name);
-      h = combine_hash(h, std::hash<u64>{}(k.type));
-      h = combine_hash(h, std::hash<u64>{}(k.flags));
-      return h;
-    }
-  };
-
-  std::unordered_map<OutputSectionKey, OutputSection<E> *, Hash> map;
+  using MapType = std::unordered_map<OutputSectionKey, OutputSection<E> *,
+                                     OutputSectionKey::Hash>;
+  MapType map;
   std::shared_mutex mu;
+  i64 size = ctx.osec_pool.size();
+  bool ctors_in_init_array = has_ctors_and_init_array(ctx);
 
   // Instantiate output sections
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     // Make a per-thread cache of the main map to avoid lock contention.
     // It makes a noticeable difference if we have millions of input sections.
-    decltype(map) cache;
+    MapType cache;
     {
       std::shared_lock lock(mu);
       cache = map;
@@ -525,63 +661,82 @@ void create_output_sections(Context<E> &ctx) {
       if (!isec || !isec->is_alive)
         continue;
 
-      OutputSectionKey key = get_output_section_key(ctx, *isec);
+      const ElfShdr<E> &shdr = isec->shdr();
+      u32 sh_flags = shdr.sh_flags & ~SHF_MERGE & ~SHF_STRINGS &
+                     ~SHF_COMPRESSED & ~SHF_GNU_RETAIN;
 
-      if (auto it = cache.find(key); it != cache.end()) {
-        isec->output_section = it->second;
+      if (ctx.arg.relocatable && (sh_flags & SHF_GROUP)) {
+        OutputSection<E> *osec = new OutputSection<E>(isec->name(), shdr.sh_type);
+        osec->sh_flags = sh_flags;
+        isec->output_section = osec;
+        ctx.osec_pool.emplace_back(osec);
         continue;
       }
 
       auto get_or_insert = [&] {
+        OutputSectionKey key =
+          get_output_section_key(ctx, *isec, ctors_in_init_array);
+
+        if (auto it = cache.find(key); it != cache.end())
+          return it->second;
+
         {
           std::shared_lock lock(mu);
-          if (auto it = map.find(key); it != map.end())
+          if (auto it = map.find(key); it != map.end()) {
+            cache.insert({key, it->second});
             return it->second;
+          }
         }
 
         std::unique_ptr<OutputSection<E>> osec =
-          std::make_unique<OutputSection<E>>(key.name, key.type, key.flags);
+          std::make_unique<OutputSection<E>>(key.name, key.type);
 
         std::unique_lock lock(mu);
         auto [it, inserted] = map.insert({key, osec.get()});
-        OutputSection<E> *ret = it->second;
-        lock.unlock();
 
         if (inserted)
           ctx.osec_pool.emplace_back(std::move(osec));
-        return ret;
+        cache.insert({key, it->second});
+        return it->second;
       };
 
       OutputSection<E> *osec = get_or_insert();
+      sh_flags &= ~SHF_GROUP;
+      if ((osec->sh_flags & sh_flags) != sh_flags)
+        osec->sh_flags |= sh_flags;
       isec->output_section = osec;
-      cache.insert({key, osec});
     }
   });
 
+  for (std::unique_ptr<OutputSection<E>> &osec : ctx.osec_pool) {
+    osec->shdr.sh_flags = osec->sh_flags;
+    osec->is_relro = is_relro(*osec);
+  }
+
   // Add input sections to output sections
+  std::vector<Chunk<E> *> chunks;
+  for (i64 i = size; i < ctx.osec_pool.size(); i++)
+    chunks.push_back(ctx.osec_pool[i].get());
+
   for (ObjectFile<E> *file : ctx.objs)
     for (std::unique_ptr<InputSection<E>> &isec : file->sections)
       if (isec && isec->is_alive)
         isec->output_section->members.push_back(isec.get());
 
   // Add output sections and mergeable sections to ctx.chunks
-  std::vector<Chunk<E> *> vec;
-  for (std::pair<const OutputSectionKey, OutputSection<E> *> &kv : map)
-    vec.push_back(kv.second);
-
   for (std::unique_ptr<MergedSection<E>> &osec : ctx.merged_sections)
     if (osec->shdr.sh_size)
-      vec.push_back(osec.get());
+      chunks.push_back(osec.get());
 
   // Sections are added to the section lists in an arbitrary order
   // because they are created in parallel. Sort them to to make the
   // output deterministic.
-  tbb::parallel_sort(vec.begin(), vec.end(), [](Chunk<E> *x, Chunk<E> *y) {
+  tbb::parallel_sort(chunks.begin(), chunks.end(), [](Chunk<E> *x, Chunk<E> *y) {
     return std::tuple(x->name, x->shdr.sh_type, x->shdr.sh_flags) <
            std::tuple(y->name, y->shdr.sh_type, y->shdr.sh_flags);
   });
 
-  append(ctx.chunks, vec);
+  append(ctx.chunks, chunks);
 }
 
 // Create a dummy object file containing linker-synthesized
@@ -619,34 +774,9 @@ void create_internal_file(Context<E> &ctx) {
     ctx.internal_esyms.push_back(esym);
   };
 
-  auto add_undef = [&](Symbol<E> *sym) {
-    obj->symbols.push_back(sym);
-    sym->value = 0xdeadbeef;
-
-    ElfSym<E> esym;
-    memset(&esym, 0, sizeof(esym));
-    esym.st_type = STT_NOTYPE;
-    esym.st_shndx = SHN_UNDEF;
-    esym.st_bind = STB_GLOBAL;
-    esym.st_visibility = STV_DEFAULT;
-    ctx.internal_esyms.push_back(esym);
-  };
-
-  // Add --defsym symbols
-  for (i64 i = 0; i < ctx.arg.defsyms.size(); i++) {
-    Symbol<E> *sym = ctx.arg.defsyms[i].first;
-    std::variant<Symbol<E> *, u64> val = ctx.arg.defsyms[i].second;
-    add(sym);
-
-    if (Symbol<E> **ref = std::get_if<Symbol<E> *>(&val)) {
-      // Add an undefined symbol to keep a reference to the defsym target.
-      // This prevents elimination by e.g. LTO or gc-sections.
-      // The undefined symbol will never make to the final object file; we
-      // double-check that the defsym target is not undefined in
-      // fix_synthetic_symbols.
-      add_undef(*ref);
-    }
-  }
+  // Add --defsym'd symbols
+  for (i64 i = 0; i < ctx.arg.defsyms.size(); i++)
+    add(ctx.arg.defsyms[i].first);
 
   // Add --section-order symbols
   for (SectionOrder &ord : ctx.arg.section_order)
@@ -688,10 +818,10 @@ template <typename E>
 void add_synthetic_symbols(Context<E> &ctx) {
   ObjectFile<E> &obj = *ctx.internal_obj;
 
-  auto add = [&](std::string_view name) {
+  auto add = [&](std::string_view name, u32 type = STT_NOTYPE) {
     ElfSym<E> esym;
     memset(&esym, 0, sizeof(esym));
-    esym.st_type = STT_NOTYPE;
+    esym.st_type = type;
     esym.st_shndx = SHN_ABS;
     esym.st_bind = STB_GLOBAL;
     esym.st_visibility = STV_HIDDEN;
@@ -737,11 +867,13 @@ void add_synthetic_symbols(Context<E> &ctx) {
     ctx.__dso_handle = add("__dso_handle");
 
   if constexpr (supports_tlsdesc<E>)
-    ctx._TLS_MODULE_BASE_ = add("_TLS_MODULE_BASE_");
+    ctx._TLS_MODULE_BASE_ = add("_TLS_MODULE_BASE_", STT_TLS);
 
-  if constexpr (is_riscv<E>)
-    if (!ctx.arg.shared)
-      ctx.__global_pointer = add("__global_pointer$");
+  if constexpr (is_riscv<E>) {
+    ctx.__global_pointer = add("__global_pointer$");
+    if (ctx.dynamic && !ctx.arg.shared)
+      ctx.__global_pointer->is_exported = true;
+  }
 
   if constexpr (is_arm32<E>) {
     ctx.__exidx_start = add("__exidx_start");
@@ -754,20 +886,28 @@ void add_synthetic_symbols(Context<E> &ctx) {
   if constexpr (is_ppc32<E>)
     ctx.extra._SDA_BASE_ = add("_SDA_BASE_");
 
-  if constexpr (is_mips<E>)
-    ctx._gp = add("_gp");
+  auto add_start_stop = [&](std::string s) {
+    add(save_string(ctx, s));
+    if (ctx.arg.z_start_stop_visibility_protected)
+      get_symbol(ctx, save_string(ctx, s))->is_exported = true;
+  };
 
   for (Chunk<E> *chunk : ctx.chunks) {
     if (std::optional<std::string> name = get_start_stop_name(ctx, *chunk)) {
-      add(save_string(ctx, "__start_" + *name));
-      add(save_string(ctx, "__stop_" + *name));
+      add_start_stop("__start_" + *name);
+      add_start_stop("__stop_" + *name);
 
       if (ctx.arg.physical_image_base) {
-        add(save_string(ctx, "__phys_start_" + *name));
-        add(save_string(ctx, "__phys_stop_" + *name));
+        add_start_stop("__phys_start_" + *name);
+        add_start_stop("__phys_stop_" + *name);
       }
     }
   }
+
+  if constexpr (is_ppc64v2<E>)
+    for (std::pair<std::string_view, u32> p : ppc64_save_restore_insns)
+      if (std::string_view label = p.first; !label.empty())
+        add(label);
 
   obj.elf_syms = ctx.internal_esyms;
   obj.has_symver.resize(ctx.internal_esyms.size() - 1);
@@ -776,32 +916,45 @@ void add_synthetic_symbols(Context<E> &ctx) {
 
   // Make all synthetic symbols relative ones by associating them to
   // a dummy output section.
-  for (Symbol<E> *sym : obj.symbols)
-    if (sym->file == &obj)
+  for (Symbol<E> *sym : obj.symbols) {
+    if (sym->file == &obj) {
       sym->set_output_section(ctx.symtab);
+      sym->is_imported = false;
+    }
+  }
 
   // Handle --defsym symbols.
   for (i64 i = 0; i < ctx.arg.defsyms.size(); i++) {
-    Symbol<E> *sym = ctx.arg.defsyms[i].first;
+    Symbol<E> *sym1 = ctx.arg.defsyms[i].first;
     std::variant<Symbol<E> *, u64> val = ctx.arg.defsyms[i].second;
 
-    Symbol<E> *target = nullptr;
-    if (Symbol<E> **ref = std::get_if<Symbol<E> *>(&val))
-      target = *ref;
+    if (Symbol<E> **ref = std::get_if<Symbol<E> *>(&val)) {
+      Symbol<E> *sym2 = *ref;
+      if (!sym2->file) {
+        Error(ctx) << "--defsym: undefined symbol: " << *sym2;
+        continue;
+      }
 
-    // If the alias refers another symobl, copy ELF symbol attributes.
-    if (target) {
       ElfSym<E> &esym = obj.elf_syms[i + 1];
-      esym.st_type = target->esym().st_type;
+      esym.st_type = sym2->esym().st_type;
       if constexpr (is_ppc64v2<E>)
-        esym.ppc_local_entry = target->esym().ppc_local_entry;
+        esym.ppc_local_entry = sym2->esym().ppc_local_entry;
+
+      if (sym2->is_absolute())
+        sym1->origin = 0;
+    } else {
+      sym1->origin = 0;
     }
-
-    // Make the target absolute if necessary.
-    if (!target || target->is_absolute())
-      sym->origin = 0;
   }
+}
 
+template <typename E>
+void apply_section_align(Context<E> &ctx) {
+  for (Chunk<E> *chunk : ctx.chunks)
+    if (OutputSection<E> *osec = chunk->to_osec())
+      if (auto it = ctx.arg.section_align.find(osec->name);
+          it != ctx.arg.section_align.end())
+        osec->shdr.sh_addralign = it->second;
 }
 
 template <typename E>
@@ -843,7 +996,7 @@ void check_cet_errors(Context<E> &ctx) {
 
 template <typename E>
 void print_dependencies(Context<E> &ctx) {
-  SyncOut(ctx) <<
+  Out(ctx) <<
 R"(# This is an output of the mold linker's --print-dependencies option.
 #
 # Each line consists of 4 fields, <section1>, <section2>, <symbol-type> and
@@ -857,13 +1010,13 @@ R"(# This is an output of the mold linker's --print-dependencies option.
 
   auto println = [&](auto &src, Symbol<E> &sym, ElfSym<E> &esym) {
     if (InputSection<E> *isec = sym.get_input_section())
-      SyncOut(ctx) << src << "\t" << *isec
-                   << "\t" << (esym.is_weak() ? 'w' : 'u')
-                   << "\t" << sym;
+      Out(ctx) << src << "\t" << *isec
+               << "\t" << (esym.is_weak() ? 'w' : 'u')
+               << "\t" << sym;
     else
-      SyncOut(ctx) << src << "\t" << *sym.file
-                   << "\t" << (esym.is_weak() ? 'w' : 'u')
-                   << "\t" << sym;
+      Out(ctx) << src << "\t" << *sym.file
+               << "\t" << (esym.is_weak() ? 'w' : 'u')
+               << "\t" << sym;
   };
 
   for (ObjectFile<E> *file : ctx.objs) {
@@ -930,20 +1083,18 @@ void write_repro_file(Context<E> &ctx) {
   if (!tar)
     Fatal(ctx) << "cannot open " << path << ": " << errno_string();
 
-  tar->append("response.txt", save_string(ctx, create_response_file(ctx)));
-  tar->append("version.txt", save_string(ctx, mold_version + "\n"));
+  tar->append("response.txt", create_response_file(ctx));
+  tar->append("version.txt", get_mold_version() + "\n");
 
-  std::unordered_set<std::string> seen;
-  for (std::unique_ptr<MappedFile<Context<E>>> &mf : ctx.mf_pool) {
-    if (!mf->parent) {
-      std::string path = to_abs_path(mf->name).string();
-      if (seen.insert(path).second) {
-        // We reopen a file because we may have modified the contents of mf
-        // in memory, which is mapped with PROT_WRITE and MAP_PRIVATE.
-        MappedFile<Context<E>> *mf2 = MappedFile<Context<E>>::must_open(ctx, path);
-        tar->append(path, mf2->get_contents());
-        mf2->unmap();
-      }
+  std::unordered_set<std::string_view> seen;
+
+  for (std::unique_ptr<MappedFile> &mf : ctx.mf_pool) {
+    if (!mf->parent && seen.insert(mf->name).second) {
+      // We reopen a file because we may have modified the contents of mf
+      // in memory, which is mapped with PROT_WRITE and MAP_PRIVATE.
+      MappedFile *mf2 = must_open_file(ctx, mf->name);
+      tar->append(to_abs_path(mf->name).string(), mf2->get_contents());
+      mf2->unmap();
     }
   }
 }
@@ -982,47 +1133,77 @@ template <typename E>
 void check_symbol_types(Context<E> &ctx) {
   Timer t(ctx, "check_symbol_types");
 
-  auto check = [&](InputFile<E> *file) {
-    for (i64 i = file->first_global; i < file->elf_syms.size(); i++) {
-      const ElfSym<E> &esym = file->elf_syms[i];
-      Symbol<E> &sym = *file->symbols[i];
+  std::vector<InputFile<E> *> files;
+  append(files, ctx.objs);
+  append(files, ctx.dsos);
 
-      if (!sym.file)
-        continue;
-
-      u32 x = sym.esym().st_type;
-      if (x == STT_GNU_IFUNC)
-        x = STT_FUNC;
-
-      u32 y = esym.st_type;
-      if (y == STT_GNU_IFUNC)
-        y = STT_FUNC;
-
-      if (x != STT_NOTYPE && y != STT_NOTYPE && x != y)
-        Warn(ctx) << "symbol type mismatch: " << sym << '\n'
-                  << ">>> defined in " << *sym.file << " as "
-                  << stt_to_string<E>(sym.esym().st_type) << '\n'
-                  << ">>> defined in " << *file << " as "
-                  << stt_to_string<E>(esym.st_type);
+  auto canonicalize = [](u32 ty) -> u32 {
+    switch (ty) {
+    case STT_GNU_IFUNC:
+      return STT_FUNC;
+    case STT_COMMON:
+      return STT_OBJECT;
+    default:
+      return ty;
     }
   };
 
-  tbb::parallel_for_each(ctx.objs, check);
-  tbb::parallel_for_each(ctx.dsos, check);
+  tbb::parallel_for_each(files.begin(), files.end(), [&](InputFile<E> *file) {
+    for (i64 i = file->first_global; i < file->elf_syms.size(); i++) {
+      Symbol<E> &sym = *file->symbols[i];
+      if (!sym.file || sym.file == file)
+        continue;
+
+      const ElfSym<E> &esym1 = sym.esym();
+      const ElfSym<E> &esym2 = file->elf_syms[i];
+
+      if (esym1.st_type != STT_NOTYPE && esym2.st_type != STT_NOTYPE &&
+          canonicalize(esym1.st_type) != canonicalize(esym2.st_type)) {
+        Warn(ctx) << "symbol type mismatch: " << sym << '\n'
+                  << ">>> defined in " << *sym.file << " as "
+                  << stt_to_string<E>(esym1.st_type) << '\n'
+                  << ">>> defined in " << *file << " as "
+                  << stt_to_string<E>(esym2.st_type);
+      }
+    }
+  });
+}
+
+template <typename E>
+static i64 get_init_fini_priority(InputSection<E> *isec) {
+  static std::regex re(R"(\.(\d+)$)", std::regex_constants::optimize);
+  std::string_view name = isec->name();
+  std::cmatch m;
+  if (std::regex_search(name.data(), name.data() + name.size(), m, re))
+    return std::stoi(m[1]);
+  return 65536;
+}
+
+template <typename E>
+static i64 get_ctor_dtor_priority(InputSection<E> *isec) {
+  auto opts = std::regex_constants::optimize | std::regex_constants::ECMAScript;
+  static std::regex re1(R"((?:clang_rt\.)?crtbegin)", opts);
+  static std::regex re2(R"((?:clang_rt\.)?crtend)", opts);
+  static std::regex re3(R"(\.(\d+)$)", opts);
+
+  // crtbegin.o and crtend.o contain marker symbols such as
+  // __CTOR_LIST__ or __DTOR_LIST__. So they have to be at the
+  // beginning or end of the section.
+  std::smatch m;
+  if (std::regex_search(isec->file.filename, m, re1))
+    return -2;
+  if (std::regex_search(isec->file.filename, m, re2))
+    return 65536;
+
+  std::string name(isec->name());
+  if (std::regex_search(name, m, re3))
+    return std::stoi(m[1]);
+  return -1;
 }
 
 template <typename E>
 void sort_init_fini(Context<E> &ctx) {
   Timer t(ctx, "sort_init_fini");
-
-  auto get_priority = [](InputSection<E> *isec) {
-    static std::regex re(R"(\.(\d+)$)", std::regex_constants::optimize);
-    std::string_view name = isec->name();
-    std::cmatch m;
-    if (std::regex_search(name.data(), name.data() + name.size(), m, re))
-      return std::stoi(m[1]);
-    return 65536;
-  };
 
   for (Chunk<E> *chunk : ctx.chunks) {
     if (OutputSection<E> *osec = chunk->to_osec()) {
@@ -1032,8 +1213,14 @@ void sort_init_fini(Context<E> &ctx) {
           std::reverse(osec->members.begin(), osec->members.end());
 
         std::unordered_map<InputSection<E> *, i64> map;
-        for (InputSection<E> *isec : osec->members)
-          map.insert({isec, get_priority(isec)});
+
+        for (InputSection<E> *isec : osec->members) {
+          std::string_view name = isec->name();
+          if (name.starts_with(".ctors") || name.starts_with(".dtors"))
+            map.insert({isec, 65535 - get_ctor_dtor_priority(isec)});
+          else
+            map.insert({isec, get_init_fini_priority(isec)});
+        }
 
         sort(osec->members, [&](InputSection<E> *a, InputSection<E> *b) {
           return map[a] < map[b];
@@ -1047,27 +1234,6 @@ template <typename E>
 void sort_ctor_dtor(Context<E> &ctx) {
   Timer t(ctx, "sort_ctor_dtor");
 
-  auto get_priority = [](InputSection<E> *isec) {
-    auto opts = std::regex_constants::optimize | std::regex_constants::ECMAScript;
-    static std::regex re1(R"((?:clang_rt\.)?crtbegin)", opts);
-    static std::regex re2(R"((?:clang_rt\.)?crtend)", opts);
-    static std::regex re3(R"(\.(\d+)$)", opts);
-
-    // crtbegin.o and crtend.o contain marker symbols such as
-    // __CTOR_LIST__ or __DTOR_LIST__. So they have to be at the
-    // beginning or end of the section.
-    std::smatch m;
-    if (std::regex_search(isec->file.filename, m, re1))
-      return -2;
-    if (std::regex_search(isec->file.filename, m, re2))
-      return 65536;
-
-    std::string name(isec->name());
-    if (std::regex_search(name, m, re3))
-      return std::stoi(m[1]);
-    return -1;
-  };
-
   for (Chunk<E> *chunk : ctx.chunks) {
     if (OutputSection<E> *osec = chunk->to_osec()) {
       if (osec->name == ".ctors" || osec->name == ".dtors") {
@@ -1076,7 +1242,7 @@ void sort_ctor_dtor(Context<E> &ctx) {
 
         std::unordered_map<InputSection<E> *, i64> map;
         for (InputSection<E> *isec : osec->members)
-          map.insert({isec, get_priority(isec)});
+          map.insert({isec, get_ctor_dtor_priority(isec)});
 
         sort(osec->members, [&](InputSection<E> *a, InputSection<E> *b) {
           return map[a] < map[b];
@@ -1084,6 +1250,46 @@ void sort_ctor_dtor(Context<E> &ctx) {
       }
     }
   }
+}
+
+// .ctors/.dtors serves the same purpose as .init_array/.fini_array,
+// albeit with very subtly differences. Both contain pointers to
+// initializer/finalizer functions. The runtime executes them one by one
+// but in the exact opposite order to one another. Therefore, if we are to
+// place the contents of .ctors/.dtors into .init_array/.fini_array, we
+// need to reverse them.
+//
+// It's unfortunate that we have both .ctors/.dtors and
+// .init_array/.fini_array in ELF for historical reasons, but that's
+// the reality we need to deal with.
+template <typename E>
+void fixup_ctors_in_init_array(Context<E> &ctx) {
+  Timer t(ctx, "fixup_ctors_in_init_array");
+
+  auto fixup = [&](OutputSection<E> &osec) {
+    for (InputSection<E> *isec : osec.members) {
+      if (isec->name().starts_with(".ctors") ||
+          isec->name().starts_with(".dtors")) {
+        if (isec->sh_size % sizeof(Word<E>)) {
+          Error(ctx) << *isec << ": section corrupted";
+          continue;
+        }
+
+        u8 *buf = (u8 *)isec->contents.data();
+        std::reverse((Word<E> *)buf, (Word<E> *)(buf + isec->sh_size));
+
+        std::span<ElfRel<E>> rels = isec->get_rels(ctx);
+        for (ElfRel<E> &r : rels)
+          r.r_offset = isec->sh_size - r.r_offset - sizeof(Word<E>);
+        std::reverse(rels.begin(), rels.end());
+      }
+    }
+  };
+
+  if (OutputSection<E> *osec = find_section(ctx, ".init_array"))
+    fixup(*osec);
+  if (OutputSection<E> *osec = find_section(ctx, ".fini_array"))
+    fixup(*osec);
 }
 
 template <typename T>
@@ -1185,18 +1391,15 @@ void compute_section_sizes(Context<E> &ctx) {
       }
     });
 
-    i64 offset = 0;
-    i64 p2align = 0;
+    ElfShdr<E> &shdr = osec->shdr;
+    shdr.sh_size = 0;
 
     for (i64 i = 0; i < groups.size(); i++) {
-      offset = align_to(offset, 1 << groups[i].p2align);
-      groups[i].offset = offset;
-      offset += groups[i].size;
-      p2align = std::max(p2align, groups[i].p2align);
+      shdr.sh_size = align_to(shdr.sh_size, 1 << groups[i].p2align);
+      groups[i].offset = shdr.sh_size;
+      shdr.sh_size += groups[i].size;
+      shdr.sh_addralign = std::max<u32>(shdr.sh_addralign, 1 << groups[i].p2align);
     }
-
-    osec->shdr.sh_size = offset;
-    osec->shdr.sh_addralign = 1 << p2align;
 
     // Assign offsets to input sections.
     tbb::parallel_for_each(groups, [](Group &group) {
@@ -1218,28 +1421,22 @@ void compute_section_sizes(Context<E> &ctx) {
   // create_range_extension_thunks is parallelized internally, but the
   // function itself is not thread-safe.
   if constexpr (needs_thunk<E>) {
-    for (Chunk<E> *chunk : ctx.chunks) {
-      OutputSection<E> *osec = chunk->to_osec();
-      if (osec && (osec->shdr.sh_flags & SHF_EXECINSTR) && !ctx.arg.relocatable) {
-        create_range_extension_thunks(ctx, *osec);
+    Timer t2(ctx, "create_range_extension_thunks");
 
-        for (InputSection<E> *isec : osec->members)
-          osec->shdr.sh_addralign =
-            std::max<u32>(osec->shdr.sh_addralign, 1 << isec->p2align);
-      }
-    }
+    if (!ctx.arg.relocatable)
+      for (Chunk<E> *chunk : ctx.chunks)
+        if (OutputSection<E> *osec = chunk->to_osec())
+          if (osec->shdr.sh_flags & SHF_EXECINSTR)
+            osec->create_range_extension_thunks(ctx);
   }
-
-  for (Chunk<E> *chunk : ctx.chunks)
-    if (OutputSection<E> *osec = chunk->to_osec())
-      if (u32 align = ctx.arg.section_align[osec->name])
-        osec->shdr.sh_addralign = std::max<u32>(osec->shdr.sh_addralign, align);
 }
 
 // Find all unresolved symbols and attach them to the most appropriate files.
-// Note that even a symbol that will be reported as an undefined symbol will
-// get an owner file in this function. Such symbol will be reported by
-// ObjectFile<E>::scan_relocations().
+//
+// Note that even a symbol that will be reported as an undefined symbol
+// will get an owner file in this function. Such symbol will be reported
+// by ObjectFile<E>::scan_relocations(). This is because we want to report
+// errors only on symbols that are actually referenced.
 template <typename E>
 void claim_unresolved_symbols(Context<E> &ctx) {
   Timer t(ctx, "claim_unresolved_symbols");
@@ -1280,9 +1477,9 @@ void claim_unresolved_symbols(Context<E> &ctx) {
 
       auto claim = [&](bool is_imported) {
         if (sym.is_traced)
-          SyncOut(ctx) << "trace-symbol: " << *file << ": unresolved"
-                       << (esym.is_weak() ? " weak" : "")
-                       << " symbol " << sym;
+          Out(ctx) << "trace-symbol: " << *file << ": unresolved"
+                   << (esym.is_weak() ? " weak" : "")
+                   << " symbol " << sym;
 
         sym.file = file;
         sym.origin = 0;
@@ -1317,7 +1514,8 @@ void claim_unresolved_symbols(Context<E> &ctx) {
       // promoted to dynamic symbols for compatibility with other linkers.
       // Some major programs, notably Firefox, depend on the behavior
       // (they use this loophole to export symbols from libxul.so).
-      if (ctx.arg.shared && sym.visibility != STV_HIDDEN && !ctx.arg.z_defs) {
+      if (ctx.arg.shared && sym.visibility != STV_HIDDEN &&
+          ctx.arg.unresolved_symbols != UNRESOLVED_ERROR) {
         claim(true);
         continue;
       }
@@ -1397,7 +1595,7 @@ void scan_relocations(Context<E> &ctx) {
       ctx.got->add_tlsdesc_symbol(ctx, sym);
 
     if (sym->flags & NEEDS_COPYREL) {
-      if (((SharedFile<E> *)sym->file)->is_readonly(sym))
+      if (ctx.arg.z_relro && ((SharedFile<E> *)sym->file)->is_readonly(sym))
         ctx.copyrel_relro->add_symbol(ctx, sym);
       else
         ctx.copyrel->add_symbol(ctx, sym);
@@ -1413,38 +1611,62 @@ void scan_relocations(Context<E> &ctx) {
   if constexpr (is_alpha<E>)
     ctx.extra.got->finalize();
 
-  if constexpr (is_mips<E>)
-    mips_merge_got_sections(ctx);
-
   if (ctx.has_textrel && ctx.arg.warn_textrel)
     Warn(ctx) << "creating a DT_TEXTREL in an output file";
+}
+
+// Compute the is_weak bit for each imported symbol.
+//
+// If all references to a shared symbol is weak, the symbol is marked
+// as weak in .dynsym.
+template <typename E>
+void compute_imported_symbol_weakness(Context<E> &ctx) {
+  Timer t(ctx, "compute_imported_symbol_weakness");
+
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    for (i64 i = file->first_global; i < file->elf_syms.size(); i++) {
+      const ElfSym<E> &esym = file->elf_syms[i];
+      Symbol<E> &sym = *file->symbols[i];
+
+      if (esym.is_undef() && !esym.is_weak() && sym.file && sym.file->is_dso) {
+        std::scoped_lock lock(sym.mu);
+        sym.is_weak = false;
+      }
+    }
+  });
 }
 
 // Report all undefined symbols, grouped by symbol.
 template <typename E>
 void report_undef_errors(Context<E> &ctx) {
-  constexpr i64 max_errors = 3;
+  constexpr i64 MAX_ERRORS = 3;
+
+  if (ctx.arg.unresolved_symbols == UNRESOLVED_IGNORE)
+    return;
 
   for (auto &pair : ctx.undef_errors) {
-    std::string_view sym_name = pair.first;
+    Symbol<E> *sym = pair.first;
     std::span<std::string> errors = pair.second;
 
-    if (ctx.arg.demangle)
-      sym_name = demangle(sym_name);
-
     std::stringstream ss;
-    ss << "undefined symbol: " << sym_name << "\n";
+    ss << "undefined symbol: "
+       << (ctx.arg.demangle ? demangle(*sym) : sym->name())
+       << "\n";
 
-    for (i64 i = 0; i < errors.size() && i < max_errors; i++)
+    for (i64 i = 0; i < errors.size() && i < MAX_ERRORS; i++)
       ss << errors[i];
 
-    if (errors.size() > max_errors)
-      ss << ">>> referenced " << (errors.size() - max_errors) << " more times\n";
+    if (MAX_ERRORS < errors.size())
+      ss << ">>> referenced " << (errors.size() - MAX_ERRORS) << " more times\n";
+
+    // Remove the trailing '\n' because Error/Warn adds it automatically
+    std::string msg = ss.str();
+    msg.pop_back();
 
     if (ctx.arg.unresolved_symbols == UNRESOLVED_ERROR)
-      Error(ctx) << ss.str();
-    else if (ctx.arg.unresolved_symbols == UNRESOLVED_WARN)
-      Warn(ctx) << ss.str();
+      Error(ctx) << msg;
+    else
+      Warn(ctx) << msg;
   }
 
   ctx.checkpoint();
@@ -1481,12 +1703,12 @@ void copy_chunks(Context<E> &ctx) {
   // sections first. This is because REL-type relocation sections (as
   // opposed to RELA-type) stores relocation addends to target sections.
   tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
-    if (chunk->shdr.sh_type != (E::is_rela ? SHT_RELA : SHT_REL))
+    if (chunk->shdr.sh_type != SHT_REL)
       copy(*chunk);
   });
 
   tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
-    if (chunk->shdr.sh_type == (E::is_rela ? SHT_RELA : SHT_REL))
+    if (chunk->shdr.sh_type == SHT_REL)
       copy(*chunk);
   });
 
@@ -1500,25 +1722,78 @@ void copy_chunks(Context<E> &ctx) {
     fixup_arm_exidx_section(ctx);
 }
 
+// Rewrite the leading endbr64 instruction with a nop if a function
+// symbol's address was not taken.
+template <typename E>
+void rewrite_endbr(Context<E> &ctx) {
+  Timer t(ctx, "rewrite_endbr");
+  assert(is_x86_64<E>);
+
+  // Compute address-taken bit for each symbol
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    for (std::unique_ptr<InputSection<E>> &isec : file->sections) {
+      if (isec && isec->is_alive && (isec->shdr().sh_flags & SHF_ALLOC)) {
+        for (const ElfRel<E> &rel : isec->get_rels(ctx)) {
+          Symbol<E> &sym = *file->symbols[rel.r_sym];
+          if (!is_func_call_rel(rel) && sym.esym().st_type == STT_FUNC) {
+            std::scoped_lock lock(sym.mu);
+            sym.address_taken = true;
+          }
+        }
+      }
+    }
+  });
+
+  // Exported symbols are conservatively assumed to be address-taken.
+  if (ctx.dynsym)
+    for (Symbol<E> *sym : ctx.dynsym->symbols)
+      if (sym && sym->is_exported)
+        sym->address_taken = true;
+
+  // Some symbols are implicitly address-taken
+  ctx.arg.entry->address_taken = true;
+  ctx.arg.init->address_taken = true;
+  ctx.arg.fini->address_taken = true;
+
+  // Rewrite endbr64 with nop
+  u8 endbr64[] = {0xf3, 0x0f, 0x1e, 0xfa};
+  u8 nop[] = {0x0f, 0x1f, 0x40, 0x00};
+
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    for (Symbol<E> *sym : file->symbols) {
+      if (sym->file == file && sym->esym().st_type == STT_FUNC &&
+          !sym->address_taken) {
+        if (InputSection<E> *isec = sym->get_input_section()) {
+          if (OutputSection<E> *osec = isec->output_section) {
+            u8 *buf = ctx.buf + osec->shdr.sh_offset + isec->offset +
+                      sym->value;
+            if (memcmp(buf, endbr64, 4) == 0)
+              memcpy(buf, nop, 4);
+          }
+        }
+      }
+    }
+  });
+}
+
 template <typename E>
 void construct_relr(Context<E> &ctx) {
   Timer t(ctx, "construct_relr");
 
   tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
-    if (OutputSection<E> *osec = chunk->to_osec())
-      osec->construct_relr(ctx);
+    chunk->construct_relr(ctx);
   });
-
-  ctx.got->construct_relr(ctx);
 }
 
 template <typename E>
 void create_output_symtab(Context<E> &ctx) {
   Timer t(ctx, "compute_symtab_size");
 
-  tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
-    chunk->compute_symtab_size(ctx);
-  });
+  if (!ctx.arg.strip_all && !ctx.arg.retain_symbols_file) {
+    tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
+      chunk->compute_symtab_size(ctx);
+    });
+  }
 
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     file->compute_symtab_size(ctx);
@@ -1533,18 +1808,72 @@ template <typename E>
 void apply_version_script(Context<E> &ctx) {
   Timer t(ctx, "apply_version_script");
 
-  // If all patterns are simple (i.e. not containing any meta-
-  // characters and is not a C++ name), we can simply look up
-  // symbols.
-  auto is_simple = [&] {
-    for (VersionPattern &v : ctx.version_patterns)
-      if (v.is_cpp || v.pattern.find_first_of("*?[") != v.pattern.npos)
-        return false;
-    return true;
+  // Assign versions to symbols specified with `extern "C++"` or
+  // wildcard patterns first.
+  MultiGlob matcher;
+  MultiGlob cpp_matcher;
+
+  // The "local:" label has a special meaning in the version script.
+  // It can appear in any VERSION clause, and it hides matched symbols
+  // unless other non-local patterns match to them. In other words,
+  // "local:" has lower precedence than other version definitions.
+  //
+  // If two or more non-local patterns match to the same symbol, the
+  // last one takes precedence.
+  std::vector<VersionPattern> patterns = ctx.version_patterns;
+
+  std::stable_partition(patterns.begin(), patterns.end(),
+                        [](const VersionPattern &pat) {
+    return pat.ver_idx == VER_NDX_LOCAL;
+  });
+
+  auto has_wildcard = [](std::string_view str) {
+    return str.find_first_of("*?[") != str.npos;
   };
 
-  if (is_simple()) {
-    for (VersionPattern &v : ctx.version_patterns) {
+  for (i64 i = 0; i < patterns.size(); i++) {
+    VersionPattern &v = patterns[i];
+    if (v.is_cpp) {
+      if (!cpp_matcher.add(v.pattern, i))
+        Fatal(ctx) << "invalid version pattern: " << v.pattern;
+    } else if (has_wildcard(v.pattern)) {
+      if (!matcher.add(v.pattern, i))
+        Fatal(ctx) << "invalid version pattern: " << v.pattern;
+    }
+  }
+
+  if (!matcher.empty() || !cpp_matcher.empty()) {
+    tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+      for (Symbol<E> *sym : file->get_global_syms()) {
+        if (sym->file != file)
+          continue;
+
+        std::string_view name = sym->name();
+        i64 match = -1;
+
+        if (std::optional<i64> idx = matcher.find(name))
+          match = std::max(match, *idx);
+
+        // Match non-mangled symbols against the C++ pattern as well.
+        // Weird, but required to match other linkers' behavior.
+        if (!cpp_matcher.empty()) {
+          if (std::optional<std::string_view> s = demangle_cpp(name))
+            name = *s;
+          if (std::optional<i64> idx = cpp_matcher.find(name))
+            match = std::max(match, *idx);
+        }
+
+        if (match != -1)
+          sym->ver_idx = patterns[match].ver_idx;
+      }
+    });
+  }
+
+  // Next, assign versions to symbols specified by exact name.
+  // In other words, exact matches have higher precedence over
+  // wildcard or `extern "C++"` patterns.
+  for (VersionPattern &v : patterns) {
+    if (!v.is_cpp && !has_wildcard(v.pattern)) {
       Symbol<E> *sym = get_symbol(ctx, v.pattern);
 
       if (!sym->file && !ctx.arg.undefined_version)
@@ -1554,48 +1883,7 @@ void apply_version_script(Context<E> &ctx) {
       if (sym->file && !sym->file->is_dso)
         sym->ver_idx = v.ver_idx;
     }
-    return;
   }
-
-  // Otherwise, use glob pattern matchers.
-  MultiGlob matcher;
-  MultiGlob cpp_matcher;
-
-  for (i64 i = 0; i < ctx.version_patterns.size(); i++) {
-    VersionPattern &v = ctx.version_patterns[i];
-    if (v.is_cpp) {
-      if (!cpp_matcher.add(v.pattern, i))
-        Fatal(ctx) << "invalid version pattern: " << v.pattern;
-    } else {
-      if (!matcher.add(v.pattern, i))
-        Fatal(ctx) << "invalid version pattern: " << v.pattern;
-    }
-  }
-
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    for (Symbol<E> *sym : file->get_global_syms()) {
-      if (sym->file != file)
-        continue;
-
-      std::string_view name = sym->name();
-      i64 match = INT64_MAX;
-
-      if (std::optional<u32> idx = matcher.find(name))
-        match = std::min<i64>(match, *idx);
-
-      // Match non-mangled symbols against the C++ pattern as well.
-      // Weird, but required to match other linkers' behavior.
-      if (!cpp_matcher.empty()) {
-        if (std::optional<std::string_view> s = cpp_demangle(name))
-          name = *s;
-        if (std::optional<u32> idx = cpp_matcher.find(name))
-          match = std::min<i64>(match, *idx);
-      }
-
-      if (match != INT64_MAX)
-        sym->ver_idx = ctx.version_patterns[match].ver_idx;
-    }
-  });
 }
 
 template <typename E>
@@ -1610,6 +1898,9 @@ void parse_symbol_version(Context<E> &ctx) {
     verdefs[ctx.arg.version_definitions[i]] = i + VER_NDX_LAST_RESERVED + 1;
 
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    if (file == ctx.internal_obj)
+      return;
+
     for (i64 i = file->first_global; i < file->elf_syms.size(); i++) {
       // Match VERSION part of symbol foo@VERSION with version definitions.
       if (!file->has_symver.get(i - file->first_global))
@@ -1619,14 +1910,8 @@ void parse_symbol_version(Context<E> &ctx) {
       if (sym->file != file)
         continue;
 
-      std::string_view ver;
-
-      if (file->is_lto_obj) {
-        ver = file->lto_symbol_versions[i - file->first_global];
-      } else {
-        const char *name = file->symbol_strtab.data() + file->elf_syms[i].st_name;
-        ver = strchr(name, '@') + 1;
-      }
+      const char *name = file->symbol_strtab.data() + file->elf_syms[i].st_name;
+      std::string_view ver = strchr(name, '@') + 1;
 
       bool is_default = false;
       if (ver.starts_with('@')) {
@@ -1660,6 +1945,44 @@ void parse_symbol_version(Context<E> &ctx) {
 }
 
 template <typename E>
+static bool should_export(Context<E> &ctx, Symbol<E> &sym) {
+  if (sym.visibility == STV_HIDDEN)
+    return false;
+
+  switch (sym.ver_idx) {
+  case VER_NDX_UNSPECIFIED:
+    if (ctx.arg.shared)
+      return !((ObjectFile<E> *)sym.file)->exclude_libs;
+    return ctx.arg.export_dynamic;
+  case VER_NDX_LOCAL:
+    return false;
+  default:
+    return true;
+  }
+};
+
+template <typename E>
+static bool is_protected(Context<E> &ctx, Symbol<E> &sym) {
+  if (sym.visibility == STV_PROTECTED)
+    return true;
+
+  switch (ctx.arg.Bsymbolic) {
+  case BSYMBOLIC_ALL:
+    return true;
+  case BSYMBOLIC_NONE:
+    return false;
+  case BSYMBOLIC_FUNCTIONS:
+    return sym.get_type() == STT_FUNC;
+  case BSYMBOLIC_NON_WEAK:
+    return !sym.is_weak;
+  case BSYMBOLIC_NON_WEAK_FUNCTIONS:
+    return !sym.is_weak && sym.get_type() == STT_FUNC;
+  default:
+    unreachable();
+  }
+}
+
+template <typename E>
 void compute_import_export(Context<E> &ctx) {
   Timer t(ctx, "compute_import_export");
 
@@ -1668,12 +1991,10 @@ void compute_import_export(Context<E> &ctx) {
   if (!ctx.arg.shared) {
     tbb::parallel_for_each(ctx.dsos, [&](SharedFile<E> *file) {
       for (Symbol<E> *sym : file->symbols) {
-        if (sym->file && !sym->file->is_dso && sym->visibility != STV_HIDDEN) {
-          if (sym->ver_idx != VER_NDX_LOCAL ||
-              !ctx.default_version_from_version_script) {
-            std::scoped_lock lock(sym->mu);
-            sym->is_exported = true;
-          }
+        if (sym->file && !sym->file->is_dso && sym->visibility != STV_HIDDEN &&
+            sym->ver_idx != VER_NDX_LOCAL) {
+          std::scoped_lock lock(sym->mu);
+          sym->is_exported = true;
         }
       }
     });
@@ -1683,37 +2004,167 @@ void compute_import_export(Context<E> &ctx) {
   // We also want to mark imported symbols as such.
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     for (Symbol<E> *sym : file->get_global_syms()) {
-      if (!sym->file || sym->visibility == STV_HIDDEN ||
-          sym->ver_idx == VER_NDX_LOCAL)
-        continue;
-
-      // If we are using a symbol in a DSO, we need to import it at runtime.
-      if (sym->file != file && sym->file->is_dso && !sym->is_absolute()) {
+      // If we are using a symbol in a DSO, we need to import it.
+      if (sym->file && sym->file->is_dso) {
         std::scoped_lock lock(sym->mu);
         sym->is_imported = true;
         continue;
       }
 
-      // If we are creating a DSO, all global symbols are exported by default.
-      if (sym->file == file) {
-        std::scoped_lock lock(sym->mu);
+      // If we have a definition of a symbol, we may want to export it.
+      if (sym->file == file && should_export(ctx, *sym)) {
         sym->is_exported = true;
 
-        if (ctx.arg.shared && sym->visibility != STV_PROTECTED &&
-            !ctx.arg.Bsymbolic &&
-            !(ctx.arg.Bsymbolic_functions && sym->get_type() == STT_FUNC))
+        // Exported symbols are marked as imported as well by default
+        // for DSOs.
+        if (ctx.arg.shared && !is_protected(ctx, *sym))
           sym->is_imported = true;
       }
     }
   });
+
+  // Apply --dynamic-list, --export-dynamic-symbol and
+  // --export-dynamic-symbol-list options.
+  //
+  // The semantics of these options vary depending on whether we are
+  // creating an executalbe or a shared object.
+  //
+  // For executable, matched symbols are exported.
+  //
+  // For shared objects, matched symbols are imported if it is already
+  // exported so that they are interposable. In other words, symbols
+  // that did not match will be bound locally within the output file,
+  // effectively turning them into protected symbols.
+  MultiGlob matcher;
+  MultiGlob cpp_matcher;
+
+  auto handle_match = [&](Symbol<E> *sym) {
+    if (ctx.arg.shared) {
+      if (sym->is_exported)
+        sym->is_imported = true;
+    } else {
+      if (sym->file && !sym->file->is_dso && sym->visibility != STV_HIDDEN)
+        sym->is_exported = true;
+    }
+  };
+
+  for (DynamicPattern &p : ctx.dynamic_list_patterns) {
+    if (p.is_cpp) {
+      if (!cpp_matcher.add(p.pattern, 1))
+        Fatal(ctx) << p.source << ": invalid dynamic list entry: "
+                   << p.pattern;
+      continue;
+    }
+
+    if (p.pattern.find_first_of("*?[") != p.pattern.npos) {
+      if (!matcher.add(p.pattern, 1))
+        Fatal(ctx) << p.source << ": invalid dynamic list entry: "
+                   << p.pattern;
+      continue;
+    }
+
+    handle_match(get_symbol(ctx, p.pattern));
+  }
+
+  if (!matcher.empty() || !cpp_matcher.empty()) {
+    tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+      for (Symbol<E> *sym : file->get_global_syms()) {
+        if (sym->file != file)
+          continue;
+        if (ctx.arg.shared && !sym->is_exported)
+          continue;
+
+        std::string_view name = sym->name();
+
+        if (matcher.find(name)) {
+          handle_match(sym);
+        } else if (!cpp_matcher.empty()) {
+          if (std::optional<std::string_view> s = demangle_cpp(name))
+            name = *s;
+          if (cpp_matcher.find(name))
+            handle_match(sym);
+        }
+      }
+    });
+  }
 }
 
+// Compute the "address-taken" bit for each input section.
+//
+// As a space-saving optimization, we want to merge two read-only objects
+// into a single object if their contents are equivalent. That
+// optimization is called the Identical Code Folding or ICF.
+//
+// A catch is that comparing object contents is not enough to determine if
+// two objects can be merged safely; we need to take care of pointer
+// equivalence.
+//
+// In C/C++, two pointers are equivalent if and only if they are taken for
+// the same object. Merging two objects into a single object can break
+// this assumption because two distinctive pointers would become
+// equivalent as a result of merging. We can still merge one object with
+// another if no pointer to the object was taken in code, because without
+// a pointer, comparing its address becomes moot.
+//
+// In mold, each input section has an "address-taken" bit. If there is a
+// pointer-taking reference to the object, it's set to true. At the ICF
+// stage, we merge only objects whose addresses were not taken.
+//
+// For functions, address-taking relocations are separated from
+// non-address-taking ones. For example, x86-64 uses R_X86_64_PLT32 for
+// direct function calls (e.g., "call foo" to call the function foo) while
+// R_X86_64_PC32 or R_X86_64_GOT32 are used for pointer-taking operations.
+//
+// Unfortunately, for data, we can't distinguish between address-taking
+// relocations and non-address-taking ones. LLVM generates an "address
+// significance" table in the ".llvm_addrsig" section to mark symbols
+// whose addresses are taken in code. If that table is available, we use
+// that information in this function. Otherwise, we conservatively assume
+// that all data items are address-taken.
 template <typename E>
-void mark_addrsig(Context<E> &ctx) {
-  Timer t(ctx, "mark_addrsig");
+void compute_address_significance(Context<E> &ctx) {
+  Timer t(ctx, "compute_address_significance");
 
+  // Flip address-taken bit for executable sections first.
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    file->mark_addrsig(ctx);
+    for (std::unique_ptr<InputSection<E>> &src : file->sections)
+      if (src && src->is_alive && (src->shdr().sh_flags & SHF_ALLOC))
+        for (const ElfRel<E> &r : src->get_rels(ctx))
+          if (!is_func_call_rel(r))
+            if (InputSection<E> *dst = file->symbols[r.r_sym]->get_input_section())
+              if (dst->shdr().sh_flags & SHF_EXECINSTR)
+                dst->address_taken = true;
+  });
+
+  auto mark = [](Symbol<E> *sym) {
+    if (sym)
+      if (InputSection<E> *isec = sym->get_input_section())
+        isec->address_taken = true;
+  };
+
+  // Some symbols' pointer values are leaked to the dynamic section.
+  mark(ctx.arg.entry);
+  mark(ctx.arg.init);
+  mark(ctx.arg.fini);
+
+  // Exported symbols are conservatively considered address-taken.
+  if (ctx.dynsym)
+    for (Symbol<E> *sym : ctx.dynsym->symbols)
+      if (sym && sym->is_exported)
+        mark(sym);
+
+  // Handle data objects.
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    if (InputSection<E> *sec = file->llvm_addrsig.get()) {
+      u8 *p = (u8 *)sec->contents.data();
+      u8 *end = p + sec->contents.size();
+      while (p != end)
+        mark(file->symbols[read_uleb(&p)]);
+    } else {
+      for (std::unique_ptr<InputSection<E>> &isec : file->sections)
+        if (isec && !(isec->shdr().sh_flags & SHF_EXECINSTR))
+          isec->address_taken = true;
+    }
   });
 }
 
@@ -1765,6 +2216,7 @@ void clear_padding(Context<E> &ctx) {
 //   <writable non-RELRO bss>
 //   <non-memory-allocated sections>
 //   <section header>
+//   .gdb_index
 //
 // .interp and some other linker-synthesized sections are placed at the
 // beginning of a file because they are needed by loader. Especially on
@@ -1775,6 +2227,10 @@ void clear_padding(Context<E> &ctx) {
 // included in a core crash dump even if it's truncated by ulimit. In
 // particular, if .note.gnu.build-id is in a truncated core file, you
 // can at least identify which executable has crashed.
+//
+// .gdb_index cannot be constructed before applying relocations to
+// other debug sections, so we create it after completing other part
+// of the output file and append it to the very end of the file.
 //
 // A PT_NOTE segment will contain multiple .note sections if exists,
 // but there's no way to represent a gap between .note sections.
@@ -1821,6 +2277,8 @@ void sort_output_sections_regular(Context<E> &ctx) {
     if (chunk == ctx.relplt)
       return 11;
     if (chunk == ctx.shdr)
+      return INT32_MAX - 1;
+    if (chunk == ctx.gdb_index)
       return INT32_MAX;
 
     bool alloc = (flags & SHF_ALLOC);
@@ -1834,30 +2292,26 @@ void sort_output_sections_regular(Context<E> &ctx) {
            (!tls << 6) | (!relro << 5) | (is_bss << 4);
   };
 
+  // Ties are broken by additional rules
   auto get_rank2 = [&](Chunk<E> *chunk) -> i64 {
-    if (chunk->shdr.sh_type == SHT_NOTE)
-      return -chunk->shdr.sh_addralign;
+    ElfShdr<E> &shdr = chunk->shdr;
+    if (shdr.sh_type == SHT_NOTE)
+      return -shdr.sh_addralign;
 
     if (chunk == ctx.got)
-      return 1;
-    if (chunk->name == ".toc")
       return 2;
-    if (chunk->name == ".alpha_got")
+    if (chunk->name == ".toc")
       return 3;
+    if (chunk->name == ".alpha_got")
+      return 4;
     if (chunk == ctx.relro_padding)
-      return INT_MAX;
+      return INT64_MAX;
     return 0;
   };
 
   sort(ctx.chunks, [&](Chunk<E> *a, Chunk<E> *b) {
-    // Sort sections by segments
-    i64 x = get_rank1(a);
-    i64 y = get_rank1(b);
-    if (x != y)
-      return x < y;
-
-    // Ties are broken by additional rules
-    return get_rank2(a) < get_rank2(b);
+    return std::tuple{get_rank1(a), get_rank2(a), a->name} <
+           std::tuple{get_rank1(b), get_rank2(b), b->name};
   });
 }
 
@@ -2029,7 +2483,7 @@ static void set_virtual_addresses_regular(Context<E> &ctx) {
       i64 flags1 = get_flags(chunks[i - 1]);
       i64 flags2 = get_flags(chunks[i]);
 
-      if (flags1 != flags2) {
+      if (!ctx.arg.nmagic && flags1 != flags2) {
         switch (ctx.arg.z_separate_code) {
         case SEPARATE_LOADABLE_SEGMENTS:
           addr = align_to(addr, ctx.page_size);
@@ -2175,6 +2629,7 @@ static i64 set_file_offsets(Context<E> &ctx) {
     }
 
     if (first.shdr.sh_type == SHT_NOBITS) {
+      first.shdr.sh_offset = fileoff;
       i++;
       continue;
     }
@@ -2215,8 +2670,10 @@ static i64 set_file_offsets(Context<E> &ctx) {
 
     while (i < chunks.size() &&
            (chunks[i]->shdr.sh_flags & SHF_ALLOC) &&
-           chunks[i]->shdr.sh_type == SHT_NOBITS)
+           chunks[i]->shdr.sh_type == SHT_NOBITS) {
+      chunks[i]->shdr.sh_offset = fileoff;
       i++;
+    }
   }
 
   return fileoff;
@@ -2229,14 +2686,15 @@ void compute_section_headers(Context<E> &ctx) {
     chunk->update_shdr(ctx);
 
   // Remove empty chunks.
-  std::erase_if(ctx.chunks, [](Chunk<E> *chunk) {
-    return chunk->kind() != OUTPUT_SECTION && chunk->shdr.sh_size == 0;
+  std::erase_if(ctx.chunks, [&](Chunk<E> *chunk) {
+    return !chunk->to_osec() && chunk != ctx.gdb_index &&
+           chunk->shdr.sh_size == 0;
   });
 
   // Set section indices.
   i64 shndx = 1;
   for (i64 i = 0; i < ctx.chunks.size(); i++)
-    if (ctx.chunks[i]->kind() != HEADER)
+    if (!ctx.chunks[i]->is_header())
       ctx.chunks[i]->shndx = shndx++;
 
   if (ctx.symtab && SHN_LORESERVE <= shndx) {
@@ -2322,7 +2780,7 @@ void fix_synthetic_symbols(Context<E> &ctx) {
 
   std::vector<Chunk<E> *> sections;
   for (Chunk<E> *chunk : ctx.chunks)
-    if (chunk->kind() != HEADER && (chunk->shdr.sh_flags & SHF_ALLOC))
+    if (!chunk->is_header() && (chunk->shdr.sh_flags & SHF_ALLOC))
       sections.push_back(chunk);
 
   auto find = [&](std::string name) -> Chunk<E> * {
@@ -2423,7 +2881,7 @@ void fix_synthetic_symbols(Context<E> &ctx) {
   // this symbol.
   if (ctx._TLS_MODULE_BASE_) {
     ctx._TLS_MODULE_BASE_->set_output_section(sections[0]);
-    ctx._TLS_MODULE_BASE_->value = ctx.tls_begin;
+    ctx._TLS_MODULE_BASE_->value = ctx.dtp_addr;
   }
 
   // __GNU_EH_FRAME_HDR
@@ -2459,9 +2917,18 @@ void fix_synthetic_symbols(Context<E> &ctx) {
     }
   }
 
-  // MIPS' _gp symbol.
-  if constexpr (is_mips<E>)
-    start(ctx._gp, ctx.extra.quickstart, 0x7ff0);
+  // PPC64's _{save,rest}gpr{0,1}_{14,15,16,...,31} symbols
+  if constexpr (is_ppc64v2<E>) {
+    i64 offset = 0;
+    for (std::pair<std::string_view, u32> p : ppc64_save_restore_insns) {
+      std::string_view label = p.first;
+      if (!label.empty())
+        if (Symbol<E> *sym = get_symbol(ctx, label);
+            sym->file == ctx.internal_obj)
+          start(sym, ctx.extra.save_restore, offset);
+      offset += 4;
+    }
+  }
 
   // __start_ and __stop_ symbols
   for (Chunk<E> *chunk : sections) {
@@ -2491,20 +2958,13 @@ void fix_synthetic_symbols(Context<E> &ctx) {
     if (u64 *addr = std::get_if<u64>(&val)) {
       sym->origin = 0;
       sym->value = *addr;
-      continue;
+    } else {
+      Symbol<E> *sym2 = std::get<Symbol<E> *>(val);
+      sym->value = sym2->value;
+      sym->origin = sym2->origin;
+      sym->visibility = sym2->visibility.load();
     }
-
-    Symbol<E> *sym2 = std::get<Symbol<E> *>(val);
-    if (!sym2->file) {
-      Error(ctx) << "--defsym: undefined symbol: " << *sym2;
-      continue;
-    }
-
-    sym->value = sym2->value;
-    sym->origin = sym2->origin;
-    sym->visibility = sym2->visibility.load();
   }
-
 
   // --section-order symbols
   for (SectionOrder &ord : ctx.arg.section_order)
@@ -2546,8 +3006,8 @@ void write_dependency_file(Context<E> &ctx) {
   std::vector<std::string> deps;
   std::unordered_set<std::string> seen;
 
-  for (std::unique_ptr<MappedFile<Context<E>>> &mf : ctx.mf_pool)
-    if (!mf->parent)
+  for (std::unique_ptr<MappedFile> &mf : ctx.mf_pool)
+    if (mf->is_dependency && !mf->parent)
       if (std::string path = path_clean(mf->name); seen.insert(path).second)
         deps.push_back(path);
 
@@ -2610,7 +3070,7 @@ void show_stats(Context<E> &ctx) {
   }
 
   static Counter num_bytes("total_input_bytes");
-  for (std::unique_ptr<MappedFile<Context<E>>> &mf : ctx.mf_pool)
+  for (std::unique_ptr<MappedFile> &mf : ctx.mf_pool)
     num_bytes += mf->size;
 
   static Counter num_input_sections("input_sections");
@@ -2625,7 +3085,7 @@ void show_stats(Context<E> &ctx) {
     static Counter thunk_bytes("thunk_bytes");
     for (Chunk<E> *chunk : ctx.chunks)
       if (OutputSection<E> *osec = chunk->to_osec())
-        for (std::unique_ptr<RangeExtensionThunk<E>> &thunk : osec->thunks)
+        for (std::unique_ptr<Thunk<E>> &thunk : osec->thunks)
           thunk_bytes += thunk->size();
   }
 
@@ -2637,37 +3097,43 @@ void show_stats(Context<E> &ctx) {
 
 using E = MOLD_TARGET;
 
+template int redo_main(Context<E> &, int, char **);
 template void create_internal_file(Context<E> &);
 template void apply_exclude_libs(Context<E> &);
 template void create_synthetic_sections(Context<E> &);
 template void resolve_symbols(Context<E> &);
 template void kill_eh_frame_sections(Context<E> &);
+template void split_section_pieces(Context<E> &);
 template void resolve_section_pieces(Context<E> &);
 template void convert_common_symbols(Context<E> &);
 template void compute_merged_section_sizes(Context<E> &);
 template void create_output_sections(Context<E> &);
 template void add_synthetic_symbols(Context<E> &);
 template void check_cet_errors(Context<E> &);
+template void apply_section_align(Context<E> &);
 template void print_dependencies(Context<E> &);
 template void write_repro_file(Context<E> &);
 template void check_duplicate_symbols(Context<E> &);
 template void check_symbol_types(Context<E> &);
 template void sort_init_fini(Context<E> &);
 template void sort_ctor_dtor(Context<E> &);
+template void fixup_ctors_in_init_array(Context<E> &);
 template void shuffle_sections(Context<E> &);
 template void compute_section_sizes(Context<E> &);
 template void sort_output_sections(Context<E> &);
 template void claim_unresolved_symbols(Context<E> &);
+template void compute_imported_symbol_weakness(Context<E> &);
 template void scan_relocations(Context<E> &);
 template void report_undef_errors(Context<E> &);
 template void create_reloc_sections(Context<E> &);
 template void copy_chunks(Context<E> &);
+template void rewrite_endbr(Context<E> &);
 template void construct_relr(Context<E> &);
 template void create_output_symtab(Context<E> &);
 template void apply_version_script(Context<E> &);
 template void parse_symbol_version(Context<E> &);
 template void compute_import_export(Context<E> &);
-template void mark_addrsig(Context<E> &);
+template void compute_address_significance(Context<E> &);
 template void clear_padding(Context<E> &);
 template void compute_section_headers(Context<E> &);
 template i64 set_osec_offsets(Context<E> &);

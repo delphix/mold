@@ -1,8 +1,6 @@
 #!/bin/bash
 . $(dirname $0)/common.inc
 
-[ $MACHINE = x86_64 ] || skip
-
 cat <<EOF | $CC -c -o $t/a.o -x assembler -
 .section .init_array,"aw",@init_array
 .p2align 3

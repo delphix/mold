@@ -92,8 +92,10 @@ static u64 ha(u64 x)    { return (x + 0x8000) >> 16; }
 static u64 high(u64 x)  { return (x >> 16) & 0xffff; }
 static u64 higha(u64 x) { return ((x + 0x8000) >> 16) & 0xffff; }
 
-static u64 prefix34(u64 x) {
-  return bits(x, 33, 16) | (bits(x, 15, 0) << 32);
+static void write34(u8 *loc, u64 x) {
+  ul32 *buf = (ul32 *)loc;
+  buf[0] = (buf[0] & 0xfffc'0000) | bits(x, 33, 16);
+  buf[1] = (buf[1] & 0xffff'0000) | bits(x, 15, 0);
 }
 
 // .plt is used only for lazy symbol resolution on PPC64. All PLT
@@ -112,25 +114,26 @@ void write_plt_header(Context<E> &ctx, u8 *buf) {
     0x7c08'03a6, // mtlr    r0
 
     // Compute the PLT entry index
-    0xe80b'002c, // ld      r0, 44(r11)
-    0x7d8b'6050, // subf    r12, r11, r12
-    0x7d60'5a14, // add     r11, r0, r11
-    0x380c'ffcc, // addi    r0, r12, -52
+    0x398c'ffd4, // addi    r12, r12, -44
+    0x7c0b'6050, // subf    r0, r11, r12
     0x7800'f082, // rldicl  r0, r0, 62, 2
+
+    // Compute the address of .got.plt
+    0x3d6b'0000, // addis   r11, r11, GOTPLT_OFFSET@ha
+    0x396b'0000, // addi    r11, r11, GOTPLT_OFFSET@lo
 
     // Load .got.plt[0] and .got.plt[1] and branch to .got.plt[0]
     0xe98b'0000, // ld      r12, 0(r11)
     0x7d89'03a6, // mtctr   r12
     0xe96b'0008, // ld      r11, 8(r11)
     0x4e80'0420, // bctr
-
-    // .quad .got.plt - .plt - 8
-    0x0000'0000,
-    0x0000'0000,
   };
 
   memcpy(buf, insn, sizeof(insn));
-  *(ul64 *)(buf + 52) = ctx.gotplt->shdr.sh_addr - ctx.plt->shdr.sh_addr - 8;
+
+  i64 val = ctx.gotplt->shdr.sh_addr - ctx.plt->shdr.sh_addr - 8;
+  *(ul32 *)(buf + 28) |= higha(val);
+  *(ul32 *)(buf + 32) |= lo(val);
 }
 
 template <>
@@ -204,7 +207,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     u64 TOC = ctx.extra.TOC->value;
 
     auto r2save_thunk_addr = [&] { return get_thunk_addr(i); };
-    auto no_r2save_thunk_addr = [&] { return get_thunk_addr(i) + 4; };
+    auto no_r2save_thunk_addr = [&] { return get_thunk_addr(i) + 8; };
 
     switch (rel.r_type) {
     case R_PPC64_ADDR64:
@@ -278,10 +281,10 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_PPC64_PLT_PCREL34:
     case R_PPC64_PLT_PCREL34_NOTOC:
     case R_PPC64_GOT_PCREL34:
-      *(ul64 *)loc |= prefix34(G + GOT - P);
+      write34(loc, G + GOT - P);
       break;
     case R_PPC64_PCREL34:
-      *(ul64 *)loc |= prefix34(S + A - P);
+      write34(loc, S + A - P);
       break;
     case R_PPC64_GOT_TPREL16_HA:
       *(ul16 *)loc = ha(sym.get_gottp_addr(ctx) - TOC);
@@ -290,7 +293,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul16 *)loc |= (sym.get_gottp_addr(ctx) - TOC) & 0xfffc;
       break;
     case R_PPC64_GOT_TPREL_PCREL34:
-      *(ul64 *)loc |= prefix34(sym.get_gottp_addr(ctx) - P);
+      write34(loc, sym.get_gottp_addr(ctx) - P);
       break;
     case R_PPC64_GOT_TLSGD16_HA:
       *(ul16 *)loc = ha(sym.get_tlsgd_addr(ctx) - TOC);
@@ -299,7 +302,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul16 *)loc = lo(sym.get_tlsgd_addr(ctx) - TOC);
       break;
     case R_PPC64_GOT_TLSGD_PCREL34:
-      *(ul64 *)loc |= prefix34(sym.get_tlsgd_addr(ctx) - P);
+      write34(loc, sym.get_tlsgd_addr(ctx) - P);
       break;
     case R_PPC64_GOT_TLSLD16_HA:
       *(ul16 *)loc = ha(ctx.got->get_tlsld_addr(ctx) - TOC);
@@ -308,7 +311,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul16 *)loc = lo(ctx.got->get_tlsld_addr(ctx) - TOC);
       break;
     case R_PPC64_GOT_TLSLD_PCREL34:
-      *(ul64 *)loc |= prefix34(ctx.got->get_tlsld_addr(ctx) - P);
+      write34(loc, ctx.got->get_tlsld_addr(ctx) - P);
       break;
     case R_PPC64_DTPREL16_HA:
       *(ul16 *)loc = ha(S + A - ctx.dtp_addr);
@@ -316,14 +319,23 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_PPC64_DTPREL16_LO:
       *(ul16 *)loc = lo(S + A - ctx.dtp_addr);
       break;
+    case R_PPC64_DTPREL16_LO_DS:
+      *(ul16 *)loc |= (S + A - ctx.dtp_addr) & 0xfffc;
+      break;
     case R_PPC64_DTPREL34:
-      *(ul64 *)loc |= prefix34(S + A - ctx.dtp_addr);
+      write34(loc, S + A - ctx.dtp_addr);
       break;
     case R_PPC64_TPREL16_HA:
       *(ul16 *)loc = ha(S + A - ctx.tp_addr);
       break;
     case R_PPC64_TPREL16_LO:
       *(ul16 *)loc = lo(S + A - ctx.tp_addr);
+      break;
+    case R_PPC64_TPREL16_LO_DS:
+      *(ul16 *)loc |= (S + A - ctx.tp_addr) & 0xfffc;
+      break;
+    case R_PPC64_TPREL34:
+      write34(loc, S + A - ctx.tp_addr);
       break;
     case R_PPC64_PLTSEQ:
     case R_PPC64_PLTSEQ_NOTOC:
@@ -442,6 +454,8 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       break;
     case R_PPC64_TPREL16_HA:
     case R_PPC64_TPREL16_LO:
+    case R_PPC64_TPREL16_LO_DS:
+    case R_PPC64_TPREL34:
       check_tlsle(ctx, sym, rel);
       break;
     case R_PPC64_REL32:
@@ -468,6 +482,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_PPC64_TLSLD:
     case R_PPC64_DTPREL16_HA:
     case R_PPC64_DTPREL16_LO:
+    case R_PPC64_DTPREL16_LO_DS:
     case R_PPC64_DTPREL34:
       break;
     default:
@@ -477,13 +492,12 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 }
 
 template <>
-void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
-
+void Thunk<E>::copy_buf(Context<E> &ctx) {
   // If the destination is PLT, we read an address from .got.plt or .got
   // and jump there.
   static const ul32 plt_thunk[] = {
     0xf841'0018, // std   r2, 24(r1)
+    0x6000'0000, // nop
     0x3d82'0000, // addis r12, r2, foo@gotplt@toc@ha
     0xe98c'0000, // ld    r12, foo@gotplt@toc@lo(r12)
     0x7d89'03a6, // mtctr r12
@@ -492,6 +506,7 @@ void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
 
   static const ul32 plt_thunk_power10[] = {
     0xf841'0018, // std   r2, 24(r1)
+    0x6000'0000, // nop
     0x0410'0000, // pld   r12, foo@gotplt@pcrel
     0xe580'0000,
     0x7d89'03a6, // mtctr r12
@@ -502,6 +517,7 @@ void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
   // to its local entry point.
   static const ul32 local_thunk[] = {
     0xf841'0018, // std   r2, 24(r1)
+    0x6000'0000, // nop
     0x3d82'0000, // addis r12, r2,  foo@toc@ha
     0x398c'0000, // addi  r12, r12, foo@toc@lo
     0x7d89'03a6, // mtctr r12
@@ -510,6 +526,7 @@ void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
 
   static const ul32 local_thunk_power10[] = {
     0xf841'0018, // std   r2, 24(r1)
+    0x6000'0000, // nop
     0x0610'0000, // pla   r12, foo@pcrel
     0x3980'0000,
     0x7d89'03a6, // mtctr r12
@@ -521,34 +538,143 @@ void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
   static_assert(E::thunk_size == sizeof(local_thunk));
   static_assert(E::thunk_size == sizeof(local_thunk_power10));
 
-  for (i64 i = 0; i < symbols.size(); i++) {
-    Symbol<E> &sym = *symbols[i];
-    ul32 *loc = (ul32 *)(buf + i * E::thunk_size);
+  u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
+  u64 P = output_section.shdr.sh_addr + offset;
+  u64 TOC = ctx.extra.TOC->value;
 
-    if (sym.has_plt(ctx)) {
-      u64 got = sym.has_got(ctx) ? sym.get_got_addr(ctx) : sym.get_gotplt_addr(ctx);
+  for (Symbol<E> *sym : symbols) {
+    if (sym->has_plt(ctx)) {
+      u64 got =
+        sym->has_got(ctx) ? sym->get_got_addr(ctx) : sym->get_gotplt_addr(ctx);
 
       if (ctx.extra.is_power10) {
-        memcpy(loc, plt_thunk_power10, E::thunk_size);
-        *(ul64 *)(loc + 1) |= prefix34(got - get_addr(i) - 4);
+        memcpy(buf, plt_thunk_power10, E::thunk_size);
+        write34(buf + 8, got - P - 8);
       } else {
-        i64 val = got - ctx.extra.TOC->value;
-        memcpy(loc, plt_thunk, E::thunk_size);
-        loc[1] |= higha(val);
-        loc[2] |= lo(val);
+        memcpy(buf, plt_thunk, E::thunk_size);
+        *(ul32 *)(buf + 8) |= higha(got - TOC);
+        *(ul32 *)(buf + 12) |= lo(got - TOC);
       }
     } else {
+      u64 S = sym->get_addr(ctx);
       if (ctx.extra.is_power10) {
-        memcpy(loc, local_thunk_power10, E::thunk_size);
-        *(ul64 *)(loc + 1) |= prefix34(sym.get_addr(ctx) - get_addr(i) - 4);
+        memcpy(buf, local_thunk_power10, E::thunk_size);
+        write34(buf + 8, S - P - 8);
       } else {
-        i64 val = sym.get_addr(ctx) - ctx.extra.TOC->value;
-        memcpy(loc, local_thunk, E::thunk_size);
-        loc[1] |= higha(val);
-        loc[2] |= lo(val);
+        memcpy(buf, local_thunk, E::thunk_size);
+        *(ul32 *)(buf + 8) |= higha(S - TOC);
+        *(ul32 *)(buf + 12) |= lo(S - TOC);
       }
     }
+
+    buf += E::thunk_size;
+    P += E::thunk_size;
   }
+}
+
+// GCC may emit references to the following functions in function prologue
+// and epiilogue if -Os is specified. For some reason, these functions are
+// not in libgcc.a and expected to be synthesized by the linker.
+const std::vector<std::pair<std::string_view, u32>>
+ppc64_save_restore_insns = {
+  { "_savegpr0_14", 0xf9c1ff70 }, // std r14,-144(r1)
+  { "_savegpr0_15", 0xf9e1ff78 }, // std r15,-136(r1)
+  { "_savegpr0_16", 0xfa01ff80 }, // std r16,-128(r1)
+  { "_savegpr0_17", 0xfa21ff88 }, // std r17,-120(r1)
+  { "_savegpr0_18", 0xfa41ff90 }, // std r18,-112(r1)
+  { "_savegpr0_19", 0xfa61ff98 }, // std r19,-104(r1)
+  { "_savegpr0_20", 0xfa81ffa0 }, // std r20,-96(r1)
+  { "_savegpr0_21", 0xfaa1ffa8 }, // std r21,-88(r1)
+  { "_savegpr0_22", 0xfac1ffb0 }, // std r22,-80(r1)
+  { "_savegpr0_23", 0xfae1ffb8 }, // std r23,-72(r1)
+  { "_savegpr0_24", 0xfb01ffc0 }, // std r24,-64(r1)
+  { "_savegpr0_25", 0xfb21ffc8 }, // std r25,-56(r1)
+  { "_savegpr0_26", 0xfb41ffd0 }, // std r26,-48(r1)
+  { "_savegpr0_27", 0xfb61ffd8 }, // std r27,-40(r1)
+  { "_savegpr0_28", 0xfb81ffe0 }, // std r28,-32(r1)
+  { "_savegpr0_29", 0xfba1ffe8 }, // std r29,-24(r1)
+  { "_savegpr0_30", 0xfbc1fff0 }, // std r30,-16(r1)
+  { "_savegpr0_31", 0xfbe1fff8 }, // std r31,-8(r1)
+  { "",             0xf8010010 }, // std r0,16(r1)
+  { "",             0x4e800020 }, // blr
+
+  { "_restgpr0_14", 0xe9c1ff70 }, // ld r14,-144(r1)
+  { "_restgpr0_15", 0xe9e1ff78 }, // ld r15,-136(r1)
+  { "_restgpr0_16", 0xea01ff80 }, // ld r16,-128(r1)
+  { "_restgpr0_17", 0xea21ff88 }, // ld r17,-120(r1)
+  { "_restgpr0_18", 0xea41ff90 }, // ld r18,-112(r1)
+  { "_restgpr0_19", 0xea61ff98 }, // ld r19,-104(r1)
+  { "_restgpr0_20", 0xea81ffa0 }, // ld r20,-96(r1)
+  { "_restgpr0_21", 0xeaa1ffa8 }, // ld r21,-88(r1)
+  { "_restgpr0_22", 0xeac1ffb0 }, // ld r22,-80(r1)
+  { "_restgpr0_23", 0xeae1ffb8 }, // ld r23,-72(r1)
+  { "_restgpr0_24", 0xeb01ffc0 }, // ld r24,-64(r1)
+  { "_restgpr0_25", 0xeb21ffc8 }, // ld r25,-56(r1)
+  { "_restgpr0_26", 0xeb41ffd0 }, // ld r26,-48(r1)
+  { "_restgpr0_27", 0xeb61ffd8 }, // ld r27,-40(r1)
+  { "_restgpr0_28", 0xeb81ffe0 }, // ld r28,-32(r1)
+  { "_restgpr0_29", 0xe8010010 }, // ld r0,16(r1)
+  { "",             0xeba1ffe8 }, // ld r29,-24(r1)
+  { "",             0x7c0803a6 }, // mtlr r0
+  { "",             0xebc1fff0 }, // ld r30,-16(r1)
+  { "",             0xebe1fff8 }, // ld r31,-8(r1)
+  { "",             0x4e800020 }, // blr
+  { "_restgpr0_30", 0xebc1fff0 }, // ld r30,-16(r1)
+  { "_restgpr0_31", 0xe8010010 }, // ld r0,16(r1)
+  { "",             0xebe1fff8 }, // ld r31,-8(r1)
+  { "",             0x7c0803a6 }, // mtlr r0
+  { "",             0x4e800020 }, // blr
+
+  { "_savegpr1_14", 0xf9ccff70 }, // std r14,-144(r12)
+  { "_savegpr1_15", 0xf9ecff78 }, // std r15,-136(r12)
+  { "_savegpr1_16", 0xfa0cff80 }, // std r16,-128(r12)
+  { "_savegpr1_17", 0xfa2cff88 }, // std r17,-120(r12)
+  { "_savegpr1_18", 0xfa4cff90 }, // std r18,-112(r12)
+  { "_savegpr1_19", 0xfa6cff98 }, // std r19,-104(r12)
+  { "_savegpr1_20", 0xfa8cffa0 }, // std r20,-96(r12)
+  { "_savegpr1_21", 0xfaacffa8 }, // std r21,-88(r12)
+  { "_savegpr1_22", 0xfaccffb0 }, // std r22,-80(r12)
+  { "_savegpr1_23", 0xfaecffb8 }, // std r23,-72(r12)
+  { "_savegpr1_24", 0xfb0cffc0 }, // std r24,-64(r12)
+  { "_savegpr1_25", 0xfb2cffc8 }, // std r25,-56(r12)
+  { "_savegpr1_26", 0xfb4cffd0 }, // std r26,-48(r12)
+  { "_savegpr1_27", 0xfb6cffd8 }, // std r27,-40(r12)
+  { "_savegpr1_28", 0xfb8cffe0 }, // std r28,-32(r12)
+  { "_savegpr1_29", 0xfbacffe8 }, // std r29,-24(r12)
+  { "_savegpr1_30", 0xfbccfff0 }, // std r30,-16(r12)
+  { "_savegpr1_31", 0xfbecfff8 }, // std r31,-8(r12)
+  { "",             0x4e800020 }, // blr
+
+  { "_restgpr1_14", 0xe9ccff70 }, // ld r14,-144(r12)
+  { "_restgpr1_15", 0xe9ecff78 }, // ld r15,-136(r12)
+  { "_restgpr1_16", 0xea0cff80 }, // ld r16,-128(r12)
+  { "_restgpr1_17", 0xea2cff88 }, // ld r17,-120(r12)
+  { "_restgpr1_18", 0xea4cff90 }, // ld r18,-112(r12)
+  { "_restgpr1_19", 0xea6cff98 }, // ld r19,-104(r12)
+  { "_restgpr1_20", 0xea8cffa0 }, // ld r20,-96(r12)
+  { "_restgpr1_21", 0xeaacffa8 }, // ld r21,-88(r12)
+  { "_restgpr1_22", 0xeaccffb0 }, // ld r22,-80(r12)
+  { "_restgpr1_23", 0xeaecffb8 }, // ld r23,-72(r12)
+  { "_restgpr1_24", 0xeb0cffc0 }, // ld r24,-64(r12)
+  { "_restgpr1_25", 0xeb2cffc8 }, // ld r25,-56(r12)
+  { "_restgpr1_26", 0xeb4cffd0 }, // ld r26,-48(r12)
+  { "_restgpr1_27", 0xeb6cffd8 }, // ld r27,-40(r12)
+  { "_restgpr1_28", 0xeb8cffe0 }, // ld r28,-32(r12)
+  { "_restgpr1_29", 0xebacffe8 }, // ld r29,-24(r12)
+  { "_restgpr1_30", 0xebccfff0 }, // ld r30,-16(r12)
+  { "_restgpr1_31", 0xebecfff8 }, // ld r31,-8(r12)
+  { "",             0x4e800020 }, // blr
+};
+
+void PPC64SaveRestoreSection::copy_buf(Context<E> &ctx) {
+  ul32 *buf = (ul32 *)(ctx.buf + this->shdr.sh_offset);
+  for (auto [label, insn] : ppc64_save_restore_insns)
+    *buf++ = insn;
+}
+
+template <>
+u64 get_eflags(Context<E> &ctx) {
+  return 2;
 }
 
 } // namespace mold::elf

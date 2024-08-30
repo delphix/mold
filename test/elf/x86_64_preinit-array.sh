@@ -1,9 +1,7 @@
 #!/bin/bash
 . $(dirname $0)/common.inc
 
-ldd --help 2>&1 | grep -q musl && skip
-
-[ $MACHINE = x86_64 ] || skip
+is_musl && skip
 
 cat <<EOF | $CC -c -o $t/a.o -x assembler -
 .globl preinit, init, fini

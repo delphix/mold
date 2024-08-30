@@ -1,8 +1,6 @@
 #!/bin/bash
 . $(dirname $0)/common.inc
 
-[ $MACHINE = x86_64 ] || skip
-
 cat <<EOF | $CC -o $t/a.o -c -x assembler -
 .globl __x86.get_pc_thunk.bx
 .section .gnu.linkonce.t.__x86.get_pc_thunk.bx,"ax"
@@ -22,5 +20,6 @@ int main() {}
 EOF
 
 $CC -B. -o $t/exe $t/a.o $t/b.o $t/c.o
+$OBJDUMP -d $t/exe >& /dev/null || skip
 $OBJDUMP -d $t/exe | grep -A1 '<__x86.get_pc_thunk.bx>:' | \
   grep -Fq 'puts$plt'

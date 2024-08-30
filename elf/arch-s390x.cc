@@ -48,16 +48,23 @@ static void write_mid20(u8 *loc, u64 val) {
 template <>
 void write_plt_header(Context<E> &ctx, u8 *buf) {
   static u8 insn[] = {
+    // Compute PLT_INDEX
+    0xb9, 0x09, 0x00, 0x01,             // sgr   %r0, %r1
+    0xa7, 0x0b, 0xff, 0xc2,             // aghi  %r0, -62
+    0xeb, 0x10, 0x00, 0x01, 0x00, 0x0c, // srlg  %r1, %r0, 1
+    0xb9, 0x08, 0x00, 0x01,             // agr   %r0, %r1
     0xe3, 0x00, 0xf0, 0x38, 0x00, 0x24, // stg   %r0, 56(%r15)
+    // Branch to _dl_runtime_resolve
     0xc0, 0x10, 0, 0, 0, 0,             // larl  %r1, GOTPLT_OFFSET
     0xd2, 0x07, 0xf0, 0x30, 0x10, 0x08, // mvc   48(8, %r15), 8(%r1)
     0xe3, 0x10, 0x10, 0x10, 0x00, 0x04, // lg    %r1, 16(%r1)
     0x07, 0xf1,                         // br    %r1
-    0x07, 0x00, 0x07, 0x00, 0x07, 0x00, // nopr; nopr; nopr
+    0x07, 0x00, 0x07, 0x00,             // nopr; nopr
   };
 
   memcpy(buf, insn, sizeof(insn));
-  *(ub32 *)(buf + 8) = (ctx.gotplt->shdr.sh_addr - ctx.plt->shdr.sh_addr - 6) >> 1;
+  *(ub32 *)(buf + 26) =
+    (ctx.gotplt->shdr.sh_addr - ctx.plt->shdr.sh_addr - 24) >> 1;
 }
 
 template <>
@@ -65,15 +72,12 @@ void write_plt_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
   static u8 insn[] = {
     0xc0, 0x10, 0, 0, 0, 0,             // larl  %r1, GOTPLT_ENTRY_OFFSET
     0xe3, 0x10, 0x10, 0x00, 0x00, 0x04, // lg    %r1, (%r1)
-    0xc0, 0x01, 0, 0, 0, 0,             // lgfi  %r0, PLT_INDEX
-    0x07, 0xf1,                         // br    %r1
-    0x07, 0x00, 0x07, 0x00, 0x07, 0x00, // nopr; nopr; nopr
-    0x07, 0x00, 0x07, 0x00, 0x07, 0x00, // nopr; nopr; nopr
+    0x0d, 0x01,                         // basr  %r0, %r1
+    0x07, 0x00,                         // nopr
   };
 
   memcpy(buf, insn, sizeof(insn));
   *(ub32 *)(buf + 2) = (sym.get_gotplt_addr(ctx) - sym.get_plt_addr(ctx)) >> 1;
-  *(ub32 *)(buf + 14) = sym.get_plt_idx(ctx) * sizeof(ElfRel<E>);
 }
 
 template <>
@@ -86,7 +90,7 @@ void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
   };
 
   memcpy(buf, insn, sizeof(insn));
-  *(ub32 *)(buf + 2) = (sym.get_got_addr(ctx) - sym.get_plt_addr(ctx)) >> 1;
+  *(ub32 *)(buf + 2) = (sym.get_got_pltgot_addr(ctx) - sym.get_plt_addr(ctx)) >> 1;
 }
 
 template <>
@@ -356,12 +360,10 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
     u64 A = frag ? frag_addend : (i64)rel.r_addend;
 
     switch (rel.r_type) {
-    case R_390_32: {
-      i64 val = S + A;
-      check(val, 0, 1LL << 32);
-      *(ub32 *)loc = val;
+    case R_390_32:
+      check(S + A, 0, 1LL << 32);
+      *(ub32 *)loc = S + A;
       break;
-    }
     case R_390_64:
       if (std::optional<u64> val = get_tombstone(sym, frag))
         *(ub64 *)loc = *val;
@@ -455,23 +457,23 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       // We always want to relax calls to __tls_get_offset() in statically-
       // linked executables because __tls_get_offset() in libc.a just calls
       // abort().
-      if (ctx.arg.is_static ||
-          (ctx.arg.relax && !sym.is_imported && !ctx.arg.shared)) {
-        // do nothing
-      } else if (ctx.arg.relax && !sym.is_imported && ctx.arg.shared &&
-                 !ctx.arg.z_dlopen) {
+      if ((ctx.arg.relax && sym.is_tprel_linktime_const(ctx)) ||
+          ctx.arg.is_static) {
+        // Do nothing
+      } else if (ctx.arg.relax && sym.is_tprel_runtime_const(ctx)) {
         sym.flags |= NEEDS_GOTTP;
       } else {
         sym.flags |= NEEDS_TLSGD;
       }
       break;
     case R_390_TLS_LDM32:
-    case R_390_TLS_LDM64: {
-      bool do_relax = ctx.arg.is_static || (ctx.arg.relax && !ctx.arg.shared);
-      if (!do_relax)
+    case R_390_TLS_LDM64:
+      if (ctx.arg.is_static || (ctx.arg.relax && !ctx.arg.shared)) {
+        // Do nothing
+      } else {
         ctx.needs_tlsld = true;
+      }
       break;
-    }
     case R_390_TLS_LE32:
     case R_390_TLS_LE64:
       check_tlsle(ctx, sym, rel);

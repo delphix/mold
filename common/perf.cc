@@ -26,19 +26,13 @@ void Counter::print() {
 }
 
 static i64 now_nsec() {
-#ifdef _WIN32
   return (i64)std::chrono::steady_clock::now().time_since_epoch().count();
-#else
-  struct timespec t;
-  clock_gettime(CLOCK_MONOTONIC, &t);
-  return (i64)t.tv_sec * 1'000'000'000 + t.tv_nsec;
-#endif
 }
 
 static std::pair<i64, i64> get_usage() {
 #ifdef _WIN32
   auto to_nsec = [](FILETIME t) -> i64 {
-    return ((u64)t.dwHighDateTime << 32 + (u64)t.dwLowDateTime) * 100;
+    return (((u64)t.dwHighDateTime << 32) + (u64)t.dwLowDateTime) * 100;
   };
 
   FILETIME creation, exit, kernel, user;

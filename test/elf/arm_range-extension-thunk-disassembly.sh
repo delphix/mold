@@ -1,8 +1,6 @@
 #!/bin/bash
 . $(dirname $0)/common.inc
 
-[ $MACHINE = arm ] || skip
-
 cat <<EOF | $CC -c -o $t/a.o -fPIC -xc -
 #include <stdio.h>
 
@@ -23,4 +21,4 @@ $CC -B. -o $t/exe $t/a.o \
 $OBJDUMP -dr $t/exe | grep -F -A7 '<fn1$thunk>:' > $t/log
 
 grep -Eq 'bx\s+pc' $t/log
-grep -Eq 'add\s+ip, ip, pc' $t/log
+grep -Eq 'add\s+pc, ip, pc' $t/log

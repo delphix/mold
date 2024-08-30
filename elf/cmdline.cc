@@ -1,18 +1,18 @@
 #include "mold.h"
-#include "../common/cmdline.h"
 
 #include <random>
 #include <regex>
 #include <sstream>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <tbb/global_control.h>
 #include <unordered_set>
 
-#ifdef _WIN32
-# define _isatty isatty
-# define STDERR_FILENO (_fileno(stderr))
-#else
+#if __has_include(<unistd.h>)
 # include <unistd.h>
+#else
+# define isatty _isatty
+# define STDERR_FILENO (_fileno(stderr))
 #endif
 
 namespace mold::elf {
@@ -34,7 +34,7 @@ Options:
     --no-dynamic-linker
   -L DIR, --library-path DIR  Add DIR to library search path
   -M, --print-map             Write map file to stdout
-  -N, --omagic                Do not page align data, do not make text readonly
+  -N, --omagic                Do not page align data; do not make text readonly
     --no-omagic
   -O NUMBER                   Ignored
   -S, --strip-debug           Strip .debug_* sections
@@ -52,24 +52,29 @@ Options:
   -s, --strip-all             Strip .symtab section
   -u SYMBOL, --undefined SYMBOL
                               Force to resolve SYMBOL
+  -y SYMBOL, --trace-symbol SYMBOL
+                              Trace references to SYMBOL
   --Bdynamic, --dy            Link against shared libraries (default)
   --Bstatic, --dn, --static   Do not link against shared libraries
-  --Bsymbolic                 Bind global symbols locally
-  --Bsymbolic-functions       Bind global functions locally
-  --Bno-symbolic              Cancel --Bsymbolic and --Bsymbolic-functions
+  --Bsymbolic                 Bind all symbols locally
+  --Bsymbolic-functions       Bind function symbols locally
+  --Bsymbolic-non-weak        Bind all but weak symbols locally
+  --Bsymbolic-non-weak-functions
+                              Bind all but weak function symbols locally
+  --Bno-symbolic              Cancel --Bsymbolic options
   --Map FILE                  Write map file to a given file
   --Tbss=ADDR                 Set address to .bss
-  --Tdata                     Set address to .data
-  --Ttext                     Set address to .text
+  --Tdata=ADDR                Set address to .data
+  --Ttext=ADDR                Set address to .text
   --allow-multiple-definition Allow multiple definitions
-  --apply-dynamic-relocs      Apply link-time values for dynamic relocations (defualt)
+  --apply-dynamic-relocs      Apply link-time values for dynamic relocations (default)
     --no-apply-dynamic-relocs
   --as-needed                 Only set DT_NEEDED if used
     --no-as-needed
   --build-id [none,md5,sha1,sha256,uuid,HEXSTRING]
                               Generate build ID
     --no-build-id
-  --chroot DIR                Set a given path to root directory
+  --chroot DIR                Set a given path to the root directory
   --color-diagnostics=[auto,always,never]
                               Use colors in diagnostics
   --color-diagnostics         Alias for --color-diagnostics=always
@@ -84,12 +89,12 @@ Options:
     --disable-new-dtags       Emit DT_RPATH for --rpath
   --execute-only              Make executable segments unreadable
   --dp                        Ignored
-  --dynamic-list              Read a list of dynamic symbols (implies -Bsymbolic)
+  --dynamic-list=FILE         Read a list of dynamic symbols (implies -Bsymbolic)
   --eh-frame-hdr              Create .eh_frame_hdr section
     --no-eh-frame-hdr
-  --exclude-libs LIB,LIB,..   Mark all symbols in given libraries hidden
+  --exclude-libs LIB,LIB,..   Mark all symbols in given libraries as hidden
   --export-dynamic-symbol     Put symbols matching glob in the dynamic symbol table
-  --export-dynamic-symbol-list
+  --export-dynamic-symbol-list=FILE
                               Read a list of dynamic symbols
   --fatal-warnings            Treat warnings as errors
     --no-fatal-warnings       Do not treat warnings as errors (default)
@@ -107,54 +112,59 @@ Options:
                               Allow merging non-executable sections with --icf
   --image-base ADDR           Set the base address to a given value
   --init SYMBOL               Call SYMBOL at load-time
+  --nmagic                    Do not page align sections
+    --no-nmagic
   --no-undefined              Report undefined symbols (even with --shared)
   --noinhibit-exec            Create an output file even if errors occur
-  --oformat=binary            Omit ELF, section and program headers
+  --oformat=binary            Omit ELF, section, and program headers
   --pack-dyn-relocs=[relr,none]
                               Pack dynamic relocations
   --package-metadata=STRING   Set a given string to .note.package
   --perf                      Print performance statistics
-  --pie, --pic-executable     Create a position independent executable
+  --pie, --pic-executable     Create a position-independent executable
     --no-pie, --no-pic-executable
-  --pop-state                 Restore state of flags governing input file handling
+  --pop-state                 Restore the state of flags governing input file handling
   --print-gc-sections         Print removed unreferenced sections
     --no-print-gc-sections
   --print-icf-sections        Print folded identical sections
     --no-print-icf-sections
-  --push-state                Save state of flags governing input file handling
+  --push-state                Save the state of flags governing input file handling
   --quick-exit                Use quick_exit to exit (default)
     --no-quick-exit
   --relax                     Optimize instructions (default)
     --no-relax
-  --repro                     Embed input files to .repro section
+  --repro                     Embed input files in .repro section
   --require-defined SYMBOL    Require SYMBOL be defined in the final output
   --retain-symbols-file FILE  Keep only symbols listed in FILE
-  --reverse-sections          Reverses input sections in the output file
+  --reverse-sections          Reverse input sections in the output file
   --rosegment                 Put read-only non-executable sections in their own segment (default)
     --no-rosegment            Put read-only non-executable sections in an executable segment
-  --rpath DIR                 Add DIR to runtime search path
+  --rpath DIR                 Add DIR to the runtime search path
   --rpath-link DIR            Ignored
   --run COMMAND ARG...        Run COMMAND with mold as /usr/bin/ld
-  --section-start=SECTION=ADDR Set address to section
-  --shared, --Bshareable      Create a share library
+  --section-start=SECTION=ADDR Set address for section
+  --shared, --Bshareable      Create a shared library
   --shuffle-sections[=SEED]   Randomize the output by shuffling input sections
   --sort-common               Ignored
   --sort-section              Ignored
-  --spare-dynamic-tags NUMBER Reserve give number of tags in .dynamic section
+  --spare-dynamic-tags NUMBER Reserve the given number of tags in the .dynamic section
+  --spare-program-headers NUMBER
+                              Reserve the given number of slots in the program header
   --start-lib                 Give following object files in-archive-file semantics
     --end-lib                 End the effect of --start-lib
   --stats                     Print input statistics
-  --sysroot DIR               Set target system root directory
+  --sysroot DIR               Set the target system root directory
   --thread-count COUNT, --threads=COUNT
                               Use COUNT number of threads
   --threads                   Use multiple threads (default)
     --no-threads
-  --trace                     Print name of each input file
-  --undefined-version         Do not report version scripts that refer undefined symbols
-    --no-undefined-version    Report version scripts that refer undefined symbols (default)
+  --trace                     Print the name of each input file
+  --undefined-glob PATTERN    Force to resolve all symbols that match a given pattern
+  --undefined-version         Do not report version scripts that refer to undefined symbols
+    --no-undefined-version    Report version scripts that refer to undefined symbols (default)
   --unique PATTERN            Don't merge input sections that match a given pattern
   --unresolved-symbols [report-all,ignore-all,ignore-in-object-files,ignore-in-shared-libs]
-                              How to handle unresolved symbols
+                              Handle unresolved symbols
   --version-script FILE       Read version script
   --warn-common               Warn about common symbols
     --no-warn-common
@@ -166,21 +176,21 @@ Options:
                               Report unresolved symbols as errors (default)
   --whole-archive             Include all objects from static archives
     --no-whole-archive
-  --wrap SYMBOL               Use wrapper function for a given symbol
+  --wrap SYMBOL               Use a wrapper function for a given symbol
   -z defs                     Report undefined symbols (even with --shared)
     -z nodefs
   -z common-page-size=VALUE   Ignored
-  -z execstack                Require executable stack
+  -z execstack                Require an executable stack
     -z noexecstack
-  -z execstack-if-needed      Make the stack area execuable if an input file explicitly requests it
+  -z execstack-if-needed      Make the stack area executable if an input file explicitly requests it
   -z initfirst                Mark DSO to be initialized first at runtime
-  -z interpose                Mark object to interpose all DSOs but executable
+  -z interpose                Mark object to interpose all DSOs but the executable
   -z keep-text-section-prefix Keep .text.{hot,unknown,unlikely,startup,exit} as separate sections in the final binary
     -z nokeep-text-section-prefix
   -z lazy                     Enable lazy function resolution (default)
   -z max-page-size=VALUE      Use VALUE as the memory page size
   -z nocopyreloc              Do not create copy relocations
-  -z nodefaultlib             Make the dynamic loader to ignore default search paths
+  -z nodefaultlib             Make the dynamic loader ignore default search paths
   -z nodelete                 Mark DSO non-deletable at runtime
   -z nodlopen                 Mark DSO not available to dlopen
   -z nodump                   Mark DSO not available to dldump
@@ -190,19 +200,126 @@ Options:
     -z nopack-relative-relocs
   -z sectionheader            Do not omit section header (default)
     -z nosectionheader        Omit section header
+  -z start_stop_visibility=[hidden,protected]
+                              Specify symbol visibility for "__start_SECNAME" and "__stop_SECNAME" symbols
   -z separate-loadable-segments
-                              Separate all loadable segments to different pages
-    -z separate-code          Separate code and data into different pages
+                              Separate all loadable segments onto different pages
+    -z separate-code          Separate code and data onto different pages
     -z noseparate-code        Allow overlap in pages
-  -z stack-size=VALUE         Set size of stack segment
+  -z stack-size=VALUE         Set the size of the stack segment
   -z relro                    Make some sections read-only after relocation (default)
     -z norelro
+  -z rodynamic                Make the .dynamic section read-only
   -z text                     Report error if DT_TEXTREL is set
     -z notext
     -z textoff
 
 mold: supported targets: elf32-i386 elf64-x86-64 elf32-littlearm elf64-littleaarch64 elf32-littleriscv elf32-bigriscv elf64-littleriscv elf64-bigriscv elf32-powerpc elf64-powerpc elf64-powerpc elf64-powerpcle elf64-s390 elf64-sparc elf32-m68k elf32-sh-linux elf64-alpha elf64-loongarch elf32-loongarch
 mold: supported emulations: elf_i386 elf_x86_64 armelf_linux_eabi aarch64linux aarch64elf elf32lriscv elf32briscv elf64lriscv elf64briscv elf32ppc elf32ppclinux elf64ppc elf64lppc elf64_s390 elf64_sparc m68kelf shlelf_linux elf64alpha elf64loongarch elf32loongarch)";
+
+template <typename E>
+static std::vector<std::string_view>
+read_response_file(Context<E> &ctx, std::string_view path, i64 depth) {
+  if (depth > 10)
+    Fatal(ctx) << path << ": response file nesting too deep";
+
+  std::vector<std::string_view> vec;
+  MappedFile *mf = must_open_file(ctx, std::string(path));
+  std::string_view data((char *)mf->data, mf->size);
+
+  mf->is_dependency = false;
+
+  while (!data.empty()) {
+    if (isspace(data[0])) {
+      data = data.substr(1);
+      continue;
+    }
+
+    auto read_quoted = [&]() {
+      char quote = data[0];
+      data = data.substr(1);
+
+      std::string buf;
+      while (!data.empty() && data[0] != quote) {
+        if (data[0] == '\\' && data.size() >= 1) {
+          buf.append(1, data[1]);
+          data = data.substr(2);
+        } else {
+          buf.append(1, data[0]);
+          data = data.substr(1);
+        }
+      }
+      if (data.empty())
+        Fatal(ctx) << path << ": premature end of input";
+      data = data.substr(1);
+      return save_string(ctx, buf);
+    };
+
+    auto read_unquoted = [&] {
+      std::string buf;
+      while (!data.empty()) {
+        if (data[0] == '\\' && data.size() >= 1) {
+          buf.append(1, data[1]);
+          data = data.substr(2);
+          continue;
+        }
+
+        if (!isspace(data[0])) {
+          buf.append(1, data[0]);
+          data = data.substr(1);
+          continue;
+        }
+        break;
+      }
+      return save_string(ctx, buf);
+    };
+
+    std::string_view tok;
+    if (data[0] == '\'' || data[0] == '\"')
+      tok = read_quoted();
+    else
+      tok = read_unquoted();
+
+    if (tok.starts_with('@'))
+      append(vec, read_response_file(ctx, tok.substr(1), depth + 1));
+    else
+      vec.push_back(tok);
+  }
+  return vec;
+}
+
+// Replace "@path/to/some/text/file" with its file contents.
+template <typename E>
+std::vector<std::string_view>
+expand_response_files(Context<E> &ctx, char **argv) {
+  std::vector<std::string_view> vec;
+  for (i64 i = 0; argv[i]; i++) {
+    if (argv[i][0] == '@')
+      append(vec, read_response_file(ctx, argv[i] + 1, 1));
+    else
+      vec.push_back(argv[i]);
+  }
+  return vec;
+}
+
+static i64 get_default_thread_count() {
+  // mold doesn't scale well above 32 threads.
+  int n = tbb::global_control::active_value(
+    tbb::global_control::max_allowed_parallelism);
+  return std::min(n, 32);
+}
+
+static inline std::string_view string_trim(std::string_view str) {
+  size_t pos = str.find_first_not_of(" \t");
+  if (pos == str.npos)
+    return "";
+  str = str.substr(pos);
+
+  pos = str.find_last_not_of(" \t");
+  if (pos == str.npos)
+    return str;
+  return str.substr(0, pos + 1);
+}
 
 static std::vector<std::string> add_dashes(std::string name) {
   // Single-letter option
@@ -291,8 +408,7 @@ split_by_comma_or_colon(std::string_view str) {
 
 template <typename E>
 static void read_retain_symbols_file(Context<E> &ctx, std::string_view path) {
-  MappedFile<Context<E>> *mf =
-    MappedFile<Context<E>>::must_open(ctx, std::string(path));
+  MappedFile *mf = must_open_file(ctx, std::string(path));
   std::string_view data((char *)mf->data, mf->size);
 
   ctx.arg.retain_symbols_file.reset(new std::unordered_set<std::string_view>);
@@ -402,12 +518,13 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   std::vector<std::string> remaining;
   std::string_view arg;
 
-  ctx.page_size = E::page_size;
   ctx.arg.color_diagnostics = isatty(STDERR_FILENO);
 
   bool version_shown = false;
   bool warn_shared_textrel = false;
+  bool error_unresolved_symbols = true;
   std::optional<SeparateCodeKind> z_separate_code;
+  std::optional<bool> report_undefined;
   std::optional<bool> z_relro;
   std::optional<u64> shuffle_sections_seed;
   std::unordered_set<std::string_view> rpaths;
@@ -425,14 +542,23 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if constexpr (is_riscv<E>)
     ctx.arg.discard_locals = true;
 
-  // It looks like the SPARC's dynamic linker takes both RELA's r_addend
-  // and the value at the relocated place. So we don't want to write
-  // values to relocated places.
-  if constexpr (is_sparc<E>)
+  // We generally don't need to write addends to relocated places if the
+  // relocation type is RELA because RELA records contain addends.
+  // However, there are too much code that wrongly assumes that addends
+  // are written to both RELA records and relocated places, so we write
+  // addends to relocated places by default. There are a few exceptions:
+  //
+  // - It looks like the SPARC's dynamic linker takes both RELA's r_addend
+  //   and the value at the relocated place. So we don't want to write
+  //   values to relocated places.
+  //
+  // - Static PIE binaries crash on startup in some RISC-V environment if
+  //   we write addends to relocated places.
+  if constexpr (is_sparc<E> || is_riscv<E>)
     ctx.arg.apply_dynamic_relocs = false;
 
   auto read_arg = [&](std::string name) {
-    for (std::string opt : add_dashes(name)) {
+    for (const std::string &opt : add_dashes(name)) {
       if (args[0] == opt) {
         if (args.size() == 1)
           Fatal(ctx) << "option -" << name << ": argument missing";
@@ -452,7 +578,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   };
 
   auto read_eq = [&](std::string name) {
-    for (std::string opt : add_dashes(name)) {
+    for (const std::string &opt : add_dashes(name)) {
       if (args[0].starts_with(opt + "=")) {
         arg = args[0].substr(opt.size() + 1);
         args = args.subspan(1);
@@ -463,7 +589,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   };
 
   auto read_flag = [&](std::string name) {
-    for (std::string opt : add_dashes(name)) {
+    for (const std::string &opt : add_dashes(name)) {
       if (args[0] == opt) {
         args = args.subspan(1);
         return true;
@@ -502,8 +628,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
 
   while (!args.empty()) {
     if (read_flag("help")) {
-      SyncOut(ctx) << "Usage: " << ctx.cmdline_args[0]
-                   << " [options] file...\n" << helpmsg;
+      Out(ctx) << "Usage: " << ctx.cmdline_args[0]
+               << " [options] file...\n" << helpmsg;
       exit(0);
     }
 
@@ -514,28 +640,20 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("no-dynamic-linker")) {
       ctx.arg.dynamic_linker = "";
     } else if (read_flag("v")) {
-      SyncOut(ctx) << mold_version;
+      Out(ctx) << get_mold_version();
       version_shown = true;
     } else if (read_flag("version")) {
-      SyncOut(ctx) << mold_version;
+      Out(ctx) << get_mold_version();
       exit(0);
     } else if (read_flag("V")) {
-      SyncOut(ctx) << mold_version
-                   << "\n  Supported emulations:\n   elf_x86_64\n   elf_i386\n"
-                   << "   aarch64linux\n   armelf_linux_eabi\n   elf64lriscv\n"
-                   << "   elf64briscv\n   elf32lriscv\n   elf32briscv\n"
-                   << "   elf32ppc\n   elf64ppc\n   elf64lppc\n   elf64_s390\n"
-                   << "   elf64_sparc\n   m68kelf\n   shlelf_linux\n"
-                   << "   elf64alpha\n   elf64ltsmip\n   elf64btsmip\n"
-                   << "   elf64loongarch\n   elf32loongarch";
+      Out(ctx) << get_mold_version()
+               << "\n  Supported emulations:\n   elf_x86_64\n   elf_i386\n"
+               << "   aarch64linux\n   armelf_linux_eabi\n   elf64lriscv\n"
+               << "   elf64briscv\n   elf32lriscv\n   elf32briscv\n"
+               << "   elf32ppc\n   elf64ppc\n   elf64lppc\n   elf64_s390\n"
+               << "   elf64_sparc\n   m68kelf\n   shlelf_linux\n"
+               << "   elf64alpha\n   elf64loongarch\n   elf32loongarch";
       version_shown = true;
-    } else if (read_flag("mips32") || read_flag("mips32r2") ||
-               read_flag("mips32r3") || read_flag("mips32r4") ||
-               read_flag("mips32r5") || read_flag("mips32r6") ||
-               read_flag("mips64") || read_flag("mips64r2") ||
-               read_flag("mips64r3") || read_flag("mips64r4") ||
-               read_flag("mips64r5") || read_flag("mips64r6")) {
-      // Ignore useless MIPS-specific flags
     } else if (read_arg("m")) {
       if (arg == "elf_x86_64") {
         ctx.arg.emulation = X86_64::target_name;
@@ -569,10 +687,6 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
         ctx.arg.emulation = SH4::target_name;
       } else if (arg == "elf64alpha") {
         ctx.arg.emulation = ALPHA::target_name;
-      } else if (arg == "elf64ltsmip") {
-        ctx.arg.emulation = MIPS64LE::target_name;
-      } else if (arg == "elf64btsmip") {
-        ctx.arg.emulation = MIPS64BE::target_name;
       } else if (arg == "elf64loongarch") {
         ctx.arg.emulation = LOONGARCH64::target_name;
       } else if (arg == "elf32loongarch") {
@@ -587,19 +701,22 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("no-export-dynamic")) {
       ctx.arg.export_dynamic = false;
     } else if (read_flag("Bsymbolic")) {
-      ctx.arg.Bsymbolic = true;
+      ctx.arg.Bsymbolic = BSYMBOLIC_ALL;
     } else if (read_flag("Bsymbolic-functions")) {
-      ctx.arg.Bsymbolic_functions = true;
+      ctx.arg.Bsymbolic = BSYMBOLIC_FUNCTIONS;
+    } else if (read_flag("Bsymbolic-non-weak")) {
+      ctx.arg.Bsymbolic = BSYMBOLIC_NON_WEAK;
+    } else if (read_flag("Bsymbolic-non-weak-functions")) {
+      ctx.arg.Bsymbolic = BSYMBOLIC_NON_WEAK_FUNCTIONS;
     } else if (read_flag("Bno-symbolic")) {
-      ctx.arg.Bsymbolic = false;
-      ctx.arg.Bsymbolic_functions = false;
+      ctx.arg.Bsymbolic = BSYMBOLIC_NONE;
     } else if (read_arg("exclude-libs")) {
       append(ctx.arg.exclude_libs, split_by_comma_or_colon(arg));
     } else if (read_flag("q") || read_flag("emit-relocs")) {
       ctx.arg.emit_relocs = true;
       ctx.arg.discard_locals = false;
     } else if (read_arg("e") || read_arg("entry")) {
-      ctx.arg.entry = arg;
+      ctx.arg.entry = get_symbol(ctx, arg);
     } else if (read_arg("Map")) {
       ctx.arg.Map = arg;
       ctx.arg.print_map = true;
@@ -617,6 +734,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.shared = true;
     } else if (read_arg("spare-dynamic-tags")) {
       ctx.arg.spare_dynamic_tags = parse_number(ctx, "spare-dynamic-tags", arg);
+    } else if (read_arg("spare-program-headers")) {
+      ctx.arg.spare_program_headers
+        = parse_number(ctx, "spare-program-headers", arg);
     } else if (read_flag("start-lib")) {
       remaining.push_back("--start-lib");
     } else if (read_flag("start-stop")) {
@@ -667,19 +787,22 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.unique = std::move(*pat);
     } else if (read_arg("unresolved-symbols")) {
       if (arg == "report-all" || arg == "ignore-in-shared-libs")
-        ctx.arg.unresolved_symbols = UNRESOLVED_ERROR;
+        report_undefined = true;
       else if (arg == "ignore-all" || arg == "ignore-in-object-files")
-        ctx.arg.unresolved_symbols = UNRESOLVED_IGNORE;
+        report_undefined = false;
       else
         Fatal(ctx) << "unknown --unresolved-symbols argument: " << arg;
     } else if (read_arg("undefined") || read_arg("u")) {
-      ctx.arg.undefined.push_back(arg);
+      ctx.arg.undefined.push_back(get_symbol(ctx, arg));
+    } else if (read_arg("undefined-glob")) {
+      if (!ctx.arg.undefined_glob.add(arg, 0))
+        Fatal(ctx) << "--undefined-glob: invalid pattern: " << arg;
     } else if (read_arg("require-defined")) {
-      ctx.arg.require_defined.push_back(arg);
+      ctx.arg.require_defined.push_back(get_symbol(ctx, arg));
     } else if (read_arg("init")) {
-      ctx.arg.init = arg;
+      ctx.arg.init = get_symbol(ctx, arg);
     } else if (read_arg("fini")) {
-      ctx.arg.fini = arg;
+      ctx.arg.fini = get_symbol(ctx, arg);
     } else if (read_arg("hash-style")) {
       if (arg == "sysv") {
         ctx.arg.hash_style_sysv = true;
@@ -836,19 +959,20 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.page_size = parse_number(ctx, "-z max-page-size", arg);
       if (!has_single_bit(ctx.page_size))
         Fatal(ctx) << "-z max-page-size " << arg << ": value must be a power of 2";
-    } else if (read_z_arg("start-stop-visibility")) {
-      if (arg != "hidden")
-        Fatal(ctx) << "-z start-stop-visibility: unsupported visibility: " << arg;
+    } else if (read_z_flag("start-stop-visibility=protected")) {
+      ctx.arg.z_start_stop_visibility_protected = true;
+    } else if (read_z_flag("start-stop-visibility=hidden")) {
+      ctx.arg.z_start_stop_visibility_protected = false;
     } else if (read_z_flag("noexecstack")) {
       ctx.arg.z_execstack = false;
     } else if (read_z_flag("relro")) {
       z_relro = true;
     } else if (read_z_flag("norelro")) {
       z_relro = false;
-    } else if (read_z_flag("defs")) {
-      ctx.arg.z_defs = true;
+    } else if (read_z_flag("defs") || read_flag("no-undefined")) {
+      report_undefined = true;
     } else if (read_z_flag("undefs")) {
-      ctx.arg.z_defs = false;
+      report_undefined = false;
     } else if (read_z_flag("nodlopen")) {
       ctx.arg.z_dlopen = false;
     } else if (read_z_flag("nodelete")) {
@@ -896,8 +1020,14 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.z_sectionheader = true;
     } else if (read_z_flag("nosectionheader")) {
       ctx.arg.z_sectionheader = false;
-    } else if (read_flag("no-undefined")) {
-      ctx.arg.z_defs = true;
+    } else if (read_z_flag("rewrite-endbr")) {
+      ctx.arg.z_rewrite_endbr = true;
+    } else if (read_z_flag("rodynamic")) {
+      ctx.arg.z_rodynamic = true;
+    } else if (read_flag("nmagic")) {
+      ctx.arg.nmagic = true;
+    } else if (read_flag("no-nmagic")) {
+      ctx.arg.nmagic = false;
     } else if (read_flag("fatal-warnings")) {
       ctx.arg.fatal_warnings = true;
     } else if (read_flag("no-fatal-warnings")) {
@@ -1023,9 +1153,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("strip-debug") || read_flag("S")) {
       ctx.arg.strip_debug = true;
     } else if (read_flag("warn-unresolved-symbols")) {
-      ctx.arg.unresolved_symbols = UNRESOLVED_WARN;
+      error_unresolved_symbols = false;
     } else if (read_flag("error-unresolved-symbols")) {
-      ctx.arg.unresolved_symbols = UNRESOLVED_ERROR;
+      error_unresolved_symbols = true;
     } else if (read_arg("rpath")) {
       add_rpath(arg);
     } else if (read_arg("R")) {
@@ -1107,6 +1237,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("warn-constructors")) {
     } else if (read_flag("warn-execstack")) {
     } else if (read_flag("no-warn-execstack")) {
+    } else if (read_flag("long-plt")) {
     } else if (read_flag("secure-plt")) {
     } else if (read_arg("rpath-link")) {
     } else if (read_z_flag("combreloc")) {
@@ -1115,21 +1246,21 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("no-keep-memory")) {
     } else if (read_arg("max-cache-size")) {
     } else if (read_arg("version-script")) {
-      // --version-script, --dynamic-list and --export-dynamic-symbol[-list]
-      // are treated as positional arguments even though they are actually not
-      // positional. This is because linker scripts (a positional argument)
-      // can also specify a version script, and it's better to consolidate
-      // parsing in read_input_files. In particular, version scripts can
-      // modify ctx.default_version which we initialize *after* parsing
-      // non-positional args, so the parsing cannot be done right here.
+      // --version-script is treated as positional arguments even though
+      // they are actually not positional. This is because linker scripts
+      // (a positional argument) can also specify a version script, and
+      // it's better to consolidate parsing in read_input_files. In
+      // particular, version scripts can modify ctx.default_version which
+      // we initialize *after* parsing non-positional args, so the parsing
+      // cannot be done right here.
       remaining.push_back("--version-script=" + std::string(arg));
     } else if (read_arg("dynamic-list")) {
-      ctx.arg.Bsymbolic = true;
-      remaining.push_back("--dynamic-list=" + std::string(arg));
+      ctx.arg.Bsymbolic = BSYMBOLIC_ALL;
+      append(ctx.dynamic_list_patterns, parse_dynamic_list(ctx, arg));
     } else if (read_arg("export-dynamic-symbol")) {
-      remaining.push_back("--export-dynamic-symbol=" + std::string(arg));
+      ctx.dynamic_list_patterns.push_back({arg, "<command line>"});
     } else if (read_arg("export-dynamic-symbol-list")) {
-      remaining.push_back("--export-dynamic-symbol-list=" + std::string(arg));
+      append(ctx.dynamic_list_patterns, parse_dynamic_list(ctx, arg));
     } else if (read_flag("as-needed")) {
       remaining.push_back("--as-needed");
     } else if (read_flag("no-as-needed")) {
@@ -1183,6 +1314,18 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if (ctx.arg.pic)
     ctx.arg.image_base = 0;
 
+  if (!report_undefined)
+    report_undefined = !ctx.arg.shared;
+
+  if (*report_undefined) {
+    if (error_unresolved_symbols)
+      ctx.arg.unresolved_symbols = UNRESOLVED_ERROR;
+    else
+      ctx.arg.unresolved_symbols = UNRESOLVED_WARN;
+  } else {
+    ctx.arg.unresolved_symbols = UNRESOLVED_IGNORE;
+  }
+
   if (ctx.arg.retain_symbols_file) {
     ctx.arg.strip_all = false;
     ctx.arg.discard_all = false;
@@ -1211,6 +1354,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   else if (!ctx.arg.section_order.empty())
     ctx.arg.z_relro = false;
 
+  if (ctx.arg.nmagic)
+    ctx.arg.z_relro = false;
+
   if (!ctx.arg.shared) {
     if (!ctx.arg.filter.empty())
       Fatal(ctx) << "-filter may not be used without -shared";
@@ -1218,7 +1364,10 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       Fatal(ctx) << "-auxiliary may not be used without -shared";
   }
 
-  if constexpr (!E::is_rela || is_mips<E>)
+  // Even though SH4 is RELA, addends in its relocation records are always
+  // zero, and actual addends are written to relocated places. So we need
+  // to handle it as an exception.
+  if constexpr (!E::is_rela || is_sh4<E>)
     if (!ctx.arg.apply_dynamic_relocs)
       Fatal(ctx) << "--no-apply-dynamic-relocs may not be used on "
                  << E::target_name;
@@ -1239,11 +1388,6 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if (char *env = getenv("MOLD_REPRO"); env && env[0])
     ctx.arg.repro = true;
 
-  if (ctx.arg.shared || ctx.arg.export_dynamic)
-    ctx.default_version = VER_NDX_GLOBAL;
-  else
-    ctx.default_version = VER_NDX_LOCAL;
-
   if (ctx.arg.default_symver) {
     std::string ver = ctx.arg.soname.empty() ?
       filepath(ctx.arg.output).filename().string() : std::string(ctx.arg.soname);
@@ -1255,6 +1399,12 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     ctx.arg.warn_textrel = true;
 
   ctx.arg.undefined.push_back(ctx.arg.entry);
+
+  for (i64 i = 0; i < ctx.arg.defsyms.size(); i++) {
+    std::variant<Symbol<E> *, u64> &val = ctx.arg.defsyms[i].second;
+    if (Symbol<E> **sym = std::get_if<Symbol<E> *>(&val))
+      ctx.arg.undefined.push_back(*sym);
+  }
 
   // --oformat=binary implies --strip-all because without a section
   // header, there's no way to identify the locations of a symbol
@@ -1275,6 +1425,21 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if (ctx.arg.shared)
     ctx.overwrite_output_file = false;
 
+  if (!ctx.arg.chroot.empty()) {
+    if (!ctx.arg.Map.empty())
+      ctx.arg.Map = ctx.arg.chroot + "/" + ctx.arg.Map;
+
+    if (!ctx.arg.dependency_file.empty())
+      ctx.arg.dependency_file = ctx.arg.chroot + "/" + ctx.arg.dependency_file;
+  }
+
+  // Mark GC root symbols
+  for (Symbol<E> *sym : ctx.arg.undefined)
+    sym->gc_root = true;
+  for (Symbol<E> *sym : ctx.arg.require_defined)
+    sym->gc_root = true;
+  ctx.arg.entry->gc_root = true;
+
   if (version_shown && remaining.empty())
     exit(0);
   return remaining;
@@ -1282,6 +1447,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
 
 using E = MOLD_TARGET;
 
+template std::vector<std::string_view> expand_response_files(Context<E> &, char **);
 template std::vector<std::string> parse_nonpositional_args(Context<E> &ctx);
 
 } // namespace mold::elf

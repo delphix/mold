@@ -2,11 +2,15 @@
 . $(dirname $0)/common.inc
 
 # Skip if 32 bits as we use very large addresses in this test.
-[ $MACHINE = i386 ] && skip
+[ $MACHINE = i686 ] && skip
 [ $MACHINE = riscv32 ] && skip
 
 # It looks like SPARC's runtime can't handle PLT if it's too far from GOT.
 [ $MACHINE = sparc64 ] && skip
+
+# qemu aborts with the "Unknown exception 0x5" error, although this
+# test passes on a real POWER10 machine.
+on_qemu && [ "$CPU" = power10 ] && skip
 
 cat <<EOF > $t/a.c
 #include <stdio.h>

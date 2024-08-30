@@ -1,5 +1,7 @@
 #include "mold.h"
-#include "../common/sha.h"
+
+#include "config.h"
+#include "blake3.h"
 
 #include <cctype>
 #include <set>
@@ -8,10 +10,6 @@
 #include <tbb/parallel_for_each.h>
 #include <tbb/parallel_scan.h>
 #include <tbb/parallel_sort.h>
-
-#ifndef _WIN32
-# include <sys/mman.h>
-#endif
 
 namespace mold::elf {
 
@@ -37,45 +35,34 @@ static u32 djb_hash(std::string_view name) {
 }
 
 template <typename E>
-u64 get_eflags(Context<E> &ctx) {
-  std::vector<ObjectFile<E> *> objs = ctx.objs;
-  std::erase(objs, ctx.internal_obj);
+OutputSection<E> *find_section(Context<E> &ctx, u32 sh_type) {
+  for (Chunk<E> *chunk : ctx.chunks)
+    if (OutputSection<E> *osec = chunk->to_osec())
+      if (osec->shdr.sh_type == sh_type)
+        return osec;
+  return nullptr;
+}
 
-  if constexpr (is_arm32<E>)
-    return EF_ARM_EABI_VER5;
+template <typename E>
+OutputSection<E> *find_section(Context<E> &ctx, std::string_view name) {
+  for (Chunk<E> *chunk : ctx.chunks)
+    if (OutputSection<E> *osec = chunk->to_osec())
+      if (osec->name == name)
+        return osec;
+  return nullptr;
+}
 
-  if constexpr (is_riscv<E>) {
-    if (objs.empty())
-      return 0;
+template <typename E>
+static u64 get_entry_addr(Context<E> &ctx) {
+  if (ctx.arg.relocatable)
+    return 0;
 
-    u32 ret = objs[0]->get_ehdr().e_flags;
-    for (i64 i = 1; i < objs.size(); i++) {
-      u32 flags = objs[i]->get_ehdr().e_flags;
-      if (flags & EF_RISCV_RVC)
-        ret |= EF_RISCV_RVC;
+  if (InputFile<E> *file = ctx.arg.entry->file)
+    if (!file->is_dso)
+      return ctx.arg.entry->get_addr(ctx);
 
-      if ((flags & EF_RISCV_FLOAT_ABI) != (ret & EF_RISCV_FLOAT_ABI))
-        Error(ctx) << *objs[i] << ": cannot link object files with different"
-                   << " floating-point ABI from " << *objs[0];
-
-      if ((flags & EF_RISCV_RVE) != (ret & EF_RISCV_RVE))
-        Error(ctx) << *objs[i] << ": cannot link object files with different"
-                   << " EF_RISCV_RVE from " << *objs[0];
-    }
-    return ret;
-  }
-
-  if constexpr (is_ppc64v2<E>)
-    return 2;
-
-  if constexpr (is_mips<E>) {
-    // Real MIPS e_flags computation is much more complicated.
-    // For now, we just copy the first object's e_flags to the output.
-    if (objs.empty())
-      return 0;
-    return objs[0]->get_ehdr().e_flags;
-  }
-
+  if (!ctx.arg.shared)
+    Warn(ctx) << "entry symbol is not defined: " << *ctx.arg.entry;
   return 0;
 }
 
@@ -84,27 +71,13 @@ void OutputEhdr<E>::copy_buf(Context<E> &ctx) {
   ElfEhdr<E> &hdr = *(ElfEhdr<E> *)(ctx.buf + this->shdr.sh_offset);
   memset(&hdr, 0, sizeof(hdr));
 
-  auto get_entry_addr = [&]() -> u64 {
-    if (ctx.arg.relocatable)
-      return 0;
-
-    if (!ctx.arg.entry.empty())
-      if (Symbol<E> *sym = get_symbol(ctx, ctx.arg.entry);
-          sym->file && !sym->file->is_dso)
-        return sym->get_addr(ctx);
-
-    if (OutputSection<E> *osec = find_section(ctx, ".text"))
-      return osec->shdr.sh_addr;
-    return 0;
-  };
-
   memcpy(&hdr.e_ident, "\177ELF", 4);
   hdr.e_ident[EI_CLASS] = E::is_64 ? ELFCLASS64 : ELFCLASS32;
   hdr.e_ident[EI_DATA] = E::is_le ? ELFDATA2LSB : ELFDATA2MSB;
   hdr.e_ident[EI_VERSION] = EV_CURRENT;
   hdr.e_machine = E::e_machine;
   hdr.e_version = EV_CURRENT;
-  hdr.e_entry = get_entry_addr();
+  hdr.e_entry = get_entry_addr(ctx);
   hdr.e_flags = get_eflags(ctx);
   hdr.e_ehsize = sizeof(ElfEhdr<E>);
 
@@ -147,12 +120,12 @@ void OutputShdr<E>::copy_buf(Context<E> &ctx) {
   ElfShdr<E> *hdr = (ElfShdr<E> *)(ctx.buf + this->shdr.sh_offset);
   memset(hdr, 0, this->shdr.sh_size);
 
+  if (ctx.shstrtab && SHN_LORESERVE <= ctx.shstrtab->shndx)
+    hdr[0].sh_link = ctx.shstrtab->shndx;
+
   i64 shnum = ctx.shdr->shdr.sh_size / sizeof(ElfShdr<E>);
   if (UINT16_MAX < shnum)
-    hdr->sh_size = shnum;
-
-  if (ctx.shstrtab && SHN_LORESERVE <= ctx.shstrtab->shndx)
-    hdr->sh_link = ctx.shstrtab->shndx;
+    hdr[0].sh_size = shnum;
 
   for (Chunk<E> *chunk : ctx.chunks)
     if (chunk->shndx)
@@ -187,12 +160,11 @@ template <typename E>
 static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
   std::vector<ElfPhdr<E>> vec;
 
-  auto define = [&](u64 type, u64 flags, i64 min_align, Chunk<E> *chunk) {
-    vec.push_back({});
-    ElfPhdr<E> &phdr = vec.back();
+  auto define = [&](u64 type, u64 flags, Chunk<E> *chunk) {
+    ElfPhdr<E> phdr = {};
     phdr.p_type = type;
     phdr.p_flags = flags;
-    phdr.p_align = std::max<u64>(min_align, chunk->shdr.sh_addralign);
+    phdr.p_align = chunk->shdr.sh_addralign;
     phdr.p_offset = chunk->shdr.sh_offset;
 
     if (chunk->shdr.sh_type != SHT_NOBITS)
@@ -203,19 +175,19 @@ static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
 
     if (chunk->shdr.sh_flags & SHF_ALLOC)
       phdr.p_memsz = chunk->shdr.sh_size;
+    vec.push_back(phdr);
   };
 
   auto append = [&](Chunk<E> *chunk) {
     ElfPhdr<E> &phdr = vec.back();
     phdr.p_align = std::max<u64>(phdr.p_align, chunk->shdr.sh_addralign);
-    if (chunk->shdr.sh_type != SHT_NOBITS)
-      phdr.p_filesz = chunk->shdr.sh_addr + chunk->shdr.sh_size - phdr.p_vaddr;
     phdr.p_memsz = chunk->shdr.sh_addr + chunk->shdr.sh_size - phdr.p_vaddr;
+    if (chunk->shdr.sh_type != SHT_NOBITS)
+      phdr.p_filesz = phdr.p_memsz;
   };
 
   auto is_bss = [](Chunk<E> *chunk) {
-    return chunk->shdr.sh_type == SHT_NOBITS &&
-           !(chunk->shdr.sh_flags & SHF_TLS);
+    return chunk->shdr.sh_type == SHT_NOBITS;
   };
 
   auto is_tbss = [](Chunk<E> *chunk) {
@@ -224,86 +196,86 @@ static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
   };
 
   auto is_note = [](Chunk<E> *chunk) {
-    ElfShdr<E> &shdr = chunk->shdr;
-    return (shdr.sh_type == SHT_NOTE) && (shdr.sh_flags & SHF_ALLOC);
+    return chunk->shdr.sh_type == SHT_NOTE;
   };
+
+  // When we are creating PT_LOAD segments, we consider only
+  // the following chunks.
+  std::vector<Chunk<E> *> chunks;
+  for (Chunk<E> *chunk : ctx.chunks)
+    if ((chunk->shdr.sh_flags & SHF_ALLOC) && !is_tbss(chunk))
+      chunks.push_back(chunk);
+
+  // The ELF spec says that "loadable segment entries in the program
+  // header table appear in ascending order, sorted on the p_vaddr
+  // member".
+  sort(chunks, [](Chunk<E> *a, Chunk<E> *b) {
+    return a->shdr.sh_addr < b->shdr.sh_addr;
+  });
 
   // Create a PT_PHDR for the program header itself.
   if (ctx.phdr && (ctx.phdr->shdr.sh_flags & SHF_ALLOC))
-    define(PT_PHDR, PF_R, sizeof(Word<E>), ctx.phdr);
+    define(PT_PHDR, PF_R, ctx.phdr);
 
   // Create a PT_INTERP.
   if (ctx.interp)
-    define(PT_INTERP, PF_R, 1, ctx.interp);
+    define(PT_INTERP, PF_R, ctx.interp);
 
   // Create a PT_NOTE for SHF_NOTE sections.
-  for (i64 i = 0, end = ctx.chunks.size(); i < end;) {
-    Chunk<E> *first = ctx.chunks[i++];
-    if (!is_note(first))
-      continue;
+  for (i64 i = 0; i < chunks.size();) {
+    Chunk<E> *first = chunks[i++];
+    if (is_note(first)) {
+      i64 flags = to_phdr_flags(ctx, first);
+      define(PT_NOTE, flags, first);
 
-    i64 flags = to_phdr_flags(ctx, first);
-    i64 alignment = first->shdr.sh_addralign;
-    define(PT_NOTE, flags, alignment, first);
-
-    while (i < end && is_note(ctx.chunks[i]) &&
-           to_phdr_flags(ctx, ctx.chunks[i]) == flags)
-      append(ctx.chunks[i++]);
+      while (i < chunks.size() &&
+             is_note(ctx.chunks[i]) &&
+             to_phdr_flags(ctx, ctx.chunks[i]) == flags)
+        append(ctx.chunks[i++]);
+    }
   }
 
   // Create PT_LOAD segments.
-  {
-    i64 idx = vec.size();
-    std::vector<Chunk<E> *> chunks = ctx.chunks;
-    std::erase_if(chunks, is_tbss);
+  for (i64 i = 0; i < chunks.size();) {
+    Chunk<E> *first = chunks[i++];
+    i64 flags = to_phdr_flags(ctx, first);
+    define(PT_LOAD, flags, first);
+    vec.back().p_align = std::max<u64>(ctx.page_size, vec.back().p_align);
 
-    for (i64 i = 0, end = chunks.size(); i < end;) {
-      Chunk<E> *first = chunks[i++];
-      if (!(first->shdr.sh_flags & SHF_ALLOC))
-        continue;
-
-      i64 flags = to_phdr_flags(ctx, first);
-      define(PT_LOAD, flags, ctx.page_size, first);
-
-      // Add contiguous ALLOC sections as long as they have the same
-      // section flags and there's no on-disk gap in between.
-      if (!is_bss(first))
-        while (i < end && !is_bss(chunks[i]) &&
-               to_phdr_flags(ctx, chunks[i]) == flags &&
-               chunks[i]->shdr.sh_offset - first->shdr.sh_offset ==
-               chunks[i]->shdr.sh_addr - first->shdr.sh_addr)
-          append(chunks[i++]);
-
-      while (i < end && is_bss(chunks[i]) &&
-             to_phdr_flags(ctx, chunks[i]) == flags)
+    // Add contiguous ALLOC sections as long as they have the same
+    // section flags and there's no on-disk gap in between.
+    if (!is_bss(first))
+      while (i < chunks.size() &&
+             !is_bss(chunks[i]) &&
+             to_phdr_flags(ctx, chunks[i]) == flags &&
+             chunks[i]->shdr.sh_offset - first->shdr.sh_offset ==
+             chunks[i]->shdr.sh_addr - first->shdr.sh_addr)
         append(chunks[i++]);
-    }
 
-    // The ELF spec says that "loadable segment entries in the program
-    // header table appear in ascending order, sorted on the p_vaddr
-    // member".
-    std::stable_sort(vec.begin() + idx, vec.end(),
-                     [](const ElfPhdr<E> &a, const ElfPhdr<E> &b) {
-      return a.p_vaddr < b.p_vaddr;
-    });
+    while (i < chunks.size() &&
+           is_bss(chunks[i]) &&
+           to_phdr_flags(ctx, chunks[i]) == flags)
+      append(chunks[i++]);
   }
 
   // Create a PT_TLS.
-  for (i64 i = 0; i < ctx.chunks.size(); i++) {
-    if (ctx.chunks[i]->shdr.sh_flags & SHF_TLS) {
-      define(PT_TLS, PF_R, 1, ctx.chunks[i++]);
-      while (i < ctx.chunks.size() && (ctx.chunks[i]->shdr.sh_flags & SHF_TLS))
+  for (i64 i = 0; i < ctx.chunks.size();) {
+    Chunk<E> *first = ctx.chunks[i++];
+    if (first->shdr.sh_flags & SHF_TLS) {
+      define(PT_TLS, PF_R, first);
+      while (i < ctx.chunks.size() &&
+             (ctx.chunks[i]->shdr.sh_flags & SHF_TLS))
         append(ctx.chunks[i++]);
     }
   }
 
   // Add PT_DYNAMIC
   if (ctx.dynamic && ctx.dynamic->shdr.sh_size)
-    define(PT_DYNAMIC, PF_R | PF_W, 1, ctx.dynamic);
+    define(PT_DYNAMIC, to_phdr_flags(ctx, ctx.dynamic), ctx.dynamic);
 
   // Add PT_GNU_EH_FRAME
   if (ctx.eh_frame_hdr)
-    define(PT_GNU_EH_FRAME, PF_R, 1, ctx.eh_frame_hdr);
+    define(PT_GNU_EH_FRAME, PF_R, ctx.eh_frame_hdr);
 
   // Add PT_GNU_STACK, which is a marker segment that doesn't really
   // contain any segments. It controls executable bit of stack area.
@@ -318,36 +290,31 @@ static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
 
   // Create a PT_GNU_RELRO.
   if (ctx.arg.z_relro) {
-    for (i64 i = 0; i < ctx.chunks.size(); i++) {
-      if (!ctx.chunks[i]->is_relro)
-        continue;
-
-      define(PT_GNU_RELRO, PF_R, 1, ctx.chunks[i++]);
-      while (i < ctx.chunks.size() && ctx.chunks[i]->is_relro)
-        append(ctx.chunks[i++]);
-      vec.back().p_align = 1;
+    for (i64 i = 0; i < chunks.size();) {
+      Chunk<E> *first = chunks[i++];
+      if (first->is_relro) {
+        define(PT_GNU_RELRO, PF_R, first);
+        while (i < chunks.size() && chunks[i]->is_relro)
+          append(chunks[i++]);
+        vec.back().p_align = 1;
+      }
     }
   }
 
   // Create a PT_ARM_EDXIDX
   if constexpr (is_arm32<E>)
     if (OutputSection<E> *osec = find_section(ctx, SHT_ARM_EXIDX))
-      define(PT_ARM_EXIDX, PF_R, 4, osec);
+      define(PT_ARM_EXIDX, PF_R, osec);
 
   // Create a PT_RISCV_ATTRIBUTES
   if constexpr (is_riscv<E>)
     if (ctx.extra.riscv_attributes->shdr.sh_size)
-      define(PT_RISCV_ATTRIBUTES, PF_R, 1, ctx.extra.riscv_attributes);
-
-  // Create a PT_MIPS_ABIFLAGS
-  if constexpr (is_mips<E>)
-    if (ctx.extra.abi_flags->shdr.sh_size)
-      define(PT_MIPS_ABIFLAGS, PF_R, 8, ctx.extra.abi_flags);
+      define(PT_RISCV_ATTRIBUTES, PF_R, ctx.extra.riscv_attributes);
 
   // Create a PT_OPENBSD_RANDOMIZE
   for (Chunk<E> *chunk : ctx.chunks)
     if (chunk->name == ".openbsd.randomdata")
-      define(PT_OPENBSD_RANDOMIZE, PF_R | PF_W, 1, chunk);
+      define(PT_OPENBSD_RANDOMIZE, PF_R | PF_W, chunk);
 
   // Set p_paddr if --physical-image-base was given. --physical-image-base
   // is typically used in embedded programming to specify the base address
@@ -395,6 +362,7 @@ static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
     }
   }
 
+  vec.resize(vec.size() + ctx.arg.spare_program_headers);
   return vec;
 }
 
@@ -446,7 +414,7 @@ void RelDynSection<E>::sort(Context<E> &ctx) {
   Timer t(ctx, "sort_dynamic_relocs");
 
   ElfRel<E> *begin = (ElfRel<E> *)(ctx.buf + this->shdr.sh_offset);
-  ElfRel<E> *end = (ElfRel<E> *)((u8 *)begin + this->shdr.sh_size);
+  ElfRel<E> *end = begin + this->shdr.sh_size / sizeof(ElfRel<E>);
 
   auto get_rank = [](u32 r_type) {
     if (r_type == E::R_RELATIVE)
@@ -486,10 +454,9 @@ template <typename E>
 void RelrDynSection<E>::update_shdr(Context<E> &ctx) {
   this->shdr.sh_link = ctx.dynsym->shndx;
 
-  i64 n = ctx.got->relr.size();
+  i64 n = 0;
   for (Chunk<E> *chunk : ctx.chunks)
-    if (OutputSection<E> *osec = chunk->to_osec())
-      n += osec->relr.size();
+    n += chunk->relr.size();
   this->shdr.sh_size = n * sizeof(Word<E>);
 }
 
@@ -497,18 +464,22 @@ template <typename E>
 void RelrDynSection<E>::copy_buf(Context<E> &ctx) {
   Word<E> *buf = (Word<E> *)(ctx.buf + this->shdr.sh_offset);
 
-  for (u64 val : ctx.got->relr)
-    *buf++ = (val & 1) ? val : (ctx.got->shdr.sh_addr + val);
-
   for (Chunk<E> *chunk : ctx.chunks)
-    if (OutputSection<E> *osec = chunk->to_osec())
-      for (u64 val : osec->relr)
-        *buf++ = (val & 1) ? val : (osec->shdr.sh_addr + val);
+    for (u64 val : chunk->relr)
+      *buf++ = (val & 1) ? val : (chunk->shdr.sh_addr + val);
 }
 
 template <typename E>
 void StrtabSection<E>::update_shdr(Context<E> &ctx) {
   i64 offset = 1;
+
+  // ARM32 uses $a, $t and $t mapping symbols to mark the beginning of
+  // ARM, Thumb and data in text, respectively. These symbols don't
+  // affect correctness of the program but helps disassembler to
+  // disassemble machine code appropriately.
+  if constexpr (is_arm32<E>)
+    if (!ctx.arg.strip_all && !ctx.arg.retain_symbols_file)
+      offset += sizeof("$a\0$t\0$d");
 
   for (Chunk<E> *chunk : ctx.chunks) {
     chunk->strtab_offset = offset;
@@ -529,12 +500,22 @@ void StrtabSection<E>::update_shdr(Context<E> &ctx) {
 }
 
 template <typename E>
+void StrtabSection<E>::copy_buf(Context<E> &ctx) {
+  u8 *buf = ctx.buf + this->shdr.sh_offset;
+  buf[0] = '\0';
+
+  if constexpr (is_arm32<E>)
+    if (!ctx.arg.strip_all && !ctx.arg.retain_symbols_file)
+      memcpy(buf + 1, "$a\0$t\0$d", 9);
+}
+
+template <typename E>
 void ShstrtabSection<E>::update_shdr(Context<E> &ctx) {
   std::unordered_map<std::string_view, i64> map;
   i64 offset = 1;
 
   for (Chunk<E> *chunk : ctx.chunks) {
-    if (chunk->kind() != ChunkKind::HEADER && !chunk->name.empty()) {
+    if (!chunk->is_header() && !chunk->name.empty()) {
       auto [it, inserted] = map.insert({chunk->name, offset});
       chunk->shdr.sh_name = it->second;
       if (inserted)
@@ -551,7 +532,7 @@ void ShstrtabSection<E>::copy_buf(Context<E> &ctx) {
   base[0] = '\0';
 
   for (Chunk<E> *chunk : ctx.chunks)
-    if (chunk->kind() != ChunkKind::HEADER && !chunk->name.empty())
+    if (chunk->shdr.sh_name)
       write_string(base + chunk->shdr.sh_name, chunk->name);
 }
 
@@ -584,14 +565,13 @@ void DynstrSection<E>::copy_buf(Context<E> &ctx) {
   u8 *base = ctx.buf + this->shdr.sh_offset;
   base[0] = '\0';
 
-  for (std::pair<std::string_view, i64> pair : strings)
-    write_string(base + pair.second, pair.first);
+  for (std::pair<std::string_view, i64> p : strings)
+    write_string(base + p.second, p.first);
 
-  if (!ctx.dynsym->symbols.empty()) {
-    i64 offset = dynsym_offset;
-    for (Symbol<E> *sym : std::span<Symbol<E> *>(ctx.dynsym->symbols).subspan(1))
-      offset += write_string(base + offset, sym->name());
-  }
+  i64 off = dynsym_offset;
+  for (Symbol<E> *sym : ctx.dynsym->symbols)
+    if (sym)
+      off += write_string(base + off, sym->name());
 }
 
 template <typename E>
@@ -636,9 +616,6 @@ void SymtabSection<E>::copy_buf(Context<E> &ctx) {
   ElfSym<E> *buf = (ElfSym<E> *)(ctx.buf + this->shdr.sh_offset);
   memset(buf, 0, sizeof(ElfSym<E>));
 
-  // Write the initial NUL byte to .strtab.
-  ctx.buf[ctx.strtab->shdr.sh_offset] = '\0';
-
   if (ctx.symtab_shndx) {
     ElfShdr<E> &shdr = ctx.symtab_shndx->shdr;
     memset(ctx.buf + shdr.sh_offset, 0, shdr.sh_size);
@@ -675,6 +652,27 @@ void SymtabSection<E>::copy_buf(Context<E> &ctx) {
   tbb::parallel_for_each(ctx.dsos, [&](SharedFile<E> *file) {
     file->populate_symtab(ctx);
   });
+}
+
+// An ARM64 function with a non-standard calling convention is marked with
+// STO_AARCH64_VARIANT_PCS bit in the symbol table.
+//
+// A function with that bit is not safe to be called through a lazy PLT
+// stub because the PLT resolver may clobber registers that should be
+// preserved in a non-standard calling convention.
+//
+// To solve the problem, the dynamic linker scans the dynamic symbol table
+// at process startup time and resolve symbols with STO_AARCH64_VARIANT_PCS
+// bit eagerly, so that the PLT resolver won't be called for that symbol
+// lazily. As an optimization, it does so only when DT_AARCH64_VARIANT_PCS
+// is set in the dynamic section.
+//
+// This function returns true if DT_AARCH64_VARIANT_PCS needs to be set.
+static bool contains_variant_pcs(Context<ARM64> &ctx) {
+  for (Symbol<ARM64> *sym : ctx.plt->symbols)
+    if (sym->esym().arm64_variant_pcs)
+      return true;
+  return false;
 }
 
 template <typename E>
@@ -726,8 +724,6 @@ static std::vector<Word<E>> create_dynamic_section(Context<E> &ctx) {
   } else if constexpr (is_ppc32<E>) {
     if (ctx.gotplt->shdr.sh_size)
       define(DT_PLTGOT, ctx.gotplt->shdr.sh_addr + GotPltSection<E>::HDR_SIZE);
-  } else if constexpr (is_mips<E>) {
-    define(DT_PLTGOT, ctx.extra.quickstart->shdr.sh_addr);
   } else {
     if (ctx.gotplt->shdr.sh_size)
       define(DT_PLTGOT, ctx.gotplt->shdr.sh_addr);
@@ -774,13 +770,13 @@ static std::vector<Word<E>> create_dynamic_section(Context<E> &ctx) {
     define(DT_VERDEFNUM, ctx.verdef->shdr.sh_info);
   }
 
-  if (Symbol<E> *sym = get_symbol(ctx, ctx.arg.init);
-      sym->file && !sym->file->is_dso)
-    define(DT_INIT, sym->get_addr(ctx));
+  if (Symbol<E> &sym = *ctx.arg.init;
+      sym.file && !sym.file->is_dso)
+    define(DT_INIT, sym.get_addr(ctx));
 
-  if (Symbol<E> *sym = get_symbol(ctx, ctx.arg.fini);
-      sym->file && !sym->file->is_dso)
-    define(DT_FINI, sym->get_addr(ctx));
+  if (Symbol<E> &sym = *ctx.arg.fini;
+      sym.file && !sym.file->is_dso)
+    define(DT_FINI, sym.get_addr(ctx));
 
   if (ctx.hash)
     define(DT_HASH, ctx.hash->shdr.sh_addr);
@@ -818,18 +814,7 @@ static std::vector<Word<E>> create_dynamic_section(Context<E> &ctx) {
   if (ctx.arg.z_interpose)
     flags1 |= DF_1_INTERPOSE;
 
-  auto has_gottp_syms = [&] {
-    if constexpr (is_mips<E>) {
-      for (ObjectFile<E> *file : ctx.objs)
-        if (!file->extra.got->gottp_syms.empty())
-          return true;
-      return false;
-    } else {
-      return !ctx.got->gottp_syms.empty();
-    }
-  };
-
-  if (has_gottp_syms())
+  if (!ctx.got->gottp_syms.empty())
     flags |= DF_STATIC_TLS;
   if (ctx.has_textrel)
     flags |= DF_TEXTREL;
@@ -838,6 +823,10 @@ static std::vector<Word<E>> create_dynamic_section(Context<E> &ctx) {
     define(DT_FLAGS, flags);
   if (flags1)
     define(DT_FLAGS_1, flags1);
+
+  if constexpr (is_arm64<E>)
+    if (contains_variant_pcs(ctx))
+      define(DT_AARCH64_VARIANT_PCS, 1);
 
   if constexpr (is_ppc32<E>)
     define(DT_PPC_GOT, ctx.gotplt->shdr.sh_addr);
@@ -849,19 +838,9 @@ static std::vector<Word<E>> create_dynamic_section(Context<E> &ctx) {
     define(DT_PPC64_GLINK, ctx.plt->shdr.sh_addr + E::plt_hdr_size - 32);
   }
 
-  if constexpr (is_mips<E>) {
-    define(DT_MIPS_RLD_VERSION, 1);
-    define(DT_MIPS_FLAGS, 0);
-    define(DT_MIPS_BASE_ADDRESS, ctx.arg.image_base);
-    define(DT_MIPS_LOCAL_GOTNO, 2);
-    define(DT_MIPS_SYMTABNO, ctx.dynsym->symbols.size());
-    define(DT_MIPS_GOTSYM, 0);
-    define(DT_MIPS_OPTIONS, 0);
-  }
-
   // GDB needs a DT_DEBUG entry in an executable to store a word-size
   // data for its own purpose. Its content is not important.
-  if (!ctx.arg.shared)
+  if (!ctx.arg.shared && !ctx.arg.z_rodynamic)
     define(DT_DEBUG, 0);
 
   define(DT_NULL, 0);
@@ -889,31 +868,6 @@ void DynamicSection<E>::copy_buf(Context<E> &ctx) {
 }
 
 template <typename E>
-OutputSection<E>::OutputSection(std::string_view name, u32 type, u64 flags) {
-  this->name = name;
-  this->shdr.sh_type = type;
-  this->shdr.sh_flags = flags;
-
-  // PT_GNU_RELRO segment is a security mechanism to make more pages
-  // read-only than we could have done without it.
-  //
-  // Traditionally, sections are either read-only or read-write. If a
-  // section contains dynamic relocations, it must have been put into a
-  // read-write segment so that the program loader can mutate its
-  // contents in memory, even if no one will write to it at runtime.
-  //
-  // RELRO segment allows us to make such pages writable only when a
-  // program is being loaded. After that, the page becomes read-only.
-  //
-  // Some sections, such as .init, .fini, .got, .dynamic, contain
-  // dynamic relocations but doesn't have to be writable at runtime,
-  // so they are put into a RELRO segment.
-  this->is_relro = (name == ".toc" || name.ends_with(".rel.ro") ||
-                    type == SHT_INIT_ARRAY || type == SHT_FINI_ARRAY ||
-                    type == SHT_PREINIT_ARRAY || (flags & SHF_TLS));
-}
-
-template <typename E>
 void OutputSection<E>::copy_buf(Context<E> &ctx) {
   if (this->shdr.sh_type != SHT_NOBITS)
     write_to(ctx, ctx.buf + this->shdr.sh_offset);
@@ -921,36 +875,34 @@ void OutputSection<E>::copy_buf(Context<E> &ctx) {
 
 template <typename E>
 void OutputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
-  auto clear = [&](u8 *loc, i64 size) {
-    // As a special case, .init and .fini are filled with NOPs for s390x
-    // because the runtime executes the sections as if they were a single
-    // function. .init and .fini are superceded by .init_array and
-    // .fini_array but being actively used only on s390x.
-    if constexpr (is_s390x<E>) {
-      if (this->name == ".init" || this->name == ".fini") {
-        for (i64 i = 0; i < size; i += 2)
-          *(ub16 *)(loc + i) = 0x0700; // nop
-        return;
-      }
-    }
-    memset(loc, 0, size);
-  };
-
   tbb::parallel_for((i64)0, (i64)members.size(), [&](i64 i) {
-    // Copy section contents to an output file
+    // Copy section contents to an output file.
     InputSection<E> &isec = *members[i];
     isec.write_to(ctx, buf + isec.offset);
 
-    // Clear trailing padding
+    // Clear trailing padding. We write trap or nop instructions for
+    // an executable segment so that a disassembler wouldn't try to
+    // disassemble garbage as instructions.
     u64 this_end = isec.offset + isec.sh_size;
-    u64 next_start = (i == members.size() - 1) ?
-      (u64)this->shdr.sh_size : members[i + 1]->offset;
-    clear(buf + this_end, next_start - this_end);
+    u64 next_start;
+    if (i + 1 < members.size())
+      next_start = members[i + 1]->offset;
+    else
+      next_start = this->shdr.sh_size;
+
+    u8 *loc = buf + this_end;
+    i64 size = next_start - this_end;
+
+    if (this->shdr.sh_flags & SHF_EXECINSTR) {
+      for (i64 i = 0; i + sizeof(E::filler) <= size; i += sizeof(E::filler))
+        memcpy(loc + i, E::filler, sizeof(E::filler));
+    } else {
+      memset(loc, 0, size);
+    }
   });
 
   if constexpr (needs_thunk<E>) {
-    tbb::parallel_for_each(thunks,
-                           [&](std::unique_ptr<RangeExtensionThunk<E>> &thunk) {
+    tbb::parallel_for_each(thunks, [&](std::unique_ptr<Thunk<E>> &thunk) {
       thunk->copy_buf(ctx);
     });
   }
@@ -973,23 +925,27 @@ void OutputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
 // bit. An address must be even and thus its LSB is 0 (odd address is not
 // representable in this encoding and such relocation must be stored to
 // the .rel.dyn section). A bitmap has LSB 1.
-static std::vector<u64> encode_relr(std::span<u64> pos, i64 word_size) {
+template <typename E>
+static std::vector<u64> encode_relr(std::span<u64> pos) {
   std::vector<u64> vec;
-  u64 num_bits = word_size * 8 - 1;
-  u64 max_delta = num_bits * word_size;
+  i64 num_bits = E::is_64 ? 63 : 31;
+  i64 max_delta = sizeof(Word<E>) * num_bits;
 
   for (i64 i = 0; i < pos.size();) {
-    assert(i == 0 || pos[i - 1] <= pos[i]);
-    assert(pos[i] % word_size == 0);
+    assert(i == 0 || pos[i - 1] < pos[i]);
+    assert(pos[i] % sizeof(Word<E>) == 0);
 
     vec.push_back(pos[i]);
-    u64 base = pos[i] + word_size;
+    u64 base = pos[i] + sizeof(Word<E>);
     i++;
 
     for (;;) {
       u64 bits = 0;
-      for (; i < pos.size() && pos[i] - base < max_delta; i++)
-        bits |= 1LL << ((pos[i] - base) / word_size);
+      for (; i < pos.size() && pos[i] - base < max_delta; i++) {
+        assert(pos[i - 1] < pos[i]);
+        assert(pos[i] % sizeof(Word<E>) == 0);
+        bits |= (u64)1 << ((pos[i] - base) / sizeof(Word<E>));
+      }
 
       if (!bits)
         break;
@@ -1020,37 +976,31 @@ void OutputSection<E>::construct_relr(Context<E> &ctx) {
 
   tbb::parallel_for((i64)0, (i64)members.size(), [&](i64 i) {
     InputSection<E> &isec = *members[i];
-    if ((1 << isec.p2align) < sizeof(Word<E>))
-      return;
 
-    for (const ElfRel<E> &r : isec.get_rels(ctx))
-      if (r.r_type == E::R_ABS && (r.r_offset % sizeof(Word<E>)) == 0)
-        if (Symbol<E> &sym = *isec.file.symbols[r.r_sym];
-            !sym.is_absolute() && !sym.is_imported)
-          shards[i].push_back(isec.offset + r.r_offset);
+    if (isec.shdr().sh_addralign % sizeof(Word<E>) == 0)
+      for (const ElfRel<E> &r : isec.get_rels(ctx))
+        if (r.r_type == E::R_ABS && r.r_offset % sizeof(Word<E>) == 0)
+          if (Symbol<E> &sym = *isec.file.symbols[r.r_sym];
+              !sym.is_ifunc() && !sym.is_absolute() && !sym.is_imported)
+            shards[i].push_back(isec.offset + r.r_offset);
   });
 
   // Compress them
   std::vector<u64> pos = flatten(shards);
-  relr = encode_relr(pos, sizeof(Word<E>));
+  this->relr = encode_relr<E>(pos);
 }
 
 // Compute spaces needed for thunk symbols
 template <typename E>
 void OutputSection<E>::compute_symtab_size(Context<E> &ctx) {
-  if (ctx.arg.strip_all || ctx.arg.retain_symbols_file || ctx.arg.relocatable)
-    return;
-
   if constexpr (needs_thunk<E>) {
     this->strtab_size = 0;
     this->num_local_symtab = 0;
 
-    if constexpr (is_arm32<E>)
-      this->strtab_size = 9; // for "$t", "$a" and "$d" symbols
-
-    for (std::unique_ptr<RangeExtensionThunk<E>> &thunk : thunks) {
+    for (std::unique_ptr<Thunk<E>> &thunk : thunks) {
       // For ARM32, we emit additional symbol "$t", "$a" and "$d" for
-      // each thunk to mark the beginning of ARM code.
+      // each thunk to mark the beginning of Thumb code, ARM code and
+      // data, respectively.
       if constexpr (is_arm32<E>)
         this->num_local_symtab += thunk->symbols.size() * 4;
       else
@@ -1067,9 +1017,6 @@ void OutputSection<E>::compute_symtab_size(Context<E> &ctx) {
 // disassembling and/or debugging our output.
 template <typename E>
 void OutputSection<E>::populate_symtab(Context<E> &ctx) {
-  if (this->strtab_size == 0)
-    return;
-
   if constexpr (needs_thunk<E>) {
     ElfSym<E> *esym =
       (ElfSym<E> *)(ctx.buf + ctx.symtab->shdr.sh_offset) + this->local_symtab_idx;
@@ -1077,37 +1024,30 @@ void OutputSection<E>::populate_symtab(Context<E> &ctx) {
     u8 *strtab_base = ctx.buf + ctx.strtab->shdr.sh_offset;
     u8 *strtab = strtab_base + this->strtab_offset;
 
-    if constexpr (is_arm32<E>) {
-      // ARM uses these symbols to mark the begining of Thumb code, ARM
-      // code and data, respectively. Our thunk contains all of them.
-      strtab += write_string(strtab, "$t");
-      strtab += write_string(strtab, "$a");
-      strtab += write_string(strtab, "$d");
-    }
+    auto write_esym = [&](u64 addr, i64 st_name) {
+      memset(esym, 0, sizeof(*esym));
+      esym->st_name = st_name;
+      esym->st_type = STT_FUNC;
+      esym->st_shndx = this->shndx;
+      esym->st_value = addr;
+      esym++;
+    };
 
-    for (std::unique_ptr<RangeExtensionThunk<E>> &thunk : thunks) {
+    for (std::unique_ptr<Thunk<E>> &thunk : thunks) {
       for (i64 i = 0; i < thunk->symbols.size(); i++) {
         Symbol<E> &sym = *thunk->symbols[i];
+        u64 addr = thunk->get_addr(i);
 
-        auto write_esym = [&](i64 st_name, i64 off) {
-          memset(esym, 0, sizeof(*esym));
-          esym->st_name = st_name;
-          esym->st_type = STT_FUNC;
-          esym->st_shndx = this->shndx;
-          esym->st_value = thunk->get_addr(i) + off;
-          esym++;
-        };
-
-        write_esym(strtab - strtab_base, 0);
+        write_esym(addr, strtab - strtab_base);
 
         strtab += write_string(strtab, sym.name()) - 1;
         strtab += write_string(strtab, "$thunk");
 
         // Emit "$t", "$a" and "$d" if ARM32.
         if constexpr (is_arm32<E>) {
-          write_esym(this->strtab_offset, 0);
-          write_esym(this->strtab_offset + 3, 4);
-          write_esym(this->strtab_offset + 6, 16);
+          write_esym(addr, ctx.strtab->THUMB);
+          write_esym(addr + 4, ctx.strtab->ARM);
+          write_esym(addr + 12, ctx.strtab->DATA);
         }
       }
     }
@@ -1117,7 +1057,14 @@ void OutputSection<E>::populate_symtab(Context<E> &ctx) {
 template <typename E>
 void GotSection<E>::add_got_symbol(Context<E> &ctx, Symbol<E> *sym) {
   sym->set_got_idx(ctx, this->shdr.sh_size / sizeof(Word<E>));
-  this->shdr.sh_size += sizeof(Word<E>);
+
+  // An IFUNC symbol uses two GOT slots in a position-dependent
+  // executable.
+  if (sym->is_pde_ifunc(ctx))
+    this->shdr.sh_size += sizeof(Word<E>) * 2;
+  else
+    this->shdr.sh_size += sizeof(Word<E>);
+
   got_syms.push_back(sym);
 }
 
@@ -1137,19 +1084,23 @@ void GotSection<E>::add_tlsgd_symbol(Context<E> &ctx, Symbol<E> *sym) {
 
 template <typename E>
 void GotSection<E>::add_tlsdesc_symbol(Context<E> &ctx, Symbol<E> *sym) {
+  // TLSDESC's GOT slot values may vary depending on libc, so we
+  // always emit a dynamic relocation for each TLSDESC entry.
+  //
+  // If dynamic relocation is not available (i.e. if we are creating a
+  // statically-linked executable), we always relax TLSDESC relocations
+  // so that no TLSDESC relocation exist at runtime.
   assert(supports_tlsdesc<E>);
+  assert(!ctx.arg.is_static);
+
   sym->set_tlsdesc_idx(ctx, this->shdr.sh_size / sizeof(Word<E>));
   this->shdr.sh_size += sizeof(Word<E>) * 2;
   tlsdesc_syms.push_back(sym);
-
-  if (sym != ctx._TLS_MODULE_BASE_)
-    ctx.dynsym->add_symbol(ctx, sym);
 }
 
 template <typename E>
 void GotSection<E>::add_tlsld(Context<E> &ctx) {
-  if (tlsld_idx != -1)
-    return;
+  assert(tlsld_idx == -1);
   tlsld_idx = this->shdr.sh_size / sizeof(Word<E>);
   this->shdr.sh_size += sizeof(Word<E>) * 2;
 }
@@ -1207,7 +1158,12 @@ static std::vector<GotEntry<E>> get_got_entries(Context<E> &ctx) {
     // IFUNC always needs to be fixed up by the dynamic linker.
     if constexpr (supports_ifunc<E>) {
       if (sym->is_ifunc()) {
-        add({idx, sym->get_addr(ctx, NO_PLT), E::R_IRELATIVE});
+        if (sym->is_pde_ifunc(ctx)) {
+          add({idx, sym->get_plt_addr(ctx)});
+          add({idx + 1, sym->get_addr(ctx, NO_PLT), E::R_IRELATIVE});
+        } else {
+          add({idx, sym->get_addr(ctx, NO_PLT), E::R_IRELATIVE});
+        }
         continue;
       }
     }
@@ -1243,12 +1199,17 @@ static std::vector<GotEntry<E>> get_got_entries(Context<E> &ctx) {
 
   if constexpr (supports_tlsdesc<E>) {
     for (Symbol<E> *sym : ctx.got->tlsdesc_syms) {
-      // _TLS_MODULE_BASE_ is a linker-synthesized virtual symbol that
-      // refers the begining of the TLS block.
-      if (sym == ctx._TLS_MODULE_BASE_)
-        add({sym->get_tlsdesc_idx(ctx), 0, E::R_TLSDESC});
+      i64 idx = sym->get_tlsdesc_idx(ctx);
+
+      // TLSDESC uses two consecutive GOT slots, and a single TLSDESC
+      // dynamic relocation fills both. The actual values of the slots
+      // vary depending on libc, so we can't precompute their values.
+      // We always emit a dynamic relocation for each incoming TLSDESC
+      // reloc.
+      if (sym->is_imported)
+        add({idx, 0, E::R_TLSDESC, sym});
       else
-        add({sym->get_tlsdesc_idx(ctx), 0, E::R_TLSDESC, sym});
+        add({idx, sym->get_addr(ctx) - ctx.tls_begin, E::R_TLSDESC});
     }
   }
 
@@ -1314,14 +1275,32 @@ void GotSection<E>::copy_buf(Context<E> &ctx) {
   for (GotEntry<E> &ent : get_got_entries(ctx)) {
     if (ent.is_relr(ctx) || ent.r_type == R_NONE) {
       buf[ent.idx] = ent.val;
-    } else {
-      *rel++ = ElfRel<E>(this->shdr.sh_addr + ent.idx * sizeof(Word<E>),
-                         ent.r_type,
-                         ent.sym ? ent.sym->get_dynsym_idx(ctx) : 0,
-                         ent.val);
+      continue;
+    }
 
-      if (ctx.arg.apply_dynamic_relocs)
+    *rel++ = ElfRel<E>(this->shdr.sh_addr + ent.idx * sizeof(Word<E>),
+                       ent.r_type,
+                       ent.sym ? ent.sym->get_dynsym_idx(ctx) : 0,
+                       ent.val);
+
+    bool is_tlsdesc = false;
+    if constexpr (supports_tlsdesc<E>)
+      is_tlsdesc = (ent.r_type == E::R_TLSDESC);
+
+    if (ctx.arg.apply_dynamic_relocs) {
+      if (is_tlsdesc && !is_arm32<E>) {
+        // A single TLSDESC relocation fixes two consecutive GOT slots
+        // where one slot holds a function pointer and the other an
+        // argument to the function. An addend should be applied not to
+        // the function pointer but to the function argument, which is
+        // usually stored to the second slot.
+        //
+        // ARM32 employs the inverted layout for some reason, so an
+        // addend is applied to the first slot.
+        buf[ent.idx + 1] = ent.val;
+      } else {
         buf[ent.idx] = ent.val;
+      }
     }
   }
 }
@@ -1335,14 +1314,11 @@ void GotSection<E>::construct_relr(Context<E> &ctx) {
     if (ent.is_relr(ctx))
       pos.push_back(ent.idx * sizeof(Word<E>));
 
-  relr = encode_relr(pos, sizeof(Word<E>));
+  this->relr = encode_relr<E>(pos);
 }
 
 template <typename E>
 void GotSection<E>::compute_symtab_size(Context<E> &ctx) {
-  if (ctx.arg.strip_all || ctx.arg.retain_symbols_file)
-    return;
-
   this->strtab_size = 0;
   this->num_local_symtab = 0;
 
@@ -1374,7 +1350,7 @@ void GotSection<E>::compute_symtab_size(Context<E> &ctx) {
 
 template <typename E>
 void GotSection<E>::populate_symtab(Context<E> &ctx) {
-  if (this->strtab_size == 0)
+  if (this->num_local_symtab == 0)
     return;
 
   ElfSym<E> *esym =
@@ -1440,7 +1416,6 @@ void GotPltSection<E>::copy_buf(Context<E> &ctx) {
 template <typename E>
 void PltSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
   assert(!sym->has_plt(ctx));
-
   sym->set_plt_idx(ctx, symbols.size());
   symbols.push_back(sym);
   ctx.dynsym->add_symbol(ctx, sym);
@@ -1465,19 +1440,19 @@ void PltSection<E>::copy_buf(Context<E> &ctx) {
 
 template <typename E>
 void PltSection<E>::compute_symtab_size(Context<E> &ctx) {
-  if (ctx.arg.strip_all || ctx.arg.retain_symbols_file)
-    return;
-
   this->num_local_symtab = symbols.size();
   this->strtab_size = 0;
 
   for (Symbol<E> *sym : symbols)
     this->strtab_size += sym->name().size() + sizeof("$plt");
+
+  if constexpr (is_arm32<E>)
+    this->num_local_symtab += symbols.size() * 2 + 2;
 }
 
 template <typename E>
 void PltSection<E>::populate_symtab(Context<E> &ctx) {
-  if (this->strtab_size == 0)
+  if (this->num_local_symtab == 0)
     return;
 
   ElfSym<E> *esym =
@@ -1486,16 +1461,30 @@ void PltSection<E>::populate_symtab(Context<E> &ctx) {
   u8 *strtab_base = ctx.buf + ctx.strtab->shdr.sh_offset;
   u8 *strtab = strtab_base + this->strtab_offset;
 
-  for (Symbol<E> *sym : symbols) {
+  auto write_esym = [&](u64 addr, i64 st_name) {
     memset(esym, 0, sizeof(*esym));
-    esym->st_name = strtab - strtab_base;
+    esym->st_name = st_name;
     esym->st_type = STT_FUNC;
     esym->st_shndx = this->shndx;
-    esym->st_value = sym->get_plt_addr(ctx);
+    esym->st_value = addr;
     esym++;
+  };
 
+  if constexpr (is_arm32<E>) {
+    write_esym(this->shdr.sh_addr, ctx.strtab->ARM);
+    write_esym(this->shdr.sh_addr + 16, ctx.strtab->DATA);
+  }
+
+  for (Symbol<E> *sym : symbols) {
+    u64 addr = sym->get_plt_addr(ctx);
+    write_esym(addr, strtab - strtab_base);
     strtab += write_string(strtab, sym->name()) - 1;
     strtab += write_string(strtab, "$plt");
+
+    if constexpr (is_arm32<E>) {
+      write_esym(addr, ctx.strtab->ARM);
+      write_esym(addr + 12, ctx.strtab->DATA);
+    }
   }
 }
 
@@ -1518,19 +1507,19 @@ void PltGotSection<E>::copy_buf(Context<E> &ctx) {
 
 template <typename E>
 void PltGotSection<E>::compute_symtab_size(Context<E> &ctx) {
-  if (ctx.arg.strip_all || ctx.arg.retain_symbols_file)
-    return;
-
   this->num_local_symtab = symbols.size();
   this->strtab_size = 0;
 
   for (Symbol<E> *sym : symbols)
     this->strtab_size += sym->name().size() + sizeof("$pltgot");
+
+  if constexpr (is_arm32<E>)
+    this->num_local_symtab += symbols.size() * 2;
 }
 
 template <typename E>
 void PltGotSection<E>::populate_symtab(Context<E> &ctx) {
-  if (this->strtab_size == 0)
+  if (this->num_local_symtab == 0)
     return;
 
   ElfSym<E> *esym =
@@ -1539,16 +1528,25 @@ void PltGotSection<E>::populate_symtab(Context<E> &ctx) {
   u8 *strtab_base = ctx.buf + ctx.strtab->shdr.sh_offset;
   u8 *strtab = strtab_base + this->strtab_offset;
 
-  for (Symbol<E> *sym : symbols) {
+  auto write_esym = [&](u64 addr, i64 st_name) {
     memset(esym, 0, sizeof(*esym));
-    esym->st_name = strtab - strtab_base;
+    esym->st_name = st_name;
     esym->st_type = STT_FUNC;
     esym->st_shndx = this->shndx;
-    esym->st_value = sym->get_plt_addr(ctx);
+    esym->st_value = addr;
     esym++;
+  };
 
+  for (Symbol<E> *sym : symbols) {
+    u64 addr = sym->get_plt_addr(ctx);
+    write_esym(addr, strtab - strtab_base);
     strtab += write_string(strtab, sym->name()) - 1;
     strtab += write_string(strtab, "$pltgot");
+
+    if constexpr (is_arm32<E>) {
+      write_esym(addr, ctx.strtab->ARM);
+      write_esym(addr + 12, ctx.strtab->DATA);
+    }
   }
 }
 
@@ -1577,7 +1575,7 @@ void RelPltSection<E>::copy_buf(Context<E> &ctx) {
   }
 }
 
-template<typename E>
+template <typename E>
 ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym, u32 st_name,
                          U32<E> *shn_xindex) {
   ElfSym<E> esym;
@@ -1595,6 +1593,9 @@ ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym, u32 st_name,
     esym.st_bind = STB_GLOBAL;
   else
     esym.st_bind = sym.esym().st_bind;
+
+  if constexpr (is_arm64<E>)
+    esym.arm64_variant_pcs = sym.esym().arm64_variant_pcs;
 
   if constexpr (is_ppc64v2<E>)
     esym.ppc_local_entry = sym.esym().ppc_local_entry;
@@ -1627,6 +1628,7 @@ ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym, u32 st_name,
     esym.st_value = sym.get_addr(ctx);
   } else if (sym.file->is_dso || sym.esym().is_undef()) {
     esym.st_shndx = SHN_UNDEF;
+    esym.st_size = 0;
     if (sym.is_canonical)
       esym.st_value = sym.get_plt_addr(ctx);
   } else if (Chunk<E> *osec = sym.get_output_section()) {
@@ -1642,8 +1644,15 @@ ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym, u32 st_name,
     esym.st_shndx = SHN_ABS;
     esym.st_value = sym.get_addr(ctx);
   } else if (sym.get_type() == STT_TLS) {
+    // TLS symbol
     shndx = get_st_shndx(sym);
     esym.st_value = sym.get_addr(ctx) - ctx.tls_begin;
+  } else if (sym.is_pde_ifunc(ctx)) {
+    // IFUNC symbol in PDE that uses two GOT slots
+    shndx = get_st_shndx(sym);
+    esym.st_type = STT_FUNC;
+    esym.st_visibility = sym.visibility;
+    esym.st_value = sym.get_plt_addr(ctx);
   } else {
     shndx = get_st_shndx(sym);
     esym.st_visibility = sym.visibility;
@@ -1668,6 +1677,8 @@ ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym, u32 st_name,
 
 template <typename E>
 void DynsymSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
+  assert(!finalized);
+
   if (symbols.empty())
     symbols.resize(1);
 
@@ -1680,6 +1691,9 @@ void DynsymSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
 template <typename E>
 void DynsymSection<E>::finalize(Context<E> &ctx) {
   Timer t(ctx, "DynsymSection::finalize");
+  assert(!finalized);
+  finalized = true;
+
   if (symbols.empty())
     return;
 
@@ -1701,11 +1715,8 @@ void DynsymSection<E>::finalize(Context<E> &ctx) {
     u32 num_buckets = num_exported / ctx.gnu_hash->LOAD_FACTOR + 1;
     ctx.gnu_hash->num_buckets = num_buckets;
 
-    tbb::parallel_for((i64)(first_global - symbols.begin()), (i64)symbols.size(),
-                      [&](i64 i) {
-      Symbol<E> &sym = *symbols[i];
-      sym.set_dynsym_idx(ctx, i);
-      sym.set_djb_hash(ctx, djb_hash(sym.name()));
+    tbb::parallel_for_each(first_global, symbols.end(), [&](Symbol<E> *sym) {
+      sym->set_djb_hash(ctx, djb_hash(sym->name()));
     });
 
     tbb::parallel_sort(first_global, symbols.end(),
@@ -1713,10 +1724,8 @@ void DynsymSection<E>::finalize(Context<E> &ctx) {
       if (a->is_exported != b->is_exported)
         return b->is_exported;
 
-      u32 h1 = a->get_djb_hash(ctx) % num_buckets;
-      u32 h2 = b->get_djb_hash(ctx) % num_buckets;
-      return std::tuple(h1, a->get_dynsym_idx(ctx)) <
-             std::tuple(h2, b->get_dynsym_idx(ctx));
+      return std::tuple(a->get_djb_hash(ctx) % num_buckets, a->name()) <
+             std::tuple(b->get_djb_hash(ctx) % num_buckets, b->name());
     });
   }
 
@@ -1794,10 +1803,10 @@ void HashSection<E>::copy_buf(Context<E> &ctx) {
 }
 
 template <typename E>
-std::span<Symbol<E> *>
-GnuHashSection<E>::get_exported_symbols(Context<E> &ctx) {
+static std::span<Symbol<E> *> get_exported_symbols(Context<E> &ctx) {
   std::span<Symbol<E> *> syms = ctx.dynsym->symbols;
-  auto it = std::partition_point(syms.begin() + 1, syms.end(), [](Symbol<E> *sym) {
+  auto it = std::partition_point(syms.begin() + 1, syms.end(),
+                                 [](Symbol<E> *sym) {
     return !sym->is_exported;
   });
   return syms.subspan(it - syms.begin());
@@ -1843,7 +1852,7 @@ void GnuHashSection<E>::copy_buf(Context<E> &ctx) {
   for (i64 i = 0; i < syms.size(); i++) {
     constexpr i64 word_bits = sizeof(Word<E>) * 8;
 
-    i64 h = syms[i]->get_djb_hash(ctx);
+    u32 h = syms[i]->get_djb_hash(ctx);
     indices[i] = h % num_buckets;
 
     i64 idx = (h / word_bits) % num_bloom;
@@ -1874,34 +1883,47 @@ void GnuHashSection<E>::copy_buf(Context<E> &ctx) {
 
 template <typename E>
 std::string_view
-get_merged_output_name(Context<E> &ctx, std::string_view name, u64 flags) {
+get_merged_output_name(Context<E> &ctx, std::string_view name, u64 flags,
+                       i64 entsize, i64 addralign) {
   if (ctx.arg.relocatable && !ctx.arg.relocatable_merge_sections)
     return name;
   if (ctx.arg.unique && ctx.arg.unique->match(name))
     return name;
-  if (name == ".rodata" || name.starts_with(".rodata."))
-    return (flags & SHF_STRINGS) ? ".rodata.str" : ".rodata.cst";
+
+  // GCC seems to create sections named ".rodata.strN.<mangled-symbol-name>.M".
+  // We want to eliminate the symbol name part from the section name.
+  if ((flags & SHF_STRINGS) && name.starts_with(".rodata.")) {
+    std::string name2 = ".rodata.str"s + std::to_string(entsize) +
+                        "." + std::to_string(addralign);
+    if (name == name2)
+      return name;
+    return save_string(ctx, name2);
+  }
+
   return name;
 }
 
 template <typename E>
-MergedSection<E>::MergedSection(std::string_view name, u64 flags, u32 type) {
+MergedSection<E>::MergedSection(std::string_view name, i64 flags, i64 type,
+                                i64 entsize) {
   this->name = name;
   this->shdr.sh_flags = flags;
   this->shdr.sh_type = type;
+  this->shdr.sh_entsize = entsize;
 }
 
 template <typename E>
 MergedSection<E> *
 MergedSection<E>::get_instance(Context<E> &ctx, std::string_view name,
-                               u64 type, u64 flags) {
-  name = get_merged_output_name(ctx, name, flags);
+                               i64 type, i64 flags,
+                               i64 entsize, i64 addralign) {
+  name = get_merged_output_name(ctx, name, flags, entsize, addralign);
   flags = flags & ~(u64)SHF_GROUP & ~(u64)SHF_COMPRESSED;
 
   auto find = [&]() -> MergedSection * {
     for (std::unique_ptr<MergedSection<E>> &osec : ctx.merged_sections)
-      if (std::tuple(name, flags, type) ==
-          std::tuple(osec->name, osec->shdr.sh_flags, osec->shdr.sh_type))
+      if (name == osec->name && flags == osec->shdr.sh_flags &&
+          type == osec->shdr.sh_type && entsize == osec->shdr.sh_entsize)
         return osec.get();
     return nullptr;
   };
@@ -1919,7 +1941,7 @@ MergedSection<E>::get_instance(Context<E> &ctx, std::string_view name,
   if (MergedSection *osec = find())
     return osec;
 
-  MergedSection *osec = new MergedSection(name, flags, type);
+  MergedSection *osec = new MergedSection(name, flags, type, entsize);
   ctx.merged_sections.emplace_back(osec);
   return osec;
 }
@@ -1928,20 +1950,13 @@ template <typename E>
 SectionFragment<E> *
 MergedSection<E>::insert(Context<E> &ctx, std::string_view data, u64 hash,
                          i64 p2align) {
-  std::call_once(once_flag, [&] {
-    // We aim 2/3 occupation ratio
-    map.resize(estimator.get_cardinality() * 3 / 2);
-  });
-
   // Even if GC is enabled, we garbage-collect only memory-mapped strings.
   // Non-memory-allocated strings are typically identifiers used by debug info.
   // To remove such strings, use the `strip` command.
   bool is_alive = !ctx.arg.gc_sections || !(this->shdr.sh_flags & SHF_ALLOC);
 
-  SectionFragment<E> *frag;
-  bool inserted;
-  std::tie(frag, inserted) =
-    map.insert(data, hash, SectionFragment(this, is_alive));
+  SectionFragment<E> *frag =
+    map.insert(data, hash, SectionFragment(this, is_alive)).first;
   update_maximum(frag->p2align, p2align);
   return frag;
 }
@@ -1949,67 +1964,52 @@ MergedSection<E>::insert(Context<E> &ctx, std::string_view data, u64 hash,
 template <typename E>
 void MergedSection<E>::assign_offsets(Context<E> &ctx) {
   std::vector<i64> sizes(map.NUM_SHARDS);
-  std::vector<i64> max_p2aligns(map.NUM_SHARDS);
-  shard_offsets.resize(map.NUM_SHARDS + 1);
-
-  i64 shard_size = map.nbuckets / map.NUM_SHARDS;
+  Atomic<i64> alignment = 1;
 
   tbb::parallel_for((i64)0, map.NUM_SHARDS, [&](i64 i) {
-    struct KeyVal {
-      std::string_view key;
-      SectionFragment<E> *val;
-    };
+    using Entry = typename decltype(map)::Entry;
+    std::vector<Entry *> entries = map.get_sorted_entries(i);
 
-    std::vector<KeyVal> fragments;
-    fragments.reserve(shard_size);
-
-    for (i64 j = shard_size * i; j < shard_size * (i + 1); j++)
-      if (const char *key = map.get_key(j))
-        if (SectionFragment<E> &frag = map.values[j]; frag.is_alive)
-          fragments.push_back({{key, map.key_sizes[j]}, &frag});
-
-    // Sort fragments to make output deterministic.
-    tbb::parallel_sort(fragments.begin(), fragments.end(),
-                       [](const KeyVal &a, const KeyVal &b) {
-      return std::tuple{(u32)a.val->p2align, a.key.size(), a.key} <
-             std::tuple{(u32)b.val->p2align, b.key.size(), b.key};
-    });
-
-    // Assign offsets.
     i64 offset = 0;
     i64 p2align = 0;
 
-    for (KeyVal &kv : fragments) {
-      SectionFragment<E> &frag = *kv.val;
-      offset = align_to(offset, 1 << frag.p2align);
-      frag.offset = offset;
-      offset += kv.key.size();
-      p2align = std::max<i64>(p2align, frag.p2align);
+    for (Entry *ent : entries) {
+      SectionFragment<E> &frag = ent->value;
+      if (frag.is_alive) {
+        offset = align_to(offset, 1 << frag.p2align);
+        frag.offset = offset;
+        offset += ent->keylen;
+        p2align = std::max<i64>(p2align, frag.p2align);
+      }
     }
 
     sizes[i] = offset;
-    max_p2aligns[i] = p2align;
+    update_maximum(alignment, 1 << p2align);
 
     static Counter merged_strings("merged_strings");
-    merged_strings += fragments.size();
+    merged_strings += entries.size();
   });
 
-  i64 p2align = 0;
-  for (i64 x : max_p2aligns)
-    p2align = std::max(p2align, x);
+  i64 shard_size = map.nbuckets / map.NUM_SHARDS;
+  shard_offsets.resize(map.NUM_SHARDS + 1);
 
   for (i64 i = 1; i < map.NUM_SHARDS + 1; i++)
     shard_offsets[i] =
-      align_to(shard_offsets[i - 1] + sizes[i - 1], 1 << p2align);
+      align_to(shard_offsets[i - 1] + sizes[i - 1], alignment);
 
   tbb::parallel_for((i64)1, map.NUM_SHARDS, [&](i64 i) {
-    for (i64 j = shard_size * i; j < shard_size * (i + 1); j++)
-      if (SectionFragment<E> &frag = map.values[j]; frag.is_alive)
+    for (i64 j = shard_size * i; j < shard_size * (i + 1); j++) {
+      SectionFragment<E> &frag = map.entries[j].value;
+      if (frag.is_alive)
         frag.offset += shard_offsets[i];
+    }
   });
 
   this->shdr.sh_size = shard_offsets[map.NUM_SHARDS];
-  this->shdr.sh_addralign = 1 << p2align;
+  this->shdr.sh_addralign = alignment;
+
+  if (this->shdr.sh_size > UINT32_MAX)
+    Fatal(ctx) << this->name << ": output section too large";
 }
 
 template <typename E>
@@ -2022,12 +2022,16 @@ void MergedSection<E>::write_to(Context<E> &ctx, u8 *buf) {
   i64 shard_size = map.nbuckets / map.NUM_SHARDS;
 
   tbb::parallel_for((i64)0, map.NUM_SHARDS, [&](i64 i) {
-    memset(buf + shard_offsets[i], 0, shard_offsets[i + 1] - shard_offsets[i]);
+    // There might be gaps between strings to satisfy alignment requirements.
+    // If that's the case, we need to zero-clear them.
+    if (this->shdr.sh_addralign > 1)
+      memset(buf + shard_offsets[i], 0, shard_offsets[i + 1] - shard_offsets[i]);
 
+    // Copy strings
     for (i64 j = shard_size * i; j < shard_size * (i + 1); j++)
-      if (const char *key = map.get_key(j))
-        if (SectionFragment<E> &frag = map.values[j]; frag.is_alive)
-          memcpy(buf + frag.offset, key, map.key_sizes[j]);
+      if (const char *key = map.entries[j].key)
+        if (SectionFragment<E> &frag = map.entries[j].value; frag.is_alive)
+          memcpy(buf + frag.offset, key, map.entries[j].keylen);
   });
 }
 
@@ -2035,12 +2039,12 @@ template <typename E>
 void MergedSection<E>::print_stats(Context<E> &ctx) {
   i64 used = 0;
   for (i64 i = 0; i < map.nbuckets; i++)
-    if (map.get_key(i))
+    if (map.entries[i].key)
       used++;
 
-  SyncOut(ctx) << this->name
-               << " estimation=" << estimator.get_cardinality()
-               << " actual=" << used;
+  Out(ctx) << this->name
+           << " estimation=" << estimator.get_cardinality()
+           << " actual=" << used;
 }
 
 template <typename E>
@@ -2072,7 +2076,7 @@ void EhFrameSection<E>::construct(Context<E> &ctx) {
   std::vector<CieRecord<E> *> leaders;
   auto find_leader = [&](CieRecord<E> &cie) -> CieRecord<E> * {
     for (CieRecord<E> *leader : leaders)
-      if (cie.equals(*leader))
+      if (cie_equals(*leader, cie))
         return leader;
     return nullptr;
   };
@@ -2115,9 +2119,9 @@ void EhFrameSection<E>::copy_buf(Context<E> &ctx) {
     I32<E> fde_addr;
   };
 
-  HdrEntry *eh_hdr_begin = nullptr;
+  HdrEntry *eh_hdr = nullptr;
   if (ctx.eh_frame_hdr)
-    eh_hdr_begin = (HdrEntry *)(ctx.buf + ctx.eh_frame_hdr->shdr.sh_offset +
+    eh_hdr = (HdrEntry *)(ctx.buf + ctx.eh_frame_hdr->shdr.sh_offset +
                    EhFrameHdrSection<E>::HEADER_SIZE);
 
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
@@ -2132,9 +2136,6 @@ void EhFrameSection<E>::copy_buf(Context<E> &ctx) {
       if (ctx.arg.relocatable)
         continue;
 
-      if constexpr (is_mips<E>)
-        mips_rewrite_cie(ctx, base + cie.output_offset, cie);
-
       for (const ElfRel<E> &rel : cie.get_rels()) {
         assert(rel.r_offset - cie.input_offset < contents.size());
 
@@ -2148,6 +2149,7 @@ void EhFrameSection<E>::copy_buf(Context<E> &ctx) {
     // Copy FDEs.
     for (i64 i = 0; i < file->fdes.size(); i++) {
       FdeRecord<E> &fde = file->fdes[i];
+      std::span<ElfRel<E>> rels = fde.get_rels(*file);
       i64 offset = file->fde_offset + fde.output_offset;
 
       std::string_view contents = fde.get_contents(*file);
@@ -2159,23 +2161,24 @@ void EhFrameSection<E>::copy_buf(Context<E> &ctx) {
       if (ctx.arg.relocatable)
         continue;
 
-      bool is_first = true;
-      for (const ElfRel<E> &rel : fde.get_rels(*file)) {
+      for (const ElfRel<E> &rel : rels) {
         assert(rel.r_offset - fde.input_offset < contents.size());
 
         Symbol<E> &sym = *file->symbols[rel.r_sym];
         u64 loc = offset + rel.r_offset - fde.input_offset;
         u64 val = sym.get_addr(ctx) + get_addend(cie.input_section, rel);
         apply_eh_reloc(ctx, rel, loc, val);
+      }
 
-        if (eh_hdr_begin && is_first) {
-          // Write to .eh_frame_hdr
-          HdrEntry &ent = eh_hdr_begin[file->fde_idx + i];
-          u64 sh_addr = ctx.eh_frame_hdr->shdr.sh_addr;
-          ent.init_addr = val - sh_addr;
-          ent.fde_addr = this->shdr.sh_addr + offset - sh_addr;
-          is_first = false;
-        }
+      if (eh_hdr) {
+        // Write to .eh_frame_hdr
+        Symbol<E> &sym = *file->symbols[rels[0].r_sym];
+        u64 val = sym.get_addr(ctx) + get_addend(cie.input_section, rels[0]);
+        u64 sh_addr = ctx.eh_frame_hdr->shdr.sh_addr;
+
+        HdrEntry &ent = eh_hdr[file->fde_idx + i];
+        ent.init_addr = val - sh_addr;
+        ent.fde_addr = this->shdr.sh_addr + offset - sh_addr;
       }
     }
   });
@@ -2184,8 +2187,8 @@ void EhFrameSection<E>::copy_buf(Context<E> &ctx) {
   *(U32<E> *)(base + this->shdr.sh_size - 4) = 0;
 
   // Sort .eh_frame_hdr contents.
-  if (eh_hdr_begin) {
-    tbb::parallel_sort(eh_hdr_begin, eh_hdr_begin + ctx.eh_frame_hdr->num_fdes,
+  if (eh_hdr) {
+    tbb::parallel_sort(eh_hdr, eh_hdr + ctx.eh_frame_hdr->num_fdes,
                       [](const HdrEntry &a, const HdrEntry &b) {
       return a.init_addr < b.init_addr;
     });
@@ -2303,7 +2306,7 @@ void CopyrelSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
   // For example, `environ`, `_environ` and `__environ` in libc.so are
   // aliases. If one of the symbols is copied by a copy relocation, other
   // symbols have to refer to the copied place as well.
-  for (Symbol<E> *sym2 : file.find_aliases(sym)) {
+  for (Symbol<E> *sym2 : file.get_symbols_at(sym)) {
     sym2->add_aux(ctx);
     sym2->is_imported = true;
     sym2->is_exported = true;
@@ -2315,29 +2318,18 @@ void CopyrelSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
 }
 
 template <typename E>
-void CopyrelSection<E>::update_shdr(Context<E> &ctx) {
-  // SHT_NOBITS sections (i.e. BSS sections) have to be at the end of
-  // a segment, so a .copyrel.rel.ro usually requires one extra
-  // segment for it. We turn a .copyrel.rel.ro into a regular section
-  // if it is very small to avoid the cost of the extra segment.
-  constexpr i64 threshold = 4096;
-  if (this->is_relro && ctx.arg.z_relro && this->shdr.sh_size < threshold)
-    this->shdr.sh_type = SHT_PROGBITS;
-}
-
-template <typename E>
 void CopyrelSection<E>::copy_buf(Context<E> &ctx) {
-  if (this->shdr.sh_type == SHT_PROGBITS)
-    memset(ctx.buf + this->shdr.sh_offset, 0, this->shdr.sh_size);
-
   ElfRel<E> *rel = (ElfRel<E> *)(ctx.buf + ctx.reldyn->shdr.sh_offset +
                                  this->reldyn_offset);
 
   for (Symbol<E> *sym : symbols)
-    *rel++ = ElfRel<E>(sym->get_addr(ctx), E::R_COPY, sym->get_dynsym_idx(ctx),
-                       0);
+    *rel++ = ElfRel<E>(sym->get_addr(ctx), E::R_COPY,
+                       sym->get_dynsym_idx(ctx), 0);
 }
 
+// .gnu.version section contains version indices as a parallel array for
+// .dynsym. If a dynamic symbol is a defined one, its version information
+// is in .gnu.version_d. Otherwise, it's in .gnu.version_r.
 template <typename E>
 void VersymSection<E>::update_shdr(Context<E> &ctx) {
   this->shdr.sh_size = contents.size() * sizeof(contents[0]);
@@ -2349,20 +2341,42 @@ void VersymSection<E>::copy_buf(Context<E> &ctx) {
   write_vector(ctx.buf + this->shdr.sh_offset, contents);
 }
 
+// If `-z pack-relative-relocs` is specified, we'll create a .relr.dyn
+// section and store base relocation records to that section instead of
+// to the usual .rela.dyn section.
+//
+// .relr.dyn is relatively new feature and not supported by glibc until
+// 2.38 which was released in 2022. If we don't do anything, executables
+// built with `-z pack-relative-relocs` 't work and would crash
+// immediately on startup with an older version of glibc.
+//
+// As a workaround, we'll add a dependency to a dummy version name
+// "GLIBC_ABI_DT_RELR" if `-z pack-relative-relocs` is given so that
+// executables built with the option failed with a more friendly "version
+// `GLIBC_ABI_DT_RELR' not found" error message. glibc 2.38 or later knows
+// about this dummy version name and simply ignores it.
+template <typename E>
+static InputFile<E> *find_glibc2(Context<E> &ctx) {
+  for (Symbol<E> *sym : ctx.dynsym->symbols)
+    if (sym && sym->file->is_dso &&
+        ((SharedFile<E> *)sym->file)->soname.starts_with("libc.so.") &&
+        sym->get_version().starts_with("GLIBC_2."))
+      return sym->file;
+  return nullptr;
+}
+
 template <typename E>
 void VerneedSection<E>::construct(Context<E> &ctx) {
   Timer t(ctx, "fill_verneed");
 
-  if (ctx.dynsym->symbols.empty())
-    return;
-
   // Create a list of versioned symbols and sort by file and version.
-  std::vector<Symbol<E> *> syms(ctx.dynsym->symbols.begin() + 1,
-                                ctx.dynsym->symbols.end());
+  std::vector<Symbol<E> *> syms;
 
-  std::erase_if(syms, [](Symbol<E> *sym) {
-    return !sym->file->is_dso || sym->ver_idx <= VER_NDX_LAST_RESERVED;
-  });
+  for (i64 i = 1; i < ctx.dynsym->symbols.size(); i++) {
+    Symbol<E> &sym = *ctx.dynsym->symbols[i];
+    if (sym.file->is_dso && VER_NDX_LAST_RESERVED < sym.ver_idx)
+      syms.push_back(&sym);
+  }
 
   if (syms.empty())
     return;
@@ -2373,8 +2387,8 @@ void VerneedSection<E>::construct(Context<E> &ctx) {
   });
 
   // Resize .gnu.version
-  ctx.versym->contents.resize(ctx.dynsym->symbols.size(), 1);
-  ctx.versym->contents[0] = 0;
+  ctx.versym->contents.resize(ctx.dynsym->symbols.size(), VER_NDX_GLOBAL);
+  ctx.versym->contents[0] = VER_NDX_LOCAL;
 
   // Allocate a large enough buffer for .gnu.version_r.
   contents.resize((sizeof(ElfVerneed<E>) + sizeof(ElfVernaux<E>)) *
@@ -2386,7 +2400,7 @@ void VerneedSection<E>::construct(Context<E> &ctx) {
   ElfVerneed<E> *verneed = nullptr;
   ElfVernaux<E> *aux = nullptr;
 
-  u16 veridx = VER_NDX_LAST_RESERVED + ctx.arg.version_definitions.size();
+  i64 veridx = VER_NDX_LAST_RESERVED + ctx.arg.version_definitions.size();
 
   auto start_group = [&](InputFile<E> *file) {
     this->shdr.sh_info++;
@@ -2407,7 +2421,7 @@ void VerneedSection<E>::construct(Context<E> &ctx) {
     if (aux)
       aux->vna_next = sizeof(ElfVernaux<E>);
     aux = (ElfVernaux<E> *)ptr;
-    ptr += sizeof(*aux);
+    ptr += sizeof(ElfVernaux<E>);
 
     aux->vna_hash = elf_hash(verstr);
     aux->vna_other = ++veridx;
@@ -2427,29 +2441,7 @@ void VerneedSection<E>::construct(Context<E> &ctx) {
   }
 
   if (ctx.arg.pack_dyn_relocs_relr) {
-    // If `-z pack-relative-relocs` is specified, we'll create a .relr.dyn
-    // section and store base relocation records to that section instead of
-    // to the usual .rela.dyn section.
-    //
-    // .relr.dyn is relatively new feature and not supported by glibc until
-    // 2.38 which was released in 2022. Executables built with `-z
-    // pack-relative-relocs` don't work and usually crash immediately on
-    // startup if libc doesn't support it.
-    //
-    // In the following code, we'll add a dependency to a dummy version name
-    // "GLIBC_ABI_DT_RELR" so that executables built with the option failed
-    // with a more friendly "version `GLIBC_ABI_DT_RELR' not found" error
-    // message. glibc 2.38 or later knows about this dummy version name and
-    // simply ignores it.
-    auto find_glibc2 = [&]() -> InputFile<E> * {
-      for (Symbol<E> *sym : syms)
-        if (((SharedFile<E> *)sym->file)->soname.starts_with("libc.so.") &&
-            sym->get_version().starts_with("GLIBC_2."))
-          return sym->file;
-      return nullptr;
-    };
-
-    if (InputFile<E> *file = find_glibc2()) {
+    if (InputFile<E> *file = find_glibc2(ctx)) {
       start_group(file);
       add_entry("GLIBC_ABI_DT_RELR");
     }
@@ -2477,16 +2469,20 @@ void VerdefSection<E>::construct(Context<E> &ctx) {
   if (ctx.arg.version_definitions.empty())
     return;
 
-  // Resize .gnu.version
-  ctx.versym->contents.resize(ctx.dynsym->symbols.size(), 1);
-  ctx.versym->contents[0] = 0;
+  // Resize .gnu.version and write to it
+  ctx.versym->contents.resize(ctx.dynsym->symbols.size(), VER_NDX_GLOBAL);
+  ctx.versym->contents[0] = VER_NDX_LOCAL;
 
-  // Allocate a buffer for .gnu.version_d.
+  for (i64 i = 1; i < ctx.dynsym->symbols.size(); i++)
+    if (Symbol<E> &sym = *ctx.dynsym->symbols[i];
+        !sym.file->is_dso && sym.ver_idx != VER_NDX_UNSPECIFIED)
+      ctx.versym->contents[sym.get_dynsym_idx(ctx)] = sym.ver_idx;
+
+  // Allocate a buffer for .gnu.version_d and write to it
   contents.resize((sizeof(ElfVerdef<E>) + sizeof(ElfVerdaux<E>)) *
                   (ctx.arg.version_definitions.size() + 1));
 
-  u8 *buf = (u8 *)&contents[0];
-  u8 *ptr = buf;
+  u8 *ptr = (u8 *)contents.data();
   ElfVerdef<E> *verdef = nullptr;
 
   auto write = [&](std::string_view verstr, i64 idx, i64 flags) {
@@ -2509,16 +2505,14 @@ void VerdefSection<E>::construct(Context<E> &ctx) {
     aux->vda_name = ctx.dynstr->add_string(verstr);
   };
 
-  std::string_view basename = ctx.arg.soname.empty() ?
-    ctx.arg.output : ctx.arg.soname;
-  write(basename, 1, VER_FLG_BASE);
+  if (!ctx.arg.soname.empty())
+    write(ctx.arg.soname, 1, VER_FLG_BASE);
+  else
+    write(ctx.arg.output, 1, VER_FLG_BASE);
 
-  i64 idx = 2;
+  i64 idx = VER_NDX_LAST_RESERVED + 1;
   for (std::string_view verstr : ctx.arg.version_definitions)
     write(verstr, idx++, 0);
-
-  for (Symbol<E> *sym : std::span<Symbol<E> *>(ctx.dynsym->symbols).subspan(1))
-    ctx.versym->contents[sym->get_dynsym_idx(ctx)] = sym->ver_idx;
 }
 
 template <typename E>
@@ -2560,63 +2554,56 @@ void BuildIdSection<E>::copy_buf(Context<E> &ctx) {
   memcpy(base + 3, "GNU", 4);           // Name string
 }
 
-template <typename E>
-static void compute_sha256(Context<E> &ctx, i64 offset) {
-  u8 *buf = ctx.buf;
-  i64 filesize = ctx.output_file->filesize;
-
-  i64 shard_size = 4096 * 1024;
-  i64 num_shards = align_to(filesize, shard_size) / shard_size;
-  std::vector<u8> shards(num_shards * SHA256_SIZE);
-
-  tbb::parallel_for((i64)0, num_shards, [&](i64 i) {
-    u8 *begin = buf + shard_size * i;
-    u8 *end = (i == num_shards - 1) ? buf + filesize : begin + shard_size;
-    sha256_hash(begin, end - begin, shards.data() + i * SHA256_SIZE);
-
-#ifndef _WIN32
-    // We call munmap early for each chunk so that the last munmap
-    // gets cheaper. We assume that the .note.build-id section is
-    // at the beginning of an output file. This is an ugly performance
-    // hack, but we can save about 30 ms for a 2 GiB output.
-    if (i > 0 && ctx.output_file->is_mmapped)
-      munmap(begin, end - begin);
-#endif
-   });
-
-  assert(ctx.arg.build_id.size() <= SHA256_SIZE);
-
-  u8 digest[SHA256_SIZE];
-  sha256_hash(shards.data(), shards.size(), digest);
-  memcpy(buf + offset, digest, ctx.arg.build_id.size());
-
-#ifndef _WIN32
-  if (ctx.output_file->is_mmapped) {
-    munmap(buf, std::min(filesize, shard_size));
-    ctx.output_file->is_unmapped = true;
-  }
-#endif
+// BLAKE3 is a cryptographic hash function just like SHA256.
+// We use it instead of SHA256 because it's faster.
+static void blake3_hash(u8 *buf, i64 size, u8 *out) {
+  blake3_hasher hasher;
+  blake3_hasher_init(&hasher);
+  blake3_hasher_update(&hasher, buf, size);
+  blake3_hasher_finalize(&hasher, out, BLAKE3_OUT_LEN);
 }
 
 template <typename E>
 void BuildIdSection<E>::write_buildid(Context<E> &ctx) {
   Timer t(ctx, "build_id");
+  u8 *buf = ctx.buf + this->shdr.sh_offset + HEADER_SIZE;
 
   switch (ctx.arg.build_id.kind) {
   case BuildId::HEX:
-    write_vector(ctx.buf + this->shdr.sh_offset + HEADER_SIZE,
-                 ctx.arg.build_id.value);
+    write_vector(buf, ctx.arg.build_id.value);
     return;
-  case BuildId::HASH:
-    // Modern x86 processors have purpose-built instructions to accelerate
-    // SHA256 computation, and SHA256 outperforms MD5 on such computers.
-    // So, we always compute SHA256 and truncate it if smaller digest was
-    // requested.
-    compute_sha256(ctx, this->shdr.sh_offset + HEADER_SIZE);
+  case BuildId::HASH: {
+    i64 shard_size = 4 * 1024 * 1024;
+    i64 filesize = ctx.output_file->filesize;
+    i64 num_shards = align_to(filesize, shard_size) / shard_size;
+    std::vector<u8> shards(num_shards * BLAKE3_OUT_LEN);
+
+    tbb::parallel_for((i64)0, num_shards, [&](i64 i) {
+      u8 *begin = ctx.buf + shard_size * i;
+      u8 *end = (i == num_shards - 1) ? ctx.buf + filesize : begin + shard_size;
+      blake3_hash(begin, end - begin, shards.data() + i * BLAKE3_OUT_LEN);
+
+#ifdef HAVE_MADVISE
+      // Make the kernel page out the file contents we've just written
+      // so that subsequent close(2) call will become quicker.
+      if (i > 0 && ctx.output_file->is_mmapped)
+        madvise(begin, end - begin, MADV_DONTNEED);
+#endif
+    });
+
+    u8 digest[BLAKE3_OUT_LEN];
+    blake3_hash(shards.data(), shards.size(), digest);
+
+    assert(ctx.arg.build_id.size() <= BLAKE3_OUT_LEN);
+    memcpy(buf, digest, ctx.arg.build_id.size());
     return;
+  }
   case BuildId::UUID: {
-    std::array<u8, 16> uuid = get_uuid_v4();
-    memcpy(ctx.buf + this->shdr.sh_offset + HEADER_SIZE, uuid.data(), 16);
+    get_random_bytes(buf, 16);
+
+    // Indicate that this is UUIDv4 as defined by RFC4122
+    buf[6] = (buf[6] & 0b0000'1111) | 0b0100'0000;
+    buf[8] = (buf[8] & 0b0011'1111) | 0b1000'0000;
     return;
   }
   default:
@@ -2734,314 +2721,25 @@ void NotePropertySection<E>::copy_buf(Context<E> &ctx) {
   }
 }
 
-// This page explains the format of .gdb_index:
-// https://sourceware.org/gdb/onlinedocs/gdb/Index-Section-Format.html
-template <typename E>
-void GdbIndexSection<E>::construct(Context<E> &ctx) {
-  Timer t(ctx, "GdbIndexSection::construct");
-
-  std::atomic_bool has_debug_info = false;
-
-  // Read debug sections
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    if (file->debug_info) {
-      // Read compilation units from .debug_info.
-      file->compunits = read_compunits(ctx, *file);
-
-      // Count the number of address areas contained in this file.
-      file->num_areas = estimate_address_areas(ctx, *file);
-      has_debug_info = true;
-    }
-  });
-
-  if (!has_debug_info)
-    return;
-
-  // Initialize `area_offset` and `compunits_idx`.
-  for (i64 i = 0; i < ctx.objs.size() - 1; i++) {
-    ctx.objs[i + 1]->area_offset =
-      ctx.objs[i]->area_offset + ctx.objs[i]->num_areas * 20;
-    ctx.objs[i + 1]->compunits_idx =
-      ctx.objs[i]->compunits_idx + ctx.objs[i]->compunits.size();
-  }
-
-  // Read .debug_gnu_pubnames and .debug_gnu_pubtypes.
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    file->gdb_names = read_pubnames(ctx, *file);
-  });
-
-  // Estimate the unique number of pubnames.
-  HyperLogLog estimator;
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    HyperLogLog e;
-    for (GdbIndexName &name : file->gdb_names)
-      e.insert(name.hash);
-    estimator.merge(e);
-  });
-
-  // Uniquify pubnames by inserting all name strings into a concurrent
-  // hashmap.
-  map.resize(estimator.get_cardinality() * 2);
-  tbb::enumerable_thread_specific<i64> num_names;
-
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    for (GdbIndexName &name : file->gdb_names) {
-      MapEntry *ent;
-      bool inserted;
-      std::tie(ent, inserted) = map.insert(name.name, name.hash, {file, name.hash});
-      if (inserted)
-        num_names.local()++;
-
-      ObjectFile<E> *old_val = ent->owner;
-      while (file->priority < old_val->priority &&
-             !ent->owner.compare_exchange_weak(old_val, file));
-
-      ent->num_attrs++;
-      name.entry_idx = ent - map.values;
-    }
-  });
-
-  // Assign offsets for names and attributes within each file.
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    for (GdbIndexName &name : file->gdb_names) {
-      MapEntry &ent = map.values[name.entry_idx];
-      if (ent.owner == file) {
-        ent.attr_offset = file->attrs_size;
-        file->attrs_size += (ent.num_attrs + 1) * 4;
-        ent.name_offset = file->names_size;
-        file->names_size += name.name.size() + 1;
-      }
-    }
-  });
-
-  // Compute per-file name and attributes offsets.
-  for (i64 i = 0; i < ctx.objs.size() - 1; i++)
-    ctx.objs[i + 1]->attrs_offset =
-      ctx.objs[i]->attrs_offset + ctx.objs[i]->attrs_size;
-
-  ctx.objs[0]->names_offset =
-    ctx.objs.back()->attrs_offset + ctx.objs.back()->attrs_size;
-
-  for (i64 i = 0; i < ctx.objs.size() - 1; i++)
-    ctx.objs[i + 1]->names_offset =
-      ctx.objs[i]->names_offset + ctx.objs[i]->names_size;
-
-  // .gdb_index contains an on-disk hash table for pubnames and
-  // pubtypes. We aim 75% utilization. As per the format specification,
-  // It must be a power of two.
-  i64 num_symtab_entries =
-    std::max<i64>(bit_ceil(num_names.combine(std::plus()) * 4 / 3), 16);
-
-  // Now that we can compute the size of this section.
-  ObjectFile<E> &last = *ctx.objs.back();
-  i64 compunits_size = (last.compunits_idx + last.compunits.size()) * 16;
-  i64 areas_size = last.area_offset + last.num_areas * 20;
-  i64 offset = sizeof(header);
-
-  header.cu_list_offset = offset;
-  offset += compunits_size;
-
-  header.cu_types_offset = offset;
-  header.areas_offset = offset;
-  offset += areas_size;
-
-  header.symtab_offset = offset;
-  offset += num_symtab_entries * 8;
-
-  header.const_pool_offset = offset;
-  offset += last.names_offset + last.names_size;
-
-  this->shdr.sh_size = offset;
-}
-
-template <typename E>
-void GdbIndexSection<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + this->shdr.sh_offset;
-
-  // Write section header.
-  memcpy(buf, &header, sizeof(header));
-  buf += sizeof(header);
-
-  // Write compilation unit list.
-  for (ObjectFile<E> *file : ctx.objs) {
-    if (file->debug_info) {
-      u64 offset = file->debug_info->offset;
-      for (std::string_view cu : file->compunits) {
-        *(ul64 *)buf = offset;
-        *(ul64 *)(buf + 8) = cu.size();
-        buf += 16;
-        offset += cu.size();
-      }
-    }
-  }
-
-  // Skip address areas. It'll be filled by write_address_areas.
-  buf += header.symtab_offset - header.areas_offset;
-
-  // Write an on-disk hash table for names.
-  u32 symtab_size = header.const_pool_offset - header.symtab_offset;
-  memset(buf, 0, symtab_size);
-
-  assert(has_single_bit(symtab_size / 8));
-  u32 mask = symtab_size / 8 - 1;
-
-  for (i64 i = 0; i < map.nbuckets; i++) {
-    if (map.get_key(i)) {
-      u32 hash = map.values[i].hash;
-      u32 step = (hash & mask) | 1;
-      u32 j = hash & mask;
-
-      while (*(U32<E> *)(buf + j * 8))
-        j = (j + step) & mask;
-
-      ObjectFile<E> &file = *map.values[i].owner;
-      *(ul32 *)(buf + j * 8) = file.names_offset + map.values[i].name_offset;
-      *(ul32 *)(buf + j * 8 + 4) = file.attrs_offset + map.values[i].attr_offset;
-    }
-  }
-
-  buf += symtab_size;
-
-  // Write CU vector
-  memset(buf, 0, ctx.objs[0]->names_offset);
-
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    std::atomic_uint32_t *attrs = (std::atomic_uint32_t *)buf;
-
-    for (GdbIndexName &name : file->gdb_names) {
-      MapEntry &ent = map.values[name.entry_idx];
-      u32 idx = (ent.owner.load()->attrs_offset + ent.attr_offset) / 4;
-      attrs[idx + ++attrs[idx]] = name.attr;
-    }
-  });
-
-  // Sort CU vector for build reproducibility
-  const i64 shard_size = map.nbuckets / map.NUM_SHARDS;
-
-  tbb::parallel_for((i64)0, (i64)map.NUM_SHARDS, [&](i64 i) {
-    u32 *attrs = (u32 *)buf;
-
-    for (i64 j = shard_size * i; j < shard_size * (i + 1); j++) {
-      if (map.get_key(j)) {
-        MapEntry &ent = map.values[j];
-        u32 idx = (ent.owner.load()->attrs_offset + ent.attr_offset) / 4;
-        u32 *start = attrs + idx + 1;
-        std::sort(start, start + attrs[idx]);
-      }
-    }
-  });
-
-  // .gdb_index contents are little-endian, so swap bytes if big-endian.
-  if constexpr (std::endian::native == std::endian::big)
-    for (i64 i = 0; i < ctx.objs[0]->names_offset; i += 4)
-      *(u32 *)(buf + i) = bswap(*(u32 *)(buf + i));
-
-  // Write pubnames and pubtypes.
-  tbb::parallel_for((i64)0, (i64)map.NUM_SHARDS, [&](i64 i) {
-    for (i64 j = shard_size * i; j < shard_size * (i + 1); j++) {
-      if (const char *key = map.get_key(j)) {
-        ObjectFile<E> &file = *map.values[j].owner;
-        std::string_view name{key, map.key_sizes[j]};
-        write_string(buf + file.names_offset + map.values[j].name_offset, name);
-      }
-    }
-  });
-}
-
-template <typename E>
-void GdbIndexSection<E>::write_address_areas(Context<E> &ctx) {
-  Timer t(ctx, "GdbIndexSection::write_address_areas");
-
-  if (this->shdr.sh_size == 0)
-    return;
-
-  u8 *base = ctx.buf + this->shdr.sh_offset;
-
-  for (Chunk<E> *chunk : ctx.chunks) {
-    std::string_view name = chunk->name;
-    if (name == ".debug_info")
-      ctx.debug_info = chunk;
-    if (name == ".debug_abbrev")
-      ctx.debug_abbrev = chunk;
-    if (name == ".debug_ranges")
-      ctx.debug_ranges = chunk;
-    if (name == ".debug_addr")
-      ctx.debug_addr = chunk;
-    if (name == ".debug_rnglists")
-      ctx.debug_rnglists = chunk;
-  }
-
-  assert(ctx.debug_info);
-  assert(ctx.debug_abbrev);
-
-  struct Entry {
-    ul64 start;
-    ul64 end;
-    ul32 attr;
-  };
-
-  // Read address ranges from debug sections and copy them to .gdb_index.
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    if (!file->debug_info)
-      return;
-
-    Entry *begin = (Entry *)(base + header.areas_offset + file->area_offset);
-    Entry *e = begin;
-    u64 offset = file->debug_info->offset;
-
-    for (i64 i = 0; i < file->compunits.size(); i++) {
-      std::vector<u64> addrs = read_address_areas(ctx, *file, offset);
-
-      for (i64 j = 0; j < addrs.size(); j += 2) {
-        // Skip an empty range
-        if (addrs[j] == addrs[j + 1])
-          continue;
-
-        // Gdb crashes if there are entries with address 0.
-        if (addrs[j] == 0)
-          continue;
-
-        assert(e < begin + file->num_areas);
-        e->start = addrs[j];
-        e->end = addrs[j + 1];
-        e->attr = file->compunits_idx + i;
-        e++;
-      }
-      offset += file->compunits[i].size();
-    }
-
-    // Fill trailing null entries with dummy values because gdb
-    // crashes if there are entries with address 0.
-    u64 filler;
-    if (e == begin)
-      filler = ctx.etext->get_addr(ctx) - 1;
-    else
-      filler = e[-1].start;
-
-    for (; e < begin + file->num_areas; e++) {
-      e->start = filler;
-      e->end = filler;
-      e->attr = file->compunits_idx;
-    }
-  });
-}
-
 template <typename E>
 CompressedSection<E>::CompressedSection(Context<E> &ctx, Chunk<E> &chunk) {
   assert(chunk.name.starts_with(".debug"));
   this->name = chunk.name;
+  this->is_compressed = true;
 
-  uncompressed.reset(new u8[chunk.shdr.sh_size]);
-  chunk.write_to(ctx, uncompressed.get());
+  this->uncompressed_data.resize(chunk.shdr.sh_size);
+  u8 *buf = this->uncompressed_data.data();
+
+  chunk.write_to(ctx, buf);
 
   switch (ctx.arg.compress_debug_sections) {
   case COMPRESS_ZLIB:
     chdr.ch_type = ELFCOMPRESS_ZLIB;
-    compressed.reset(new ZlibCompressor(uncompressed.get(), chunk.shdr.sh_size));
+    compressor.reset(new ZlibCompressor(buf, chunk.shdr.sh_size));
     break;
   case COMPRESS_ZSTD:
     chdr.ch_type = ELFCOMPRESS_ZSTD;
-    compressed.reset(new ZstdCompressor(uncompressed.get(), chunk.shdr.sh_size));
+    compressor.reset(new ZstdCompressor(buf, chunk.shdr.sh_size));
     break;
   default:
     unreachable();
@@ -3053,19 +2751,21 @@ CompressedSection<E>::CompressedSection(Context<E> &ctx, Chunk<E> &chunk) {
   this->shdr = chunk.shdr;
   this->shdr.sh_flags |= SHF_COMPRESSED;
   this->shdr.sh_addralign = 1;
-  this->shdr.sh_size = sizeof(chdr) + compressed->compressed_size;
+  this->shdr.sh_size = sizeof(chdr) + compressor->compressed_size;
   this->shndx = chunk.shndx;
 
   // We don't need to keep the original data unless --gdb-index is given.
-  if (!ctx.arg.gdb_index)
-    uncompressed.reset(nullptr);
+  if (!ctx.arg.gdb_index) {
+    this->uncompressed_data.clear();
+    this->uncompressed_data.shrink_to_fit();
+  }
 }
 
 template <typename E>
 void CompressedSection<E>::copy_buf(Context<E> &ctx) {
   u8 *base = ctx.buf + this->shdr.sh_offset;
   memcpy(base, &chdr, sizeof(chdr));
-  compressed->write_to(base + sizeof(chdr));
+  compressor->write_to(base + sizeof(chdr));
 }
 
 template <typename E>
@@ -3110,35 +2810,41 @@ void RelocSection<E>::update_shdr(Context<E> &ctx) {
 
 template <typename E>
 void RelocSection<E>::copy_buf(Context<E> &ctx) {
-  auto write = [&](ElfRel<E> &out, InputSection<E> &isec, const ElfRel<E> &rel) {
-    i64 symidx = 0;
-    i64 addend = 0;
-
+  auto get_symidx_addend = [&](InputSection<E> &isec, const ElfRel<E> &rel)
+      -> std::pair<i64, i64> {
     Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
 
-    if (sym.esym().st_type == STT_SECTION) {
-      if (SectionFragment<E> *frag = sym.get_frag()) {
-        symidx = frag->output_section.shndx;
-        addend = frag->offset + sym.value + get_addend(isec, rel);
-      } else {
-        InputSection<E> *target = sym.get_input_section();
-
-        if (OutputSection<E> *osec = target->output_section) {
-          symidx = osec->shndx;
-          addend = get_addend(isec, rel) + target->offset;
-        } else if (isec.name() == ".eh_frame") {
-          symidx = ctx.eh_frame->shndx;
-          addend = get_addend(isec, rel);
-        } else {
-          // This is usually a dead debug section referring a
-          // COMDAT-eliminated section.
-        }
-      }
-    } else {
-      if (sym.sym_idx)
-        symidx = sym.get_output_sym_idx(ctx);
-      addend = get_addend(isec, rel);
+    if (!(isec.shdr().sh_flags & SHF_ALLOC)) {
+      SectionFragment<E> *frag;
+      i64 frag_addend;
+      std::tie(frag, frag_addend) = isec.get_fragment(ctx, rel);
+      if (frag)
+        return {frag->output_section.shndx, frag->offset + frag_addend};
     }
+
+    if (sym.esym().st_type == STT_SECTION) {
+      if (SectionFragment<E> *frag = sym.get_frag())
+        return {frag->output_section.shndx,
+                frag->offset + sym.value + get_addend(isec, rel)};
+
+      InputSection<E> *isec2 = sym.get_input_section();
+      if (OutputSection<E> *osec = isec2->output_section)
+        return {osec->shndx, get_addend(isec, rel) + isec2->offset};
+
+      // This is usually a dead debug section referring to a
+      // COMDAT-eliminated section.
+      return {0, 0};
+    }
+
+    if (sym.write_to_symtab)
+      return {sym.get_output_sym_idx(ctx), get_addend(isec, rel)};
+    return {0, 0};
+  };
+
+  auto write = [&](ElfRel<E> &out, InputSection<E> &isec, const ElfRel<E> &rel) {
+    i64 symidx;
+    i64 addend;
+    std::tie(symidx, addend) = get_symidx_addend(isec, rel);
 
     if constexpr (is_alpha<E>)
       if (rel.r_type == R_ALPHA_GPDISP || rel.r_type == R_ALPHA_LITUSE)
@@ -3167,7 +2873,11 @@ template <typename E>
 void ComdatGroupSection<E>::update_shdr(Context<E> &ctx) {
   assert(ctx.arg.relocatable);
   this->shdr.sh_link = ctx.symtab->shndx;
-  this->shdr.sh_info = sym.get_output_sym_idx(ctx);
+
+  if (sym.esym().st_type == STT_SECTION)
+    this->shdr.sh_info = sym.get_input_section()->output_section->shndx;
+  else
+    this->shdr.sh_info = sym.get_output_sym_idx(ctx);
 }
 
 template <typename E>
@@ -3216,6 +2926,9 @@ template class GdbIndexSection<E>;
 template class CompressedSection<E>;
 template class RelocSection<E>;
 template class ComdatGroupSection<E>;
+
+template OutputSection<E> *find_section(Context<E> &, u32);
+template OutputSection<E> *find_section(Context<E> &, std::string_view);
 template i64 to_phdr_flags(Context<E> &ctx, Chunk<E> *chunk);
 template ElfSym<E> to_output_esym(Context<E> &, Symbol<E> &, u32, U32<E> *);
 

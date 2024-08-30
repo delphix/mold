@@ -24,41 +24,51 @@
 
 namespace mold {
 
-std::optional<u32> MultiGlob::find(std::string_view str) {
+std::optional<i64> MultiGlob::find(std::string_view str) {
   std::call_once(once, [&] { compile(); });
-  u32 val = UINT32_MAX;
+  i64 val = -1;
 
-  if (root) {
-    // Match against simple glob patterns
-    TrieNode *node = root.get();
-
-    auto walk = [&](u8 c) {
-      for (;;) {
-        if (node->children[c]) {
-          node = node->children[c].get();
-          val = std::min(val, node->value);
-          return;
-        }
-
-        if (!node->suffix_link)
-          return;
-        node = node->suffix_link;
-      }
-    };
-
-    walk('\0');
-    for (u8 c : str)
-      walk(c);
-    walk('\0');
-  }
+  // Match against simple glob patterns
+  if (root)
+    val = find_aho_corasick(str);
 
   // Match against complex glob patterns
-  for (std::pair<Glob, u32> &glob : globs)
+  for (std::pair<Glob, i64> &glob : globs)
     if (glob.first.match(str))
-      val = std::min(val, glob.second);
+      val = std::max(val, glob.second);
 
-  if (val == UINT32_MAX)
+  if (val == -1)
     return {};
+  return val;
+}
+
+i64 MultiGlob::find_aho_corasick(std::string_view str) {
+  TrieNode *node = root.get();
+  i64 val = -1;
+
+  auto walk = [&](u8 c) {
+    for (;;) {
+      if (node->children[c]) {
+        node = node->children[c].get();
+        val = std::max(val, node->value);
+        return;
+      }
+
+      if (!node->suffix_link)
+        return;
+      node = node->suffix_link;
+    }
+  };
+
+  walk('\0');
+
+  for (u8 c : str) {
+    if (prefix_match && node == root.get())
+      return val;
+    walk(c);
+  }
+
+  walk('\0');
   return val;
 }
 
@@ -82,7 +92,7 @@ static std::string handle_stars(std::string_view pat) {
   return "\0"s + str + "\0"s;
 }
 
-bool MultiGlob::add(std::string_view pat, u32 val) {
+bool MultiGlob::add(std::string_view pat, i64 val) {
   assert(!is_compiled);
   assert(!pat.empty());
 
@@ -108,7 +118,7 @@ bool MultiGlob::add(std::string_view pat, u32 val) {
     node = node->children[c].get();
   }
 
-  node->value = std::min(node->value, val);
+  node->value = std::max(node->value, val);
   return true;
 }
 
@@ -117,6 +127,16 @@ void MultiGlob::compile() {
   if (root) {
     fix_suffix_links(*root);
     fix_values();
+
+    // If no pattern starts with '*', set prefix_match to true.
+    // We'll use this flag for optimization.
+    prefix_match = true;
+    for (i64 i = 1; i < 256; i++) {
+      if (root->children[i]) {
+        prefix_match = false;
+        break;
+      }
+    }
   }
 }
 
@@ -157,7 +177,7 @@ void MultiGlob::fix_values() {
     for (std::unique_ptr<TrieNode> &child : node->children) {
       if (!child)
         continue;
-      child->value = std::min(child->value, child->suffix_link->value);
+      child->value = std::max(child->value, child->suffix_link->value);
       queue.push(child.get());
     }
   } while (!queue.empty());

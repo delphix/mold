@@ -5,7 +5,7 @@ export LC_ALL=C
 
 canonical_name() {
   case $1 in
-  i?86) echo i386 ;;
+  i?86) echo i686 ;;
   arm*) echo arm ;;
   powerpc) echo ppc ;;
   powerpc64) echo ppc64 ;;
@@ -14,12 +14,13 @@ canonical_name() {
   esac
 }
 
-HOST=$(canonical_name $(uname -m))
+if [ -z "$MACHINE" ]; then
+  MACHINE=$(canonical_name $(uname -m))
+fi
 
 # Set tool names
-if [ "$TRIPLE" = "" ]; then
-  MACHINE=$HOST
-  TESTDIR=out/test/elf/$HOST
+if [ -z "$TRIPLE" ]; then
+  TESTDIR=out/test/elf/$MACHINE
   CC="${TEST_CC:-cc}"
   CXX="${TEST_CXX:-c++}"
   GCC="${TEST_GCC:-gcc}"
@@ -28,8 +29,7 @@ if [ "$TRIPLE" = "" ]; then
   OBJCOPY=objcopy
   STRIP=strip
   QEMU=
-elif [ "$TRIPLE" = powerpc64le_power10-linux-gnu ]; then
-  TRIPLE=powerpc64le-linux-gnu
+elif [ "$TRIPLE" = powerpc64le-linux-gnu -a "$CPU" = power10 ]; then
   MACHINE=ppc64le
   TESTDIR=out/test/elf/ppc64le-power10
   CC="${TEST_CC:-$TRIPLE-gcc} -mcpu=power10"
@@ -50,7 +50,18 @@ else
   OBJDUMP="$TRIPLE-objdump"
   OBJCOPY="$TRIPLE-objcopy"
   STRIP="$TRIPLE-strip"
-  QEMU="qemu-$MACHINE -L /usr/$TRIPLE"
+
+  if [ $MACHINE = i686 ]; then
+    QEMU="qemu-i386 -L /usr/$TRIPLE"
+  else
+    QEMU="qemu-$MACHINE -L /usr/$TRIPLE"
+  fi
+fi
+
+if [ $MACHINE = x86_64 -o $MACHINE = i686 -o $MACHINE = arm ]; then
+  tlsdesc_opt=-mtls-dialect=gnu2
+elif [ $MACHINE = aarch64 ]; then
+  tlsdesc_opt=-mtls-dialect=desc
 fi
 
 # Common functions
@@ -58,9 +69,29 @@ test_cflags() {
   echo 'int main() {}' | $CC "$@" -o /dev/null -xc - >& /dev/null
 }
 
+test_cxxflags() {
+  echo 'int main() {}' | $CXX "$@" -o /dev/null -xc++ - >& /dev/null
+}
+
+is_musl() {
+  ldd --version 2>&1 | grep -q musl
+}
+
 supports_ifunc() {
-  echo 'void x() __attribute__((ifunc("y"))); void *y() { return 0; }' | \
+  ! is_musl && \
+    echo 'void x() __attribute__((ifunc("y"))); void *y() { return 0; }' | \
     $CC -c -o /dev/null -xc - >& /dev/null
+}
+
+supports_tlsdesc() {
+  # musl's tlsdesc on arm32 seems to be broken
+  [ $MACHINE = arm ] && is_musl && return 1
+
+  [ -n "$tlsdesc_opt" ]
+}
+
+on_qemu() {
+  [ "$QEMU" != '' ] || grep -qw qemu /proc/cpuinfo 2> /dev/null
 }
 
 skip() {

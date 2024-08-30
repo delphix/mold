@@ -1,31 +1,31 @@
 # You can customize a build by specifying CMake options. An option may be
 # given in the -Dvariable=value form. For a boolean variable, `ON` or `1`
-# means true while `OFF` or `0` means false.
+# means true, while `OFF` or `0` means false.
 #
 # Here are a couple of common cmake options:
 #
 #  -DCMAKE_C_COMPILER=<command-name>
 #
-#   Specifies a C compiler name to use. The default value is `cc`.
+#   Specifies the C compiler name to use. The default value is `cc`.
 #
 #  -DCMAKE_CXX_COMPILER=<command-name>
 #
-#   Specifies a C++ compiler name to use. The default value is `c++`.
+#   Specifies the C++ compiler name to use. The default value is `c++`.
 #
 #  -DCMAKE_INSTALL_PREFIX=<directory>
 #
-#   Specifies an install target directory. The default value is `/usr/local`.
+#   Specifies the install target directory. The default value is `/usr/local`.
 #
 #  -DCMAKE_BUILD_TYPE=[Debug | Release | RelWithDebInfo | MinSizeRel]
 #
-#   Specifies a build type. The default is `Release` which is the right
+#   Specifies the build type. The default is `Release`, which is the right
 #   option unless you are debugging mold.
 #
 # An example of a cmake command line is shown below:
 #
 #   $ cmake -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_CXX_COMPILER=g++-12 ..
 #
-# where `..` refers this directory.
+# where `..` refers to this directory.
 #
 # With cmake, you may run `cmake --install .` instead of `make install` to
 # install build artifacts to system directories. If you want to install
@@ -39,14 +39,15 @@
 # how to build mold. However, as a policy, we do not provide a way to
 # enable/disable any individual mold's feature. In other words, we do not
 # provide options like `--enable-foo` or `--disable-foo`. The motivation
-# behind it is build reproducibility. We want to guarantees that all builds
-# of the mold linker of the same version will have the exactly same set of
+# behind this is build reproducibility. We want to guarantee that all builds
+# of the mold linker of the same version will have the exact same set of
 # features and behave exactly the same.
 
-cmake_minimum_required(VERSION 3.13)
-project(mold VERSION 2.1.0)
+cmake_minimum_required(VERSION 3.14)
+project(mold VERSION 2.32.1)
 
 include(CMakeDependentOption)
+include(CheckSymbolExists)
 include(GNUInstallDirs)
 
 # Build mold itself using mold if -DMOLD_USE_MOLD=ON
@@ -57,15 +58,22 @@ endif()
 
 add_executable(mold)
 target_compile_features(mold PRIVATE cxx_std_20)
-target_link_libraries(mold PRIVATE ${CMAKE_DL_LIBS})
+
+if(MINGW)
+  target_link_libraries(mold PRIVATE dl)
+endif()
 
 if(NOT "${CMAKE_CXX_COMPILER_FRONTEND_VARIANT}" STREQUAL "MSVC")
   target_compile_options(mold PRIVATE
     -fno-exceptions
     -fno-unwind-tables
     -fno-asynchronous-unwind-tables
+    -Wall
+    -Wextra
     -Wno-sign-compare
     -Wno-unused-function
+    -Wno-unused-parameter
+    -Wno-missing-field-initializers
     -ggnu-pubnames)
 endif()
 
@@ -97,35 +105,51 @@ if(MOLD_USE_TSAN)
   target_link_options(mold PRIVATE -fsanitize=thread)
 endif()
 
-# Statically-link libstdc++ and libcrypto if -DMOLD_MOSTLY_STATIC=ON.
+# Statically-link libstdc++ if -DMOLD_MOSTLY_STATIC=ON.
 #
 # This option is intended to be used by `./dist.sh` script to create a
 # mold binary that works on various Linux distros. You probably don't
 # need nor want to set this to ON.
-option(MOLD_MOSTLY_STATIC "Statically link libstdc++ and libcrypto" OFF)
+option(MOLD_MOSTLY_STATIC "Statically link libstdc++ and some other libraries" OFF)
 if(MOLD_MOSTLY_STATIC)
   target_link_options(mold PRIVATE -static-libstdc++)
-  target_link_libraries(mold PRIVATE libcrypto.a)
 endif()
 
 # Find zlib. If libz.so is not found, we compile a bundled one and
 # statically-link it to mold.
 find_package(ZLIB QUIET)
-if(ZLIB_FOUND)
+if(ZLIB_FOUND AND NOT MOLD_MOSTLY_STATIC)
   target_link_libraries(mold PRIVATE ZLIB::ZLIB)
 else()
+  set(ZLIB_BUILD_EXAMPLES OFF CACHE INTERNAL "")
   add_subdirectory(third-party/zlib EXCLUDE_FROM_ALL)
   target_include_directories(zlibstatic INTERFACE third-party/zlib
     $<TARGET_PROPERTY:zlibstatic,BINARY_DIR>)
   target_link_libraries(mold PRIVATE zlibstatic)
 endif()
 
-# Find zstd compression library. Just like zlib, if libzstd.so is not
-# found, we compile a bundled one and statically-link it to mold.
+# Find BLAKE3 cryptographic hash library. Just like zlib, if libblkae3.so
+# is not found, we compile a bundled one and statically-link it to mold.
+find_package(BLAKE3 QUIET)
+if(BLAKE3_FOUND AND NOT MOLD_MOSTLY_STATIC)
+  target_link_libraries(mold PRIVATE BLAKE3::blake3)
+else()
+  function(mold_add_blake3)
+    set(BUILD_SHARED_LIBS OFF)
+    add_subdirectory(third-party/blake3/c EXCLUDE_FROM_ALL)
+    target_link_libraries(mold PRIVATE blake3)
+    target_include_directories(mold PUBLIC third-party/blake3/c)
+  endfunction()
+
+  mold_add_blake3()
+endif()
+
+# Find zstd compression library. If zstd.h is not found, we compile a
+# bundled one and statically-link it to mold.
 include(CheckIncludeFile)
 check_include_file(zstd.h HAVE_ZSTD_H)
 
-if(HAVE_ZSTD_H)
+if(HAVE_ZSTD_H AND NOT MOLD_MOSTLY_STATIC)
   target_link_libraries(mold PRIVATE zstd)
 else()
   add_subdirectory(third-party/zstd/build/cmake EXCLUDE_FROM_ALL)
@@ -146,12 +170,10 @@ endif()
 #
 # We enable mimalloc by default for 64-bit targets. It doesn't seem to
 # be stable on 32-bit targets.
-include(CheckCXXSourceCompiles)
-check_cxx_source_compiles(
-  "static_assert(sizeof(void *) == 4); int main() {}" P32)
+cmake_dependent_option(
+  MOLD_USE_MIMALLOC "Use mimalloc" ON
+  "CMAKE_SIZEOF_VOID_P EQUAL 8; NOT APPLE; NOT ANDROID; NOT OPENBSD" OFF)
 
-cmake_dependent_option(MOLD_USE_MIMALLOC "Use mimalloc" ON
-  "NOT APPLE; NOT ANDROID; NOT OPENBSD; NOT P32" OFF)
 cmake_dependent_option(
   MOLD_USE_SYSTEM_MIMALLOC "Use system or vendored mimalloc" OFF
   MOLD_USE_MIMALLOC OFF)
@@ -200,11 +222,6 @@ else()
   mold_add_tbb()
 endif()
 
-# Check if this is a commercial version of mold (a.k.a. "sold")
-if(EXISTS "${CMAKE_SOURCE_DIR}/LICENSE.md")
-  set(MOLD_IS_SOLD ON)
-endif()
-
 # We always use Clang to build mold on Windows. MSVC can't compile mold.
 if(WIN32)
   if(MSVC AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
@@ -236,11 +253,6 @@ if(NOT APPLE AND NOT WIN32)
   target_sources(mold-wrapper PRIVATE elf/mold-wrapper.c)
 endif()
 
-if(NOT APPLE AND NOT WIN32 AND NOT MOLD_MOSTLY_STATIC)
-  find_package(OpenSSL REQUIRED COMPONENTS Crypto)
-  target_link_libraries(mold PRIVATE OpenSSL::Crypto)
-endif()
-
 # If atomics doesn't work by default, add -latomic.
 # We need the flag on riscv, armv6 and m68k.
 include(CheckCXXSourceCompiles)
@@ -262,6 +274,14 @@ if(NOT APPLE AND NOT MSVC)
   target_compile_options(mold PRIVATE -pthread)
   target_link_options(mold PRIVATE -pthread)
 endif()
+
+# shm_open needs -lrt
+find_library(LIBRT rt)
+if(LIBRT)
+  target_link_libraries(mold PRIVATE rt)
+endif()
+
+check_symbol_exists(madvise sys/mman.h HAVE_MADVISE)
 
 # Create a .cc file containing the current git hash for `mold --version`.
 add_custom_target(git_hash
@@ -289,20 +309,18 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR})
 # on a multicore machine.
 list(APPEND MOLD_ELF_TARGETS
   X86_64 I386 ARM64 ARM32 RV32LE RV32BE RV64LE RV64BE PPC32 PPC64V1 PPC64V2
-  S390X SPARC64 M68K SH4 ALPHA MIPS64LE MIPS64BE LOONGARCH32 LOONGARCH64)
+  S390X SPARC64 M68K SH4 ALPHA LOONGARCH32 LOONGARCH64)
 
 list(APPEND MOLD_ELF_TEMPLATE_FILES
   elf/arch-loongarch.cc
   elf/arch-riscv.cc
   elf/cmdline.cc
-  elf/dwarf.cc
   elf/gc-sections.cc
+  elf/gdb-index.cc
   elf/icf.cc
   elf/input-files.cc
   elf/input-sections.cc
-  elf/jobs.cc
   elf/linker-script.cc
-  elf/lto.cc
   elf/main.cc
   elf/mapfile.cc
   elf/output-chunks.cc
@@ -313,26 +331,20 @@ list(APPEND MOLD_ELF_TEMPLATE_FILES
   elf/tls.cc
   )
 
-list(APPEND MOLD_MACHO_TARGETS X86_64 ARM64)
-
-list(APPEND MOLD_MACHO_TEMPLATE_FILES
-  macho/cmdline.cc
-  macho/dead-strip.cc
-  macho/input-files.cc
-  macho/input-sections.cc
-  macho/lto.cc
-  macho/main.cc
-  macho/mapfile.cc
-  macho/output-chunks.cc
-  macho/tapi.cc
-  )
+if(WIN32 AND NOT MINGW)
+  list(APPEND MOLD_ELF_TEMPLATE_FILES elf/lto-win32.cc)
+else()
+  list(APPEND MOLD_ELF_TEMPLATE_FILES elf/lto-unix.cc)
+endif()
 
 function(mold_instantiate_templates SOURCE TARGET)
   set(PATH ${CMAKE_BINARY_DIR}/${SOURCE}.${TARGET}.cc)
-  file(WRITE ${PATH} "#define MOLD_${TARGET} 1
+  if(NOT EXISTS ${PATH})
+    file(WRITE ${PATH} "#define MOLD_${TARGET} 1
 #define MOLD_TARGET ${TARGET}
 #include \"${CMAKE_SOURCE_DIR}/${SOURCE}\"
 ")
+  endif()
   target_sources(mold PRIVATE ${PATH})
 endfunction()
 
@@ -342,14 +354,6 @@ foreach (SOURCE IN LISTS MOLD_ELF_TEMPLATE_FILES)
   endforeach()
 endforeach()
 
-if(MOLD_IS_SOLD)
-  foreach (SOURCE IN LISTS MOLD_MACHO_TEMPLATE_FILES)
-    foreach(TARGET IN LISTS MOLD_MACHO_TARGETS)
-      mold_instantiate_templates(${SOURCE} ${TARGET})
-    endforeach()
-  endforeach()
-endif()
-
 # Add other non-template source files.
 target_sources(mold PRIVATE
   common/compress.cc
@@ -357,17 +361,16 @@ target_sources(mold PRIVATE
   common/filepath.cc
   common/glob.cc
   common/hyperloglog.cc
-  common/main.cc
+  common/malloc.cc
   common/multi-glob.cc
   common/perf.cc
+  common/random.cc
   common/tar.cc
-  common/uuid.cc
   elf/arch-alpha.cc
   elf/arch-arm32.cc
   elf/arch-arm64.cc
   elf/arch-i386.cc
   elf/arch-m68k.cc
-  elf/arch-mips64.cc
   elf/arch-ppc32.cc
   elf/arch-ppc64v1.cc
   elf/arch-ppc64v2.cc
@@ -375,40 +378,40 @@ target_sources(mold PRIVATE
   elf/arch-sh4.cc
   elf/arch-sparc64.cc
   elf/arch-x86-64.cc
+  elf/config.cc
   elf/elf.cc
   git-hash.cc
   third-party/rust-demangle/rust-demangle.c
   )
 
-if(MOLD_IS_SOLD)
+if(WIN32)
   target_sources(mold PRIVATE
-    macho/arch-arm64.cc
-    macho/arch-x86-64.cc
-    macho/yaml.cc
+    common/jobs-win32.cc
+    common/mapped-file-win32.cc
+    common/signal-win32.cc
+    )
+else()
+  target_sources(mold PRIVATE
+    common/jobs-unix.cc
+    common/mapped-file-unix.cc
+    common/signal-unix.cc
     )
 endif()
 
 # Add frequently included header files for pre-compiling.
 # target_precompile_headers is supported by CMake 3.16.0 or newer.
 if(${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.16.0")
-  if(MOLD_IS_SOLD)
-    target_precompile_headers(mold PRIVATE
-      "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_SOURCE_DIR}/elf/mold.h>"
-      "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_SOURCE_DIR}/macho/mold.h>")
-  else()
-    target_precompile_headers(mold PRIVATE
-      "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_SOURCE_DIR}/elf/mold.h>")
-  endif()
-
   # ccache needs this flag along with `sloppiness = pch_defines,time_macros`
   # to enable caching
-  target_compile_options(mold PRIVATE -fpch-preprocess)
+  if(NOT MSVC)
+    target_compile_options(mold PRIVATE -fpch-preprocess)
+  endif()
 endif()
 
 include(CTest)
 
 if(BUILD_TESTING)
-  # Create the ld and ld64 symlinks required for testing
+  # Create the ld symlinks required for testing
   if(NOT WIN32)
     add_custom_command(
       TARGET mold POST_BUILD
@@ -416,22 +419,9 @@ if(BUILD_TESTING)
       BYPRODUCTS ld
       WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
       VERBATIM)
-
-    if(MOLD_IS_SOLD)
-      add_custom_command(
-        TARGET mold POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E create_symlink mold ld64
-        BYPRODUCTS ld64
-        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-        VERBATIM)
-    endif()
   endif()
 
-  if(${APPLE})
-    if(MOLD_IS_SOLD)
-      add_subdirectory(test/macho)
-    endif()
-  elseif(${UNIX})
+  if(${UNIX})
     add_subdirectory(test/elf)
   endif()
 endif()
@@ -439,13 +429,8 @@ endif()
 if(NOT CMAKE_SKIP_INSTALL_RULES)
   install(TARGETS mold RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
   install(FILES docs/mold.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1/)
-
-  if(EXISTS "${CMAKE_SOURCE_DIR}/LICENSE")
-    install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
-  endif()
-  if(EXISTS "${CMAKE_SOURCE_DIR}/LICENSE.third-party")
-    install(FILES "LICENSE.third-party" DESTINATION "${CMAKE_INSTALL_DOCDIR}")
-  endif()
+  install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
+  install(FILES "LICENSE.third-party" DESTINATION "${CMAKE_INSTALL_DOCDIR}")
 
   function(mold_install_relative_symlink OLD NEW)
     install(CODE "
@@ -465,13 +450,4 @@ if(NOT CMAKE_SKIP_INSTALL_RULES)
     ${CMAKE_INSTALL_BINDIR}/ld.mold${CMAKE_EXECUTABLE_SUFFIX})
   mold_install_relative_symlink(${CMAKE_INSTALL_MANDIR}/man1/mold.1
     ${CMAKE_INSTALL_MANDIR}/man1/ld.mold.1)
-
-  if(MOLD_IS_SOLD)
-    mold_install_relative_symlink(${CMAKE_INSTALL_BINDIR}/mold
-      ${CMAKE_INSTALL_BINDIR}/ld64.mold)
-    mold_install_relative_symlink(${CMAKE_INSTALL_BINDIR}/mold
-      ${CMAKE_INSTALL_BINDIR}/ld.sold)
-    mold_install_relative_symlink(${CMAKE_INSTALL_BINDIR}/mold
-      ${CMAKE_INSTALL_BINDIR}/ld64.sold)
-  endif()
 endif()

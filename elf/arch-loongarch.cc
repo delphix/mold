@@ -47,42 +47,56 @@ static u64 hi20(u64 val, u64 pc) {
   //
   // This is similar but different from RISC-V because RISC-V's AUIPC
   // doesn't zero-clear [11:0].
-  return page(val + 0x800) - page(pc);
+  return bits(page(val + 0x800) - page(pc), 31, 12);
 }
 
 static u64 hi64(u64 val, u64 pc) {
   // A PC-relative 64-bit address is materialized with the following
   // instructions for the large code model:
   //
-  //   pcalau12i $rX, %pc_hi20(sym)
-  //   addi.d    $rY, $zero, %lo12(sym)
-  //   lu32i.d   $rY, %pc64_lo20(sym)
-  //   lu52i.d   $rY, $r12, %pc64_hi12(sym)
-  //   add.d     $rX, $rX, $rY
+  //   pcalau12i $rN, %pc_hi20(sym)
+  //   addi.d    $rM, $zero, %lo12(sym)
+  //   lu32i.d   $rM, %pc64_lo20(sym)
+  //   lu52i.d   $rM, $r12, %pc64_hi12(sym)
+  //   add.d     $rN, $rN, $rM
   //
   // PCALAU12I computes (pc + imm << 12) to materialize a 64-bit value.
   // ADDI.D adds a sign-extended 12 bit value to a register. LU32I.D and
   // LU52I.D simply set bits to [51:31] and to [63:53], respectively.
   //
   // Compensating all the sign-extensions is a bit complicated.
-  u64 x = hi20(val, pc);
-  if ((val & 0x800) && !(x & 0x8000'0000))
-    return x - 0x1'0000'0000;
-  if (!(val & 0x800) && (x & 0x8000'0000))
-    return x + 0x1'0000'0000;
+  u64 x = page(val) - page(pc);
+  if (val & 0x800)
+    x += 0x1000 - 0x1'0000'0000;
+  if (x & 0x8000'0000)
+    x += 0x1'0000'0000;
   return x;
 }
 
-static void write_j20(u8 *loc, u32 val) {
-  // opcode, [19:0], rd
-  *(ul32 *)loc &= 0b1111111'00000000000000000000'11111;
-  *(ul32 *)loc |= bits(val, 19, 0) << 5;
+static u64 higher20(u64 val, u64 pc) {
+  return bits(hi64(val, pc), 51, 32);
+}
+
+static u64 highest12(u64 val, u64 pc) {
+  return bits(hi64(val, pc), 63, 52);
 }
 
 static void write_k12(u8 *loc, u32 val) {
   // opcode, [11:0], rj, rd
   *(ul32 *)loc &= 0b1111111111'000000000000'11111'11111;
   *(ul32 *)loc |= bits(val, 11, 0) << 10;
+}
+
+static void write_k16(u8 *loc, u32 val) {
+  // opcode, [15:0], rj, rd
+  *(ul32 *)loc &= 0b111111'0000000000000000'11111'11111;
+  *(ul32 *)loc |= bits(val, 15, 0) << 10;
+}
+
+static void write_j20(u8 *loc, u32 val) {
+  // opcode, [19:0], rd
+  *(ul32 *)loc &= 0b1111111'00000000000000000000'11111;
+  *(ul32 *)loc |= bits(val, 19, 0) << 5;
 }
 
 static void write_d5k16(u8 *loc, u32 val) {
@@ -97,12 +111,6 @@ static void write_d10k16(u8 *loc, u32 val) {
   *(ul32 *)loc &= 0b111111'0000000000000000'0000000000;
   *(ul32 *)loc |= bits(val, 15, 0) << 10;
   *(ul32 *)loc |= bits(val, 25, 16);
-}
-
-static void write_k16(u8 *loc, u32 val) {
-  // opcode, [15:0], rj, rd
-  *(ul32 *)loc &= 0b111111'0000000000000000'11111'11111;
-  *(ul32 *)loc |= bits(val, 15, 0) << 10;
 }
 
 template <>
@@ -133,7 +141,7 @@ void write_plt_header<E>(Context<E> &ctx, u8 *buf) {
   u64 plt = ctx.plt->shdr.sh_addr;
 
   memcpy(buf, E::is_64 ? insn_64 : insn_32, E::plt_hdr_size);
-  write_j20(buf, hi20(gotplt, plt) >> 12);
+  write_j20(buf, hi20(gotplt, plt));
   write_k12(buf + 8, gotplt);
   write_k12(buf + 16, gotplt);
 }
@@ -158,17 +166,17 @@ void write_plt_entry<E>(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
   u64 plt = sym.get_plt_addr(ctx);
 
   memcpy(buf, E::is_64 ? plt_entry_64 : plt_entry_32, E::plt_size);
-  write_j20(buf, hi20(gotplt, plt) >> 12);
+  write_j20(buf, hi20(gotplt, plt));
   write_k12(buf + 4, gotplt);
 }
 
 template <>
 void write_pltgot_entry<E>(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
-  u64 got = sym.get_got_addr(ctx);
+  u64 got = sym.get_got_pltgot_addr(ctx);
   u64 plt = sym.get_plt_addr(ctx);
 
   memcpy(buf, E::is_64 ? plt_entry_64 : plt_entry_32, E::plt_size);
-  write_j20(buf, hi20(got, plt) >> 12);
+  write_j20(buf, hi20(got, plt));
   write_k12(buf + 4, got);
 }
 
@@ -264,7 +272,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     // as if they were TLSGD relocs for LoongArch, which is a clear bug.
     // We need to handle TLSLD relocs as synonyms for TLSGD relocs for the
     // sake of bug compatibility.
-    auto get_tls_idx = [&] {
+    auto get_got_idx = [&] {
       if (sym.has_tlsgd(ctx))
         return sym.get_tlsgd_idx(ctx);
       return sym.get_got_idx(ctx);
@@ -273,7 +281,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     u64 S = sym.get_addr(ctx);
     u64 A = rel.r_addend;
     u64 P = get_addr() + rel.r_offset;
-    u64 G = get_tls_idx() * sizeof(Word<E>);
+    u64 G = get_got_idx() * sizeof(Word<E>);
     u64 GOT = ctx.got->shdr.sh_addr;
 
     switch (rel.r_type) {
@@ -302,11 +310,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       write_d10k16(loc, val >> 2);
       break;
     }
-    case R_LARCH_ABS_HI20:
-      write_j20(loc, (S + A) >> 12);
-      break;
     case R_LARCH_ABS_LO12:
       write_k12(loc, S + A);
+      break;
+    case R_LARCH_ABS_HI20:
+      write_j20(loc, (S + A) >> 12);
       break;
     case R_LARCH_ABS64_LO20:
       write_j20(loc, (S + A) >> 32);
@@ -314,41 +322,42 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_LARCH_ABS64_HI12:
       write_k12(loc, (S + A) >> 52);
       break;
-    case R_LARCH_PCALA_HI20: {
-      i64 val = hi20(S + A, P);
-      check(val, -(1LL << 31), 1LL << 31);
-      write_j20(loc, val >> 12);
-      break;
-    }
     case R_LARCH_PCALA_LO12:
-      write_k12(loc, S + A);
+      // It looks like R_LARCH_PCALA_LO12 is sometimes used for JIRL even
+      // though the instruction takes a 16 bit immediate rather than 12 bits.
+      // It is contrary to the psABI document, but GNU ld has special
+      // code to handle it, so we accept it too.
+      if ((*(ul32 *)loc & 0xfc00'0000) == 0x4c00'0000)
+        write_k16(loc, sign_extend(S + A, 11) >> 2);
+      else
+        write_k12(loc, S + A);
+      break;
+    case R_LARCH_PCALA_HI20:
+      write_j20(loc, hi20(S + A, P));
       break;
     case R_LARCH_PCALA64_LO20:
-      write_j20(loc, hi64(S + A, P) >> 32);
+      write_j20(loc, higher20(S + A, P));
       break;
     case R_LARCH_PCALA64_HI12:
-      write_k12(loc, hi64(S + A, P) >> 52);
+      write_k12(loc, highest12(S + A, P));
       break;
-    case R_LARCH_GOT_PC_HI20: {
-      i64 val = hi20(GOT + G + A, P);
-      check(val, -(1LL << 31), 1LL << 31);
-      write_j20(loc, val >> 12);
-      break;
-    }
     case R_LARCH_GOT_PC_LO12:
       write_k12(loc, GOT + G + A);
       break;
+    case R_LARCH_GOT_PC_HI20:
+      write_j20(loc, hi20(GOT + G + A, P));
+      break;
     case R_LARCH_GOT64_PC_LO20:
-      write_j20(loc, hi64(GOT + G + A, P) >> 32);
+      write_j20(loc, higher20(GOT + G + A, P));
       break;
     case R_LARCH_GOT64_PC_HI12:
-      write_k12(loc, hi64(GOT + G + A, P) >> 52);
-      break;
-    case R_LARCH_GOT_HI20:
-      write_j20(loc, (GOT + G + A) >> 12);
+      write_k12(loc, highest12(GOT + G + A, P));
       break;
     case R_LARCH_GOT_LO12:
       write_k12(loc, GOT + G + A);
+      break;
+    case R_LARCH_GOT_HI20:
+      write_j20(loc, (GOT + G + A) >> 12);
       break;
     case R_LARCH_GOT64_LO20:
       write_j20(loc, (GOT + G + A) >> 32);
@@ -356,11 +365,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_LARCH_GOT64_HI12:
       write_k12(loc, (GOT + G + A) >> 52);
       break;
-    case R_LARCH_TLS_LE_HI20:
-      write_j20(loc, (S + A - ctx.tp_addr) >> 12);
-      break;
     case R_LARCH_TLS_LE_LO12:
       write_k12(loc, S + A - ctx.tp_addr);
+      break;
+    case R_LARCH_TLS_LE_HI20:
+      write_j20(loc, (S + A - ctx.tp_addr) >> 12);
       break;
     case R_LARCH_TLS_LE64_LO20:
       write_j20(loc, (S + A - ctx.tp_addr) >> 32);
@@ -368,26 +377,23 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_LARCH_TLS_LE64_HI12:
       write_k12(loc, (S + A - ctx.tp_addr) >> 52);
       break;
-    case R_LARCH_TLS_IE_PC_HI20: {
-      i64 val = hi20(sym.get_gottp_addr(ctx) + A, P);
-      check(val, -(1LL << 31), 1LL << 31);
-      write_j20(loc, val >> 12);
-      break;
-    }
     case R_LARCH_TLS_IE_PC_LO12:
       write_k12(loc, sym.get_gottp_addr(ctx) + A);
       break;
+    case R_LARCH_TLS_IE_PC_HI20:
+      write_j20(loc, hi20(sym.get_gottp_addr(ctx) + A, P));
+      break;
     case R_LARCH_TLS_IE64_PC_LO20:
-      write_j20(loc, hi64(sym.get_gottp_addr(ctx) + A, P) >> 32);
+      write_j20(loc, higher20(sym.get_gottp_addr(ctx) + A, P));
       break;
     case R_LARCH_TLS_IE64_PC_HI12:
-      write_k12(loc, hi64(sym.get_gottp_addr(ctx) + A, P) >> 52);
-      break;
-    case R_LARCH_TLS_IE_HI20:
-      write_j20(loc, (sym.get_gottp_addr(ctx) + A) >> 12);
+      write_k12(loc, highest12(sym.get_gottp_addr(ctx) + A, P));
       break;
     case R_LARCH_TLS_IE_LO12:
       write_k12(loc, sym.get_gottp_addr(ctx) + A);
+      break;
+    case R_LARCH_TLS_IE_HI20:
+      write_j20(loc, (sym.get_gottp_addr(ctx) + A) >> 12);
       break;
     case R_LARCH_TLS_IE64_LO20:
       write_j20(loc, (sym.get_gottp_addr(ctx) + A) >> 32);
@@ -396,12 +402,10 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       write_k12(loc, (sym.get_gottp_addr(ctx) + A) >> 52);
       break;
     case R_LARCH_TLS_LD_PC_HI20:
-    case R_LARCH_TLS_GD_PC_HI20: {
-      i64 val = hi20(sym.get_tlsgd_addr(ctx) + A, P);
-      check(val, -(1LL << 31), 1LL << 31);
-      write_j20(loc, val >> 12);
+    case R_LARCH_TLS_GD_PC_HI20:
+      check(sym.get_tlsgd_addr(ctx) + A - P, -(1LL << 31), 1LL << 31);
+      write_j20(loc, hi20(sym.get_tlsgd_addr(ctx) + A, P));
       break;
-    }
     case R_LARCH_TLS_LD_HI20:
     case R_LARCH_TLS_GD_HI20:
       write_j20(loc, (sym.get_tlsgd_addr(ctx) + A) >> 12);
@@ -565,11 +569,6 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
 
-    if (!sym.file) {
-      record_undef_error(ctx, rel);
-      continue;
-    }
-
     if (sym.is_ifunc())
       sym.flags |= NEEDS_GOT | NEEDS_PLT;
 
@@ -585,6 +584,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       scan_dyn_absrel(ctx, sym, rel);
       break;
     case R_LARCH_B26:
+    case R_LARCH_PCALA_HI20:
       if (sym.is_imported)
         sym.flags |= NEEDS_PLT;
       break;
@@ -618,7 +618,6 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_LARCH_ABS_LO12:
     case R_LARCH_ABS64_LO20:
     case R_LARCH_ABS64_HI12:
-    case R_LARCH_PCALA_HI20:
     case R_LARCH_PCALA_LO12:
     case R_LARCH_PCALA64_LO20:
     case R_LARCH_PCALA64_HI12:
@@ -654,26 +653,26 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 }
 
 template <>
-void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
-
+void Thunk<E>::copy_buf(Context<E> &ctx) {
   static const ul32 insn[] = {
-    0x1a00'000c, // pcalau12i $t0, 0
-    0x02c0'018c, // addi.d    $t0, $t0, 0
+    0x1e00'000c, // pcaddu18i $t0, 0
     0x4c00'0180, // jirl      $zero, $t0, 0
-    0x0340'0000, // nop
   };
 
   static_assert(E::thunk_size == sizeof(insn));
 
-  for (i64 i = 0; i < symbols.size(); i++) {
-    u64 S = symbols[i]->get_addr(ctx);
-    u64 P = output_section.shdr.sh_addr + offset + i * E::thunk_size;
+  u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
+  u64 P = output_section.shdr.sh_addr + offset;
 
-    u8 *loc = buf + i * E::thunk_size;
-    memcpy(loc, insn, sizeof(insn));
-    write_j20(loc, hi20(S, P) >> 12);
-    write_k12(loc + 4, S);
+  for (Symbol<E> *sym : symbols) {
+    u64 S = sym->get_addr(ctx);
+
+    memcpy(buf, insn, sizeof(insn));
+    write_j20(buf, (S - P + 0x20000) >> 18);
+    write_k16(buf + 4, (S - P) >> 2);
+
+    buf += sizeof(insn);
+    P += sizeof(insn);
   }
 }
 

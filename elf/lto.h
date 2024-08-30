@@ -55,9 +55,7 @@ enum PluginApiVersion {
 
 struct PluginTagValue {
   PluginTagValue(PluginTag tag, int val) : tag(tag), val(val) {}
-
-  template <typename T>
-  PluginTagValue(PluginTag tag, T *ptr) : tag(tag), ptr((void *)ptr) {}
+  PluginTagValue(PluginTag tag, auto *ptr) : tag(tag), ptr((void *)ptr) {}
 
   PluginTag tag;
   union {
@@ -75,7 +73,11 @@ enum PluginOutputFileType {
 
 struct PluginInputFile {
   const char *name;
-  i32 fd;
+#if __MINGW32__
+  HANDLE fd;
+#else
+  int fd;
+#endif
   u64 offset;
   u64 filesize;
   void *handle;

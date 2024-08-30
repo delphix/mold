@@ -72,22 +72,22 @@ void write_plt_header(Context<E> &ctx, u8 *buf) {
     0x7d88'02a6, // mflr    r12
     0x429f'0005, // bcl     20, 31, 4 // obtain PC
     0x7d68'02a6, // mflr    r11
-    0xe84b'0024, // ld      r2,36(r11)
     0x7d88'03a6, // mtlr    r12
-    0x7d62'5a14, // add     r11,r2,r11
+    0x3d6b'0000, // addis   r11, r11, GOTPLT_OFFSET@ha
+    0x396b'0000, // addi    r11, r11, GOTPLT_OFFSET@lo
     0xe98b'0000, // ld      r12,0(r11)
     0xe84b'0008, // ld      r2,8(r11)
     0x7d89'03a6, // mtctr   r12
     0xe96b'0010, // ld      r11,16(r11)
     0x4e80'0420, // bctr
-    // .quad .got.plt - .plt - 8
-    0x0000'0000,
-    0x0000'0000,
   };
 
   static_assert(sizeof(insn) == E::plt_hdr_size);
   memcpy(buf, insn, sizeof(insn));
-  *(ub64 *)(buf + 44) = ctx.gotplt->shdr.sh_addr - ctx.plt->shdr.sh_addr - 8;
+
+  i64 val = ctx.gotplt->shdr.sh_addr - ctx.plt->shdr.sh_addr - 8;
+  *(ub32 *)(buf + 16) |= higha(val);
+  *(ub32 *)(buf + 20) |= lo(val);
 }
 
 template <>
@@ -262,11 +262,17 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_PPC64_DTPREL16_LO:
       *(ub16 *)loc = lo(S + A - ctx.dtp_addr);
       break;
+    case R_PPC64_DTPREL16_LO_DS:
+      *(ub16 *)loc |= (S + A - ctx.dtp_addr) & 0xfffc;
+      break;
     case R_PPC64_TPREL16_HA:
       *(ub16 *)loc = ha(S + A - ctx.tp_addr);
       break;
     case R_PPC64_TPREL16_LO:
       *(ub16 *)loc = lo(S + A - ctx.tp_addr);
+      break;
+    case R_PPC64_TPREL16_LO_DS:
+      *(ub16 *)loc |= (S + A - ctx.tp_addr) & 0xfffc;
       break;
     case R_PPC64_GOT_TPREL16_LO_DS:
       *(ub16 *)loc |= (sym.get_gottp_addr(ctx) - TOC) & 0xfffc;
@@ -378,6 +384,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       break;
     case R_PPC64_TPREL16_HA:
     case R_PPC64_TPREL16_LO:
+    case R_PPC64_TPREL16_LO_DS:
       check_tlsle(ctx, sym, rel);
       break;
     case R_PPC64_REL32:
@@ -401,6 +408,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_PPC64_TLSLD:
     case R_PPC64_DTPREL16_HA:
     case R_PPC64_DTPREL16_LO:
+    case R_PPC64_DTPREL16_LO_DS:
       break;
     default:
       Error(ctx) << *this << ": unknown relocation: " << rel;
@@ -409,9 +417,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 }
 
 template <>
-void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
-
+void Thunk<E>::copy_buf(Context<E> &ctx) {
   // If the destination is .plt.got, we save the current r2, read an
   // address of a function descriptor from .got, restore %r2 and jump
   // to the function.
@@ -466,26 +472,27 @@ void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
   static_assert(E::thunk_size == sizeof(plt_thunk));
   static_assert(E::thunk_size == sizeof(local_thunk));
 
-  for (i64 i = 0; i < symbols.size(); i++) {
-    Symbol<E> &sym = *symbols[i];
-    ub32 *loc = (ub32 *)(buf + i * E::thunk_size);
+  u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
 
-    if (sym.has_got(ctx)) {
-      memcpy(loc, pltgot_thunk, sizeof(pltgot_thunk));
-      i64 val = sym.get_got_addr(ctx) - ctx.extra.TOC->value;
-      loc[1] |= higha(val);
-      loc[2] |= lo(val);
-    } else if(sym.has_plt(ctx)) {
-      memcpy(loc, plt_thunk, sizeof(plt_thunk));
-      i64 val = sym.get_gotplt_addr(ctx) - ctx.extra.TOC->value;
-      loc[1] |= higha(val);
-      loc[2] |= lo(val);
+  for (Symbol<E> *sym : symbols) {
+    if (sym->has_got(ctx)) {
+      i64 val = sym->get_got_addr(ctx) - ctx.extra.TOC->value;
+      memcpy(buf, pltgot_thunk, sizeof(pltgot_thunk));
+      *(ub32 *)(buf + 4) |= higha(val);
+      *(ub32 *)(buf + 8) |= lo(val);
+    } else if(sym->has_plt(ctx)) {
+      i64 val = sym->get_gotplt_addr(ctx) - ctx.extra.TOC->value;
+      memcpy(buf, plt_thunk, sizeof(plt_thunk));
+      *(ub32 *)(buf + 4) |= higha(val);
+      *(ub32 *)(buf + 8) |= lo(val);
     } else {
-      memcpy(loc, local_thunk, sizeof(local_thunk));
-      i64 val = sym.get_addr(ctx, NO_OPD) - ctx.extra.TOC->value;
-      loc[0] |= higha(val);
-      loc[1] |= lo(val);
+      i64 val = sym->get_addr(ctx, NO_OPD) - ctx.extra.TOC->value;
+      memcpy(buf, local_thunk, sizeof(local_thunk));
+      *(ub32 *)buf |= higha(val);
+      *(ub32 *)(buf + 4) |= lo(val);
     }
+
+    buf += E::thunk_size;
   }
 }
 
@@ -520,7 +527,7 @@ struct OpdSymbol {
 };
 
 static Symbol<E> *
-get_opd_sym_at(Context<E> &ctx, std::span<OpdSymbol> syms, u64 offset) {
+get_opd_sym_at(std::span<OpdSymbol> syms, u64 offset) {
   auto it = std::lower_bound(syms.begin(), syms.end(), OpdSymbol{offset});
   if (it == syms.end())
     return nullptr;
@@ -615,7 +622,7 @@ void ppc64v1_rewrite_opd(Context<E> &ctx) {
         if (sym.get_input_section() != opd)
           continue;
 
-        Symbol<E> *real_sym = get_opd_sym_at(ctx, opd_syms, r.r_addend);
+        Symbol<E> *real_sym = get_opd_sym_at(opd_syms, r.r_addend);
         if (!real_sym)
           Fatal(ctx) << *isec << ": cannot find a symbol in .opd for " << r
                      << " at offset 0x" << std::hex << (u64)r.r_addend;
@@ -639,15 +646,14 @@ void ppc64v1_scan_symbols(Context<E> &ctx) {
   });
 
   // Functions referenced by the ELF header also have to have .opd entries.
-  auto mark = [&](std::string_view name) {
-    if (!name.empty())
-      if (Symbol<E> &sym = *get_symbol(ctx, name); !sym.is_imported)
-        sym.flags |= NEEDS_PPC_OPD;
-  };
+  if (!ctx.arg.entry->is_imported)
+    ctx.arg.entry->flags |= NEEDS_PPC_OPD;
 
-  mark(ctx.arg.entry);
-  mark(ctx.arg.init);
-  mark(ctx.arg.fini);
+  if (!ctx.arg.init->is_imported)
+    ctx.arg.init->flags |= NEEDS_PPC_OPD;
+
+  if (!ctx.arg.fini->is_imported)
+    ctx.arg.fini->flags |= NEEDS_PPC_OPD;
 }
 
 void PPC64OpdSection::add_symbol(Context<E> &ctx, Symbol<E> *sym) {

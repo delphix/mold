@@ -7,28 +7,9 @@
 namespace mold::elf {
 
 typedef enum {
-  NONE, ERROR, COPYREL, DYN_COPYREL, PLT, CPLT, DYN_CPLT, DYNREL, BASEREL, IFUNC,
+  NONE, ERROR, COPYREL, DYN_COPYREL, PLT, CPLT, DYN_CPLT, DYNREL,
+  BASEREL, IFUNC_DYNREL,
 } Action;
-
-template <typename E>
-bool CieRecord<E>::equals(const CieRecord<E> &other) const {
-  if (get_contents() != other.get_contents())
-    return false;
-
-  std::span<const ElfRel<E>> x = get_rels();
-  std::span<const ElfRel<E>> y = other.get_rels();
-  if (x.size() != y.size())
-    return false;
-
-  for (i64 i = 0; i < x.size(); i++) {
-    if (x[i].r_offset - input_offset != y[i].r_offset - other.input_offset ||
-        x[i].r_type != y[i].r_type ||
-        file.symbols[x[i].r_sym] != other.file.symbols[y[i].r_sym] ||
-        get_addend(input_section, x[i]) != get_addend(other.input_section, y[i]))
-      return false;
-  }
-  return true;
-}
 
 static i64 to_p2align(u64 alignment) {
   if (alignment == 0)
@@ -37,8 +18,26 @@ static i64 to_p2align(u64 alignment) {
 }
 
 template <typename E>
-InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file,
-                              std::string_view name, i64 shndx)
+bool cie_equals(const CieRecord<E> &a, const CieRecord<E> &b) {
+  if (a.get_contents() != b.get_contents())
+    return false;
+
+  std::span<const ElfRel<E>> x = a.get_rels();
+  std::span<const ElfRel<E>> y = b.get_rels();
+  if (x.size() != y.size())
+    return false;
+
+  for (i64 i = 0; i < x.size(); i++)
+    if (x[i].r_offset - a.input_offset != y[i].r_offset - b.input_offset ||
+        x[i].r_type != y[i].r_type ||
+        a.file.symbols[x[i].r_sym] != b.file.symbols[y[i].r_sym] ||
+        get_addend(a.input_section, x[i]) != get_addend(b.input_section, y[i]))
+      return false;
+  return true;
+}
+
+template <typename E>
+InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file, i64 shndx)
   : file(file), shndx(shndx) {
   if (shndx < file.elf_sections.size())
     contents = {(char *)file.mf->data + shdr().sh_offset, (size_t)shdr().sh_size};
@@ -70,14 +69,14 @@ void InputSection<E>::uncompress(Context<E> &ctx) {
     return;
 
   u8 *buf = new u8[sh_size];
-  uncompress_to(ctx, buf);
+  copy_contents(ctx, buf);
   contents = std::string_view((char *)buf, sh_size);
   ctx.string_pool.emplace_back(buf);
   uncompressed = true;
 }
 
 template <typename E>
-void InputSection<E>::uncompress_to(Context<E> &ctx, u8 *buf) {
+void InputSection<E>::copy_contents(Context<E> &ctx, u8 *buf) {
   if (!(shdr().sh_flags & SHF_COMPRESSED) || uncompressed) {
     memcpy(buf, contents.data(), contents.size());
     return;
@@ -105,6 +104,16 @@ void InputSection<E>::uncompress_to(Context<E> &ctx, u8 *buf) {
     Fatal(ctx) << *this << ": unsupported compression type: 0x"
                << std::hex << hdr.ch_type;
   }
+}
+
+template <typename E>
+static bool
+is_relr_reloc(Context<E> &ctx, InputSection<E> &isec, const ElfRel<E> &rel) {
+  ElfShdr<E> shdr = isec.shdr();
+  return ctx.arg.pack_dyn_relocs_relr &&
+         !(shdr.sh_flags & SHF_EXECINSTR) &&
+         shdr.sh_addralign % sizeof(Word<E>) == 0 &&
+         rel.r_offset % sizeof(Word<E>) == 0;
 }
 
 template <typename E>
@@ -150,40 +159,67 @@ static void scan_rel(Context<E> &ctx, InputSection<E> &isec, Symbol<E> &sym,
   case NONE:
     break;
   case ERROR:
+    // Print out the "recompile with -fPIC" error message.
     error();
     break;
   case COPYREL:
+    // Create a copy relocation.
     if (!ctx.arg.z_copyreloc)
       error();
     copyrel();
     break;
   case DYN_COPYREL:
+    // Same as COPYREL but try to avoid creating a copy relocation by
+    // creating a dynamic relocation instead if the relocation is in
+    // a writable section.
+    //
+    // GHC (Glasgow Haskell Compiler) places a small amount of data in
+    // .text before each function and access that data with a fixed
+    // offset. The function breaks if we copy-relocate the data. For such
+    // programs, we should avoid copy relocations if possible.
+    //
+    // Besides GHC, copy relocation is a hacky solution, so if we can
+    // represent a relocation either with copyrel or dynrel, we prefer
+    // dynamic relocation.
     if (writable || !ctx.arg.z_copyreloc)
       dynrel();
     else
       copyrel();
     break;
   case PLT:
+    // Create a PLT entry.
     sym.flags |= NEEDS_PLT;
     break;
   case CPLT:
+    // Create a canonical PLT entry.
     sym.flags |= NEEDS_CPLT;
     break;
   case DYN_CPLT:
+    // Same as CPLT but try to avoid creating a canonical PLT creating by
+    // creating a dynamic relocation instead if the relocation is in a
+    // writable section. The motivation behind it is hte same as DYN_COPYREL.
     if (writable)
       dynrel();
     else
       sym.flags |= NEEDS_CPLT;
     break;
   case DYNREL:
+    // Create a dynamic relocation.
     dynrel();
     break;
   case BASEREL:
+    // Create a base relocation.
     check_textrel();
-    if (!isec.is_relr_reloc(ctx, rel))
+    if (!is_relr_reloc(ctx, isec, rel))
       isec.file.num_dynrel++;
     break;
-  case IFUNC:
+  case IFUNC_DYNREL:
+    // Create an IRELATIVE relocation for a GNU ifunc symbol.
+    //
+    // We usually create an IRELATIVE relocation in .got for each ifunc.
+    // However, if a statically-initialized pointer is initialized to an
+    // ifunc's address, we have no choice other than emitting an IRELATIVE
+    // relocation for each such pointer.
     dynrel();
     ctx.num_ifunc_dynrels++;
     break;
@@ -230,9 +266,9 @@ static Action get_pcrel_action(Context<E> &ctx, Symbol<E> &sym) {
 template <typename E>
 static Action get_absrel_action(Context<E> &ctx, Symbol<E> &sym) {
   // This is a decision table for absolute relocations that is smaller
-  // than the word size (e.g. R_X86_64_32). Since the dynamic linker
+  // than the pointer size (e.g. R_X86_64_32). Since the dynamic linker
   // generally does not support dynamic relocations smaller than the
-  // word size, we need to report an error if a relocation cannot be
+  // pointer size, we need to report an error if a relocation cannot be
   // resolved at link-time.
   static Action table[3][4] = {
     // Absolute  Local    Imported data  Imported code
@@ -247,9 +283,9 @@ static Action get_absrel_action(Context<E> &ctx, Symbol<E> &sym) {
 template <typename E>
 static Action get_dyn_absrel_action(Context<E> &ctx, Symbol<E> &sym) {
   if (sym.is_ifunc())
-    return IFUNC;
+    return sym.is_pde_ifunc(ctx) ? NONE : IFUNC_DYNREL;
 
-  // This is a decision table for absolute relocations for the word
+  // This is a decision table for absolute relocations for the pointer
   // size data (e.g. R_X86_64_64). Unlike the absrel_table, we can emit
   // a dynamic relocation if we cannot resolve an address at link-time.
   static Action table[3][4] = {
@@ -265,7 +301,7 @@ static Action get_dyn_absrel_action(Context<E> &ctx, Symbol<E> &sym) {
 template <typename E>
 static Action get_ppc64_toc_action(Context<E> &ctx, Symbol<E> &sym) {
   if (sym.is_ifunc())
-    return IFUNC;
+    return IFUNC_DYNREL;
 
   // As a special case, we do not create copy relocations nor canonical
   // PLTs for .toc sections. PPC64's .toc is a compiler-generated
@@ -306,6 +342,29 @@ void InputSection<E>::scan_toc_rel(Context<E> &ctx, Symbol<E> &sym,
 }
 
 template <typename E>
+void InputSection<E>::scan_tlsdesc(Context<E> &ctx, Symbol<E> &sym) {
+  if (ctx.arg.is_static ||
+      (ctx.arg.relax && sym.is_tprel_linktime_const(ctx))) {
+    // Relax TLSDESC to Local Exec. In this case, we directly materialize
+    // a TP-relative offset, so no dynamic relocation is needed.
+    //
+    // TLSDESC relocs must always be relaxed for statically-linked
+    // executables even if -no-relax is given. It is because a
+    // statically-linked executable doesn't contain a trampoline
+    // function needed for TLSDESC.
+  } else if (ctx.arg.relax && sym.is_tprel_runtime_const(ctx)) {
+    // In this condition, TP-relative offset of a thread-local variable
+    // is known at process startup time, so we can relax TLSDESC to the
+    // code that reads the TP-relative offset from GOT and add TP to it.
+    sym.flags |= NEEDS_GOTTP;
+  } else {
+    // If no relaxation is doable, we simply create a TLSDESC dynamic
+    // relocation.
+    sym.flags |= NEEDS_TLSDESC;
+  }
+}
+
+template <typename E>
 void InputSection<E>::check_tlsle(Context<E> &ctx, Symbol<E> &sym,
                                   const ElfRel<E> &rel) {
   if (ctx.arg.shared)
@@ -322,7 +381,7 @@ static void apply_absrel(Context<E> &ctx, InputSection<E> &isec,
   bool writable = (isec.shdr().sh_flags & SHF_WRITE);
 
   auto emit_abs_dynrel = [&] {
-    *dynrel++ = ElfRel<E>(P, E::R_DYNAMIC, sym.get_dynsym_idx(ctx), A);
+    *dynrel++ = ElfRel<E>(P, E::R_ABS, sym.get_dynsym_idx(ctx), A);
     if (ctx.arg.apply_dynamic_relocs)
       *(Word<E> *)loc = A;
   };
@@ -334,7 +393,7 @@ static void apply_absrel(Context<E> &ctx, InputSection<E> &isec,
     *(Word<E> *)loc = S + A;
     break;
   case BASEREL:
-    if (isec.is_relr_reloc(ctx, rel)) {
+    if (is_relr_reloc(ctx, isec, rel)) {
       *(Word<E> *)loc = S + A;
     } else {
       *dynrel++ = ElfRel<E>(P, E::R_RELATIVE, 0, S + A);
@@ -357,7 +416,7 @@ static void apply_absrel(Context<E> &ctx, InputSection<E> &isec,
   case DYNREL:
     emit_abs_dynrel();
     break;
-  case IFUNC:
+  case IFUNC_DYNREL:
     if constexpr (supports_ifunc<E>) {
       u64 addr = sym.get_addr(ctx, NO_PLT) + A;
       *dynrel++ = ElfRel<E>(P, E::R_IRELATIVE, 0, addr);
@@ -399,7 +458,7 @@ void InputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
   if constexpr (is_riscv<E>)
     copy_contents_riscv(ctx, buf);
   else
-    uncompress_to(ctx, buf);
+    copy_contents(ctx, buf);
 
   // Apply relocations
   if (!ctx.arg.relocatable) {
@@ -412,14 +471,15 @@ void InputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
 
 // Get the name of a function containin a given offset.
 template <typename E>
-std::string_view InputSection<E>::get_func_name(Context<E> &ctx, i64 offset) const {
-  for (const ElfSym<E> &esym : file.elf_syms) {
+std::string_view
+InputSection<E>::get_func_name(Context<E> &ctx, i64 offset) const {
+  for (Symbol<E> *sym : file.symbols) {
+    const ElfSym<E> &esym = sym->esym();
     if (esym.st_shndx == shndx && esym.st_type == STT_FUNC &&
         esym.st_value <= offset && offset < esym.st_value + esym.st_size) {
-      std::string_view name = file.symbol_strtab.data() + esym.st_name;
       if (ctx.arg.demangle)
-        return demangle(name);
-      return name;
+        return demangle(*sym);
+      return sym->name();
     }
   }
   return "";
@@ -456,22 +516,29 @@ bool InputSection<E>::record_undef_error(Context<E> &ctx, const ElfRel<E> &rel) 
     ss << ">>>               " << file;
     if (std::string_view func = get_func_name(ctx, rel.r_offset); !func.empty())
       ss << ":(" << func << ")";
+    ss << '\n';
 
     typename decltype(ctx.undef_errors)::accessor acc;
-    ctx.undef_errors.insert(acc, {sym.name(), {}});
+    ctx.undef_errors.insert(acc, {&sym, {}});
     acc->second.push_back(ss.str());
   };
 
-  // A non-weak undefined symbol must be promoted to an imported
-  // symbol or resolved to an defined symbol. Otherwise, it's an
-  // undefined symbol error.
+  // A non-weak undefined symbol must be promoted to an imported symbol
+  // or resolved to an defined symbol. Otherwise, we need to report an
+  // error or warn on it.
   //
   // Every ELF file has an absolute local symbol as its first symbol.
   // Referring to that symbol is always valid.
   bool is_undef = esym.is_undef() && !esym.is_weak() && sym.sym_idx;
-  if (!sym.is_imported && is_undef && sym.esym().is_undef()) {
-    record();
-    return true;
+  if (is_undef && sym.esym().is_undef()) {
+    if (ctx.arg.unresolved_symbols == UNRESOLVED_ERROR && !sym.is_imported) {
+      record();
+      return true;
+    }
+    if (ctx.arg.unresolved_symbols == UNRESOLVED_WARN) {
+      record();
+      return false;
+    }
   }
 
   // If a protected/hidden undefined symbol is resolved to other .so,
@@ -487,7 +554,7 @@ bool InputSection<E>::record_undef_error(Context<E> &ctx, const ElfRel<E> &rel) 
 
 using E = MOLD_TARGET;
 
-template struct CieRecord<E>;
+template bool cie_equals(const CieRecord<E> &, const CieRecord<E> &);
 template class InputSection<E>;
 
 } // namespace mold::elf

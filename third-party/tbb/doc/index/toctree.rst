@@ -9,6 +9,7 @@
    /main/intro/intro_os
    /main/intro/Benefits
    /main/intro/testing_approach
+   /main/intro/limitations.rst
 
 
 .. toctree::
@@ -16,8 +17,12 @@
    :maxdepth: 2
 
    /GSG/get_started
+   /GSG/intro
+   /GSG/system_requirements
    /GSG/installation
-   /GSG/examples
+   /GSG/next_steps 
+   /GSG/integrate
+   /GSG/samples
 
 
 .. toctree::

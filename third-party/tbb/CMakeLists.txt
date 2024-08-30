@@ -106,13 +106,16 @@ option(TBB_CPF "Enable preview features of the library" OFF)
 option(TBB_FIND_PACKAGE "Enable search for external oneTBB using find_package instead of build from sources" OFF)
 option(TBB_DISABLE_HWLOC_AUTOMATIC_SEARCH "Disable HWLOC automatic search by pkg-config tool" OFF)
 option(TBB_ENABLE_IPO "Enable Interprocedural Optimization (IPO) during the compilation" ON)
+option(TBB_FUZZ_TESTING "Enable fuzz testing" OFF)
 
 if (NOT DEFINED BUILD_SHARED_LIBS)
     set(BUILD_SHARED_LIBS ON)
 endif()
 
 if (NOT BUILD_SHARED_LIBS)
-    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+    if(NOT DEFINED CMAKE_POSITION_INDEPENDENT_CODE)
+        set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+    endif()
     message(WARNING "You are building oneTBB as a static library. This is highly discouraged and such configuration is not supported. Consider building a dynamic library to avoid unforeseen issues.")
 endif()
 
@@ -121,6 +124,14 @@ if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     message(STATUS "CMAKE_BUILD_TYPE is not specified. Using default: ${CMAKE_BUILD_TYPE}")
     # Possible values of build type for cmake-gui
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
+endif()
+
+if (CMAKE_BUILD_TYPE)
+    string(TOLOWER ${CMAKE_BUILD_TYPE} _tbb_build_type)
+    if (_tbb_build_type STREQUAL "debug")
+        set(TBB_ENABLE_IPO OFF)
+    endif()
+    unset(_tbb_build_type)
 endif()
 
 # -------------------------------------------------------------------
@@ -171,10 +182,22 @@ foreach(output_type LIBRARY ARCHIVE PDB RUNTIME)
     endif()
 endforeach()
 
+if (CMAKE_CONFIGURATION_TYPES)
+    # We can't use generator expressions in a cmake variable name.
+    set(TBB_TEST_WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/${TBB_OUTPUT_DIR_BASE}_$<LOWER_CASE:$<CONFIG>>)
+else()
+    set(TBB_TEST_WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+endif()
+
 # -------------------------------------------------------------------
 
 # -------------------------------------------------------------------
 # Common dependencies
+#force -pthread during compilation for Emscripten
+if (EMSCRIPTEN)
+   set(THREADS_HAVE_PTHREAD_ARG TRUE)
+endif()
+
 set(THREADS_PREFER_PTHREAD_FLAG TRUE)
 find_package(Threads REQUIRED)
 # -------------------------------------------------------------------
@@ -222,7 +245,7 @@ else()
             add_subdirectory(src/tbbmalloc_proxy)
         endif()
     endif()
-    if (APPLE OR NOT BUILD_SHARED_LIBS)
+    if (NOT BUILD_SHARED_LIBS)
         message(STATUS "TBBBind build targets are disabled due to unsupported environment")
     else()
         add_subdirectory(src/tbbbind)

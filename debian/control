@@ -7,7 +7,6 @@ Build-Depends:
  debhelper-compat (= 12),
  dwarfdump,
  libssl-dev,
- libtbb-dev,
  libxxhash-dev,
  pkg-config,
  zlib1g-dev,

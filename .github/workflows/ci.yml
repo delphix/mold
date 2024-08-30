@@ -20,10 +20,10 @@ jobs:
     - uses: actions/checkout@v3
     - uses: rui314/setup-mold@staging
     - name: install-build-deps
-      run: sudo ./install-build-deps.sh update
+      run: sudo ./install-build-deps.sh
     - name: ccache
       uses: hendrikmuhs/ccache-action@v1
-    - name: build and test
+    - name: build
       run: |
         echo "/usr/lib/ccache:/usr/local/opt/ccache/libexec" >> $GITHUB_PATH
         sudo apt-get install -y clang++-12
@@ -31,15 +31,18 @@ jobs:
         cd build
         cmake -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++-12 ${{ matrix.target }} ..
         cmake --build . -j$(nproc)
-        ctest . -j$(nproc)
+    - name: test
+      run: |
+        cd build
+        ctest -j$(nproc)
     - name: archive test results
       uses: actions/upload-artifact@v3
       if: failure()
       with:
         name: test-results-clang
         path: |
-          build/out
-          build/Testing
+          build
+          !build/CMakeFiles
 
   build-gcc:
     runs-on: ubuntu-20.04
@@ -47,68 +50,64 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - name: install-build-deps
+      shell: bash
       run: |
         # Install cross toolchains
-        dpkg --add-architecture i386
-        ./install-build-deps.sh update
-        apt-get install -y sudo qemu-user gdb zstd dwarfdump xz-utils {gcc,g++}-10-{i686,aarch64,riscv64,powerpc,powerpc64,powerpc64le,s390x,sparc64,m68k,sh4,alpha,mips,mipsel}-linux-gnu {gcc,g++}-10-arm-linux-gnueabihf {gcc,g++}-10-{mips64,mips64el}-linux-gnuabi64
-
-        for i in {i686,aarch64,riscv64,powerpc,powerpc64,powerpc64le,s390x,sparc64,m68k,sh4,alpha,mips,mipsel}-linux-gnu arm-linux-gnueabihf {mips64,mips64el}-linux-gnuabi64; do
-          ln -sf /usr/bin/$i-gcc-10 /usr/bin/$i-gcc
-          ln -sf /usr/bin/$i-g++-10 /usr/bin/$i-g++
-        done
+        ./install-build-deps.sh
+        ./install-cross-tools.sh
 
         # Install a RV32 toolchain from third party since it's not available
         # as an Ubuntu package.
-        mkdir /usr/local/rv32
-        wget -O- -q https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/2023.07.07/riscv32-glibc-ubuntu-20.04-gcc-nightly-2023.07.07-nightly.tar.gz | tar -C /usr/local/rv32 --strip-components=1 -xzf -
+        mkdir /rv32
+        wget -O- -q https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/2023.07.07/riscv32-glibc-ubuntu-20.04-gcc-nightly-2023.07.07-nightly.tar.gz | tar -C /rv32 --strip-components=1 -xzf -
 
-        ln -sf /usr/local/rv32/sysroot /usr/riscv32-linux-gnu
-        echo '/usr/local/rv32/bin/riscv32-unknown-linux-gnu-gcc -L/usr/riscv32-linux-gnu "$@"' > /usr/bin/riscv32-linux-gnu-gcc
-        echo '/usr/local/rv32/bin/riscv32-unknown-linux-gnu-g++ -L/usr/riscv32-linux-gnu "$@"' > /usr/bin/riscv32-linux-gnu-g++
+        ln -sf /rv32/sysroot /usr/riscv32-linux-gnu
+        echo '/rv32/bin/riscv32-unknown-linux-gnu-gcc -L/usr/riscv32-linux-gnu "$@"' > /usr/bin/riscv32-linux-gnu-gcc
+        echo '/rv32/bin/riscv32-unknown-linux-gnu-g++ -L/usr/riscv32-linux-gnu "$@"' > /usr/bin/riscv32-linux-gnu-g++
         chmod 755 /usr/bin/riscv32-linux-gnu-{gcc,g++}
 
         for i in objdump objcopy strip; do
-          ln -sf /usr/local/rv32/bin/riscv32-unknown-linux-gnu-$i /usr/bin/riscv32-linux-gnu-$i
+          ln -sf /rv32/bin/riscv32-unknown-linux-gnu-$i /usr/bin/riscv32-linux-gnu-$i
         done
 
         # Install a LoongArch toolchain
-        mkdir /usr/local/larch
-        wget -O- -q https://github.com/loongson/build-tools/releases/download/2023.08.08/CLFS-loongarch64-8.1-x86_64-cross-tools-gcc-glibc.tar.xz | tar -C /usr/local/larch --strip-components=1 --xz -xf -
+        mkdir /larch
+        wget -O- -q https://github.com/loongson/build-tools/releases/download/2023.08.08/CLFS-loongarch64-8.1-x86_64-cross-tools-gcc-glibc.tar.xz | tar -C /larch --strip-components=1 --xz -xf -
 
-        ln -sf /usr/local/larch/target /usr/loongarch64-linux-gnu
-        cp -r /usr/local/larch/loongarch64-unknown-linux-gnu/lib/* /usr/loongarch64-linux-gnu/lib64/
+        ln -sf /larch/target /usr/loongarch64-linux-gnu
+        cp -r /larch/loongarch64-unknown-linux-gnu/lib/* /usr/loongarch64-linux-gnu/lib64/
 
         for i in objdump objcopy strip; do
-          ln -sf /usr/local/larch/bin/loongarch64-unknown-linux-gnu-$i /usr/bin/loongarch64-linux-gnu-$i
+          ln -sf /larch/bin/loongarch64-unknown-linux-gnu-$i /usr/bin/loongarch64-linux-gnu-$i
         done
 
-        echo '/usr/local/larch/bin/loongarch64-unknown-linux-gnu-gcc -L/usr/local/larch/loongarch64-unknown-linux-gnu "$@"' > /usr/bin/loongarch64-linux-gnu-gcc
-        echo '/usr/local/larch/bin/loongarch64-unknown-linux-gnu-g++ -L/usr/local/larch/loongarch64-unknown-linux-gnu "$@"' > /usr/bin/loongarch64-linux-gnu-g++
+        echo '/larch/bin/loongarch64-unknown-linux-gnu-gcc -L/larch/loongarch64-unknown-linux-gnu "$@"' > /usr/bin/loongarch64-linux-gnu-gcc
+        echo '/larch/bin/loongarch64-unknown-linux-gnu-g++ -L/larch/loongarch64-unknown-linux-gnu "$@"' > /usr/bin/loongarch64-linux-gnu-g++
         chmod 755 /usr/bin/loongarch64-linux-gnu-{gcc,g++}
 
-        wget -O/usr/local/bin/qemu-loongarch64 -q https://github.com/loongson/build-tools/releases/download/2023.08.08/qemu-loongarch64
+        wget -O /usr/local/bin/qemu-loongarch64 -q https://github.com/loongson/build-tools/releases/download/2023.08.08/qemu-loongarch64
         chmod 755 /usr/local/bin/qemu-loongarch64
-
-      shell: bash
     - name: ccache
       uses: hendrikmuhs/ccache-action@v1
-    - name: build and test
+    - name: build
       run: |
         echo "/usr/lib/ccache:/usr/local/opt/ccache/libexec" >> $GITHUB_PATH
         mkdir build
         cd build
-        cmake -DMOLD_ENABLE_QEMU_TESTS=On -DMOLD_ENABLE_QEMU_TESTS_RV32=On -DMOLD_ENABLE_QEMU_TESTS_LOONGARCH=On ..
+        cmake ..
         cmake --build . -j$(nproc)
-        ctest . -j$(nproc)
+    - name: test
+      run: |
+        cd build
+        ctest -j$(nproc)
     - name: archive test results
       uses: actions/upload-artifact@v3
       if: failure()
       with:
         name: test-results-gcc
         path: |
-          build/out
-          build/Testing
+          build
+          !build/CMakeFiles
 
   build-macos:
     runs-on: macos-11
@@ -122,7 +121,7 @@ jobs:
     - uses: actions/checkout@v3
     - name: ccache
       uses: hendrikmuhs/ccache-action@v1
-    - name: build and test
+    - name: build
       run: |
         echo "/usr/lib/ccache:/usr/local/opt/ccache/libexec" >> $GITHUB_PATH
         mkdir build
@@ -140,3 +139,21 @@ jobs:
         cd build
         cmake -T clangcl ..
         cmake --build . -j $Env:NUMBER_OF_PROCESSORS
+
+  build-msys:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: UCRT64
+        update: true
+        pacboy: gcc-libs:p libwinpthread-git:p tbb:p zlib:p zstd:p dlfcn:p cc:p cmake:p ninja:p
+    - name: build
+      shell: msys2 {0}
+      run: |
+        mkdir build
+        cd build
+        cmake -GNinja -DMOLD_USE_MIMALLOC=OFF -DMOLD_USE_SYSTEM_TBB=ON -DMOLD_USE_MOLD=OFF ..
+        cmake --build . -j $(nproc)

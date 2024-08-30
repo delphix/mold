@@ -54,6 +54,8 @@ static Map<E> get_map(Context<E> &ctx) {
 
 template <typename E>
 void print_map(Context<E> &ctx) {
+  Timer t(ctx, "print_map");
+
   std::ostream *out = &std::cout;
   std::unique_ptr<std::ofstream> file;
 
@@ -75,7 +77,7 @@ void print_map(Context<E> &ctx) {
          << std::setw(6) << (u64)osec->shdr.sh_addralign
          << " " << osec->name << "\n";
 
-    if (osec->kind() != OUTPUT_SECTION)
+    if (!osec->to_osec())
       continue;
 
     std::span<InputSection<E> *> members = ((OutputSection<E> *)osec)->members;
@@ -84,7 +86,6 @@ void print_map(Context<E> &ctx) {
     tbb::parallel_for((i64)0, (i64)members.size(), [&](i64 i) {
       InputSection<E> *mem = members[i];
       std::ostringstream ss;
-      opt_demangle = ctx.arg.demangle;
       u64 addr = osec->shdr.sh_addr + mem->offset;
 
       ss << std::showbase

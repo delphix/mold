@@ -65,7 +65,7 @@
 // conditions.
 
 #include "mold.h"
-#include "../common/sha.h"
+#include "../common/siphash.h"
 
 #include <array>
 #include <cstdio>
@@ -78,34 +78,43 @@
 
 static constexpr int64_t HASH_SIZE = 16;
 
-typedef std::array<uint8_t, HASH_SIZE> Digest;
+using Digest = std::array<uint8_t, HASH_SIZE>;
 
 namespace std {
-template<> struct hash<Digest> {
+template <> struct hash<Digest> {
   size_t operator()(const Digest &k) const {
-    return *(int64_t *)&k[0];
+    static_assert(sizeof(size_t) <= HASH_SIZE);
+    size_t val;
+    memcpy(&val, k.data(), sizeof(size_t));
+    return val;
   }
 };
 }
 
 namespace mold::elf {
 
+static u8 hmac_key[16];
+
 template <typename E>
 static void uniquify_cies(Context<E> &ctx) {
   Timer t(ctx, "uniquify_cies");
   std::vector<CieRecord<E> *> cies;
 
+  auto find = [&](CieRecord<E> &cie) -> i64 {
+    for (i64 i = 0; i < cies.size(); i++)
+      if (cie_equals(cie, *cies[i]))
+        return i;
+    return -1;
+  };
+
   for (ObjectFile<E> *file : ctx.objs) {
     for (CieRecord<E> &cie : file->cies) {
-      for (i64 i = 0; i < cies.size(); i++) {
-        if (cie.equals(*cies[i])) {
-          cie.icf_idx = i;
-          goto found;
-        }
+      if (i64 idx = find(cie); idx != -1) {
+        cie.icf_idx = idx;
+      } else {
+        cie.icf_idx = cies.size();
+        cies.push_back(&cie);
       }
-      cie.icf_idx = cies.size();
-      cies.push_back(&cie);
-    found:;
     }
   }
 }
@@ -115,30 +124,18 @@ static bool is_eligible(Context<E> &ctx, InputSection<E> &isec) {
   const ElfShdr<E> &shdr = isec.shdr();
   std::string_view name = isec.name();
 
-  bool is_alloc = (shdr.sh_flags & SHF_ALLOC);
-  bool is_exec = (shdr.sh_flags & SHF_EXECINSTR) ||
-                 ctx.arg.ignore_data_address_equality;
-  bool is_relro = (name == ".data.rel.ro" ||
-                   name.starts_with(".data.rel.ro."));
-  bool is_readonly = !(shdr.sh_flags & SHF_WRITE) || is_relro;
-  bool is_bss = (shdr.sh_type == SHT_NOBITS);
-  bool is_empty = (shdr.sh_size == 0);
-  bool is_init = (shdr.sh_type == SHT_INIT_ARRAY || name == ".init");
-  bool is_fini = (shdr.sh_type == SHT_FINI_ARRAY || name == ".fini");
-  bool is_enumerable = is_c_identifier(name);
-  bool is_addr_taken = !ctx.arg.icf_all && isec.address_significant;
+  if (shdr.sh_size == 0 || !(shdr.sh_flags & SHF_ALLOC) ||
+      shdr.sh_type == SHT_NOBITS || is_c_identifier(name))
+    return false;
 
-  return is_alloc && is_exec && is_readonly && !is_bss && !is_empty &&
-         !is_init && !is_fini && !is_enumerable && !is_addr_taken;
-}
+  if (shdr.sh_flags & SHF_EXECINSTR)
+    return (ctx.arg.icf_all || !isec.address_taken) &&
+           name != ".init" && name != ".fini";
 
-static Digest digest_final(SHA256Hash &sha) {
-  u8 buf[SHA256_SIZE];
-  sha.finish(buf);
-
-  Digest digest;
-  memcpy(digest.data(), buf, HASH_SIZE);
-  return digest;
+  bool is_readonly = !(shdr.sh_flags & SHF_WRITE);
+  bool is_relro = isec.output_section && isec.output_section->is_relro;
+  return (ctx.arg.ignore_data_address_equality || !isec.address_taken) &&
+         (is_readonly || is_relro);
 }
 
 template <typename E>
@@ -234,15 +231,15 @@ static void merge_leaf_nodes(Context<E> &ctx) {
 
 template <typename E>
 static Digest compute_digest(Context<E> &ctx, InputSection<E> &isec) {
-  SHA256Hash sha;
+  SipHash13_128 hasher(hmac_key);
 
   auto hash = [&](auto val) {
-    sha.update((u8 *)&val, sizeof(val));
+    hasher.update((u8 *)&val, sizeof(val));
   };
 
   auto hash_string = [&](std::string_view str) {
     hash(str.size());
-    sha.update((u8 *)str.data(), str.size());
+    hasher.update((u8 *)str.data(), str.size());
   };
 
   auto hash_symbol = [&](Symbol<E> &sym) {
@@ -298,7 +295,9 @@ static Digest compute_digest(Context<E> &ctx, InputSection<E> &isec) {
     hash_symbol(*isec.file.symbols[rel.r_sym]);
   }
 
-  return digest_final(sha);
+  Digest digest;
+  hasher.finish(digest.data());
+  return digest;
 }
 
 template <typename E>
@@ -399,7 +398,7 @@ static void gather_edges(Context<E> &ctx,
 template <typename E>
 static i64 propagate(std::span<std::vector<Digest>> digests,
                      std::span<u32> edges, std::span<u32> edge_indices,
-                     bool &slot, BitVector &converged,
+                     bool &slot, std::span<u8> converged,
                      tbb::affinity_partitioner &ap) {
   static Counter round("icf_round");
   round++;
@@ -408,24 +407,24 @@ static i64 propagate(std::span<std::vector<Digest>> digests,
   tbb::enumerable_thread_specific<i64> changed;
 
   tbb::parallel_for((i64)0, num_digests, [&](i64 i) {
-    if (converged.get(i))
+    if (converged[i])
       return;
 
-    SHA256Hash sha;
-    sha.update(digests[2][i].data(), HASH_SIZE);
+    SipHash13_128 hasher(hmac_key);
+    hasher.update(digests[2][i].data(), HASH_SIZE);
 
     i64 begin = edge_indices[i];
     i64 end = (i + 1 == num_digests) ? edges.size() : edge_indices[i + 1];
 
     for (i64 j : edges.subspan(begin, end - begin))
-      sha.update(digests[slot][j].data(), HASH_SIZE);
+      hasher.update(digests[slot][j].data(), HASH_SIZE);
 
-    digests[!slot][i] = digest_final(sha);
+    hasher.finish(digests[!slot][i].data());
 
     if (digests[slot][i] == digests[!slot][i]) {
       // This node has converged. Skip further iterations as it will
       // yield the same hash.
-      converged.set(i);
+      converged[i] = true;
     } else {
       changed.local()++;
     }
@@ -477,17 +476,17 @@ static void print_icf_sections(Context<E> &ctx) {
     if (begin == end)
       continue;
 
-    SyncOut(ctx) << "selected section " << *leader;
+    Out(ctx) << "selected section " << *leader;
 
     i64 n = 0;
     for (auto it = begin; it != end; it++) {
-      SyncOut(ctx) << "  removing identical section " << *it->second;
+      Out(ctx) << "  removing identical section " << *it->second;
       n++;
     }
     saved_bytes += leader->contents.size() * n;
   }
 
-  SyncOut(ctx) << "ICF saved " << saved_bytes << " bytes";
+  Out(ctx) << "ICF saved " << saved_bytes << " bytes";
 }
 
 template <typename E>
@@ -495,6 +494,8 @@ void icf_sections(Context<E> &ctx) {
   Timer t(ctx, "icf");
   if (ctx.objs.empty())
     return;
+
+  get_random_bytes(hmac_key, sizeof(hmac_key));
 
   uniquify_cies(ctx);
   merge_leaf_nodes(ctx);
@@ -520,7 +521,7 @@ void icf_sections(Context<E> &ctx) {
   std::vector<u32> edge_indices;
   gather_edges<E>(ctx, sections, edges, edge_indices);
 
-  BitVector converged(digests[0].size());
+  std::vector<u8> converged(digests[0].size());
   bool slot = 0;
 
   // Execute the propagation rounds until convergence is obtained.
@@ -563,7 +564,7 @@ void icf_sections(Context<E> &ctx) {
     }
   }
 
-  // Group sections by SHA digest.
+  // Group sections by hash values.
   {
     Timer t(ctx, "group");
 

@@ -195,14 +195,14 @@ void write_addend(u8 *loc, i64 val, const ElfRel<E> &rel) {
 template <>
 void write_plt_header(Context<E> &ctx, u8 *buf) {
   static const ul32 insn[] = {
-    0xe52d'e004, // push {lr}
-    0xe59f'e004, // ldr lr, 2f
+    0xe52d'e004, //    push {lr}
+    0xe59f'e004, //    ldr lr, 2f
     0xe08f'e00e, // 1: add lr, pc, lr
-    0xe5be'f008, // ldr pc, [lr, #8]!
+    0xe5be'f008, //    ldr pc, [lr, #8]!
     0x0000'0000, // 2: .word .got.plt - 1b - 8
-    0xe320'f000, // nop
-    0xe320'f000, // nop
-    0xe320'f000, // nop
+    0x0000'0000, //    (padding)
+    0x0000'0000, //    (padding)
+    0x0000'0000, //    (padding)
   };
 
   memcpy(buf, insn, sizeof(insn));
@@ -211,8 +211,8 @@ void write_plt_header(Context<E> &ctx, u8 *buf) {
 
 static const ul32 plt_entry[] = {
   0xe59f'c004, // 1: ldr ip, 2f
-  0xe08c'c00f, // add ip, ip, pc
-  0xe59c'f000, // ldr pc, [ip]
+  0xe08c'c00f, //    add ip, ip, pc
+  0xe59c'f000, //    ldr pc, [ip]
   0x0000'0000, // 2: .word sym@GOT - 1b
 };
 
@@ -225,14 +225,27 @@ void write_plt_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
 template <>
 void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
   memcpy(buf, plt_entry, sizeof(plt_entry));
-  *(ul32 *)(buf + 12) = sym.get_got_addr(ctx) - sym.get_plt_addr(ctx) - 12;
+  *(ul32 *)(buf + 12) = sym.get_got_pltgot_addr(ctx) - sym.get_plt_addr(ctx) - 12;
 }
 
-// ARM does not use .eh_frame for exception handling. Instead, it uses
-// .ARM.exidx and .ARM.extab. So this function is empty.
 template <>
 void EhFrameSection<E>::apply_eh_reloc(Context<E> &ctx, const ElfRel<E> &rel,
-                                       u64 offset, u64 val) {}
+                                       u64 offset, u64 val) {
+  u8 *loc = ctx.buf + this->shdr.sh_offset + offset;
+
+  switch (rel.r_type) {
+  case R_NONE:
+    break;
+  case R_ARM_ABS32:
+    *(ul32 *)loc = val;
+    break;
+  case R_ARM_REL32:
+    *(ul32 *)loc = val - this->shdr.sh_addr - offset;
+    break;
+  default:
+    Fatal(ctx) << "unsupported relocation in .eh_frame: " << rel;
+  }
+}
 
 // ARM and Thumb branch instructions can jump within ±16 MiB.
 static bool is_jump_reachable(i64 val) {
@@ -336,12 +349,12 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         break;
       }
 
-      // Just like THM_CALL, ARM_CALL relocation refers either BL or
+      // Just like THM_CALL, ARM_CALL relocation refers to either BL or
       // BLX instruction. We may need to rewrite BL → BLX or BLX → BL.
       bool is_bl = ((*(ul32 *)loc & 0xff00'0000) == 0xeb00'0000);
       bool is_blx = ((*(ul32 *)loc & 0xfe00'0000) == 0xfa00'0000);
       if (!is_bl && !is_blx)
-        Fatal(ctx) << *this << ": R_ARM_CALL refers neither BL nor BLX";
+        Fatal(ctx) << *this << ": R_ARM_CALL refers to neither BL nor BLX";
 
       u64 val = S + A - P;
       if (is_jump_reachable(val)) {
@@ -364,7 +377,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         break;
       }
 
-      // These relocs refers a B (unconditional branch) instruction.
+      // These relocs refers to a B (unconditional branch) instruction.
       // Unlike BL or BLX, we can't rewrite B to BX in place when the
       // processor mode switch is required because BX doesn't takes an
       // immediate; it takes only a register. So if mode switch is
@@ -467,12 +480,33 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul32 *)loc = S + A - ctx.tp_addr;
       break;
     case R_ARM_TLS_GOTDESC:
+      // ARM32 TLSDESC uses the following code sequence to materialize
+      // a TP-relative address in r0.
+      //
+      //       ldr     r0, .L2
+      //  .L1: bl      foo
+      //           R_ARM_TLS_CALL
+      //  .L2: .word   foo + . - .L1
+      //           R_ARM_TLS_GOTDESC
+      //
+      // We may relax the instructions to the following for non-dlopen'd DSO
+      //
+      //       ldr     r0, .L2
+      //  .L1: ldr r0, [pc, r0]
+      //       ...
+      //  .L2: .word   foo(gottpoff) + . - .L1
+      //
+      // or to the following for executable.
+      //
+      //       ldr     r0, .L2
+      //  .L1: nop
+      //       ...
+      //  .L2: .word   foo(tpoff)
       if (sym.has_tlsdesc(ctx)) {
         // A is odd if the corresponding TLS_CALL is Thumb.
-        if (A & 1)
-          *(ul32 *)loc = sym.get_tlsdesc_addr(ctx) - P + A - 6;
-        else
-          *(ul32 *)loc = sym.get_tlsdesc_addr(ctx) - P + A - 4;
+        *(ul32 *)loc = sym.get_tlsdesc_addr(ctx) - P + A - ((A & 1) ? 6 : 4);
+      } else if (sym.has_gottp(ctx)) {
+        *(ul32 *)loc = sym.get_gottp_addr(ctx) - P + A - ((A & 1) ? 5 : 8);
       } else {
         *(ul32 *)loc = S - ctx.tp_addr;
       }
@@ -481,9 +515,10 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       if (sym.has_tlsdesc(ctx)) {
         // BL <tls_trampoline>
         *(ul32 *)loc = 0xeb00'0000 | bits(get_tls_trampoline_addr(P + 8), 25, 2);
+      } else if (sym.has_gottp(ctx)) {
+        *(ul32 *)loc = 0xe79f'0000; // ldr r0, [pc, r0]
       } else {
-        // BL -> NOP
-        *(ul32 *)loc = 0xe320'f000;
+        *(ul32 *)loc = 0xe320'f000; // nop
       }
       break;
     case R_ARM_THM_TLS_CALL:
@@ -491,9 +526,13 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         u64 val = align_to(get_tls_trampoline_addr(P + 4), 4);
         write_thm_b_imm(loc, val);
         *(ul16 *)(loc + 2) &= ~0x1000; // rewrite BL with BLX
+      } else if (sym.has_gottp(ctx)) {
+        // Since `ldr r0, [pc, r0]` is not representable in Thumb,
+        // we use two instructions instead.
+        *(ul16 *)loc = 0x4478;         // add r0, pc
+        *(ul16 *)(loc + 2) = 0x6800;   // ldr r0, [r0]
       } else {
-        // BL -> NOP.W
-        *(ul32 *)loc = 0x8000'f3af;
+        *(ul32 *)loc = 0x8000'f3af;    // nop.w
       }
       break;
     default:
@@ -567,6 +606,10 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_ARM_TARGET1:
       scan_dyn_absrel(ctx, sym, rel);
       break;
+    case R_ARM_MOVW_ABS_NC:
+    case R_ARM_THM_MOVW_ABS_NC:
+      scan_absrel(ctx, sym, rel);
+      break;
     case R_ARM_THM_CALL:
     case R_ARM_CALL:
     case R_ARM_JUMP24:
@@ -594,9 +637,9 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_ARM_TLS_IE32:
       sym.flags |= NEEDS_GOTTP;
       break;
-    case R_ARM_TLS_GOTDESC:
-      if (!relax_tlsdesc(ctx, sym))
-        sym.flags |= NEEDS_TLSDESC;
+    case R_ARM_TLS_CALL:
+    case R_ARM_THM_TLS_CALL:
+      scan_tlsdesc(ctx, sym);
       break;
     case R_ARM_TLS_LE32:
       check_tlsle(ctx, sym, rel);
@@ -607,13 +650,10 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_ARM_THM_JUMP11:
     case R_ARM_THM_JUMP19:
     case R_ARM_MOVW_PREL_NC:
-    case R_ARM_MOVW_ABS_NC:
     case R_ARM_THM_MOVW_PREL_NC:
-    case R_ARM_THM_MOVW_ABS_NC:
     case R_ARM_TLS_LDO32:
-    case R_ARM_TLS_CALL:
-    case R_ARM_THM_TLS_CALL:
     case R_ARM_V4BX:
+    case R_ARM_TLS_GOTDESC:
       break;
     default:
       Error(ctx) << *this << ": unknown relocation: " << rel;
@@ -622,9 +662,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 }
 
 template <>
-void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
-
+void Thunk<E>::copy_buf(Context<E> &ctx) {
   // TLS trampoline code. ARM32's TLSDESC is designed so that this
   // common piece of code is factored out from object files to reduce
   // output size. Since no one provide, the linker has to synthesize it.
@@ -632,6 +670,7 @@ void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
     0xe08e'0000, // add r0, lr, r0
     0xe590'1004, // ldr r1, [r0, #4]
     0xe12f'ff11, // bx  r1
+    0xe320'f000, // nop
   };
 
   // This is a range extension and mode switch thunk.
@@ -641,25 +680,32 @@ void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
     0x78, 0x47,             //    bx   pc  # jumps to 1f
     0xc0, 0x46,             //    nop
     // .arm
-    0x04, 0xc0, 0x9f, 0xe5, // 1: ldr  ip, 3f
-    0x0f, 0xc0, 0x8c, 0xe0, // 2: add  ip, ip, pc
-    0x1c, 0xff, 0x2f, 0xe1, //    bx   ip
+    0x00, 0xc0, 0x9f, 0xe5, // 1: ldr  ip, 3f
+    0x0f, 0xf0, 0x8c, 0xe0, // 2: add  pc, ip, pc
     0x00, 0x00, 0x00, 0x00, // 3: .word sym - 2b
   };
 
   static_assert(E::thunk_hdr_size == sizeof(hdr));
   static_assert(E::thunk_size == sizeof(entry));
 
+  u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
   memcpy(buf, hdr, sizeof(hdr));
+  buf += sizeof(hdr);
 
-  for (i64 i = 0; i < symbols.size(); i++) {
-    u8 *loc = buf + sizeof(hdr) + i * sizeof(entry);
-    memcpy(loc, entry, sizeof(entry));
+  u64 P = output_section.shdr.sh_addr + offset + sizeof(hdr);
 
-    u64 S = symbols[i]->get_addr(ctx);
-    u64 P = output_section.shdr.sh_addr + offset + sizeof(hdr) + i * sizeof(entry);
-    *(ul32 *)(loc + 16) = S - P - 16;
+  for (Symbol<E> *sym : symbols) {
+    memcpy(buf, entry, sizeof(entry));
+    *(ul32 *)(buf + 12) = sym->get_addr(ctx) - P - 16;
+
+    buf += sizeof(entry);
+    P += sizeof(entry);
   }
+}
+
+template <>
+u64 get_eflags(Context<E> &ctx) {
+  return EF_ARM_EABI_VER5;
 }
 
 // ARM executables use an .ARM.exidx section to look up an exception

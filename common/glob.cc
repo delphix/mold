@@ -79,6 +79,14 @@ std::optional<Glob> Glob::compile(std::string_view pat) {
     case '*':
       vec.push_back({STAR});
       break;
+    case '\\':
+      if (pat.empty())
+        return {};
+      if (vec.empty() || vec.back().kind != STRING)
+        vec.push_back({STRING});
+      vec.back().str += pat[0];
+      pat = pat.substr(1);
+      break;
     default:
       if (vec.empty() || vec.back().kind != STRING)
         vec.push_back({STRING});
@@ -101,7 +109,7 @@ bool Glob::do_match(std::string_view str, std::span<Element> elements) {
 
     switch (e.kind) {
     case STRING:
-      if (str.empty() || !str.starts_with(e.str))
+      if (!str.starts_with(e.str))
         return false;
       str = str.substr(e.str.size());
       break;
@@ -116,13 +124,12 @@ bool Glob::do_match(std::string_view str, std::span<Element> elements) {
         for (;;) {
           size_t pos = str.find(elements[0].str);
           if (pos == str.npos)
-            break;
+            return false;
           if (do_match(str.substr(pos + elements[0].str.size()),
                        elements.subspan(1)))
             return true;
           str = str.substr(pos + 1);
         }
-        return false;
       }
 
       // Other cases are handled here.

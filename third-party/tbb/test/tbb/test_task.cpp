@@ -1,5 +1,5 @@
 /*
-    Copyright (c) 2005-2022 Intel Corporation
+    Copyright (c) 2005-2023 Intel Corporation
 
     Licensed under the Apache License, Version 2.0 (the "License");
     you may not use this file except in compliance with the License.
@@ -785,7 +785,7 @@ TEST_CASE("Test with priority inversion") {
     // take first core on execute
     utils::SpinBarrier barrier(thread_number + 1);
     test_arena.execute([&] {
-        tbb::parallel_for(std::uint32_t(0), thread_number + 1, [&] (std::uint32_t&) {
+        tbb::parallel_for(std::uint32_t(0), thread_number + 1, [&] (std::uint32_t) {
             barrier.wait();
             submit(worker_task, test_arena, test_context, true);
         });
@@ -821,4 +821,20 @@ TEST_CASE("raii_guard move ctor") {
 
     tbb::detail::d0::raii_guard<decltype(func)> guard1(func);
     tbb::detail::d0::raii_guard<decltype(func)> guard2(std::move(guard1));
+}
+
+//! \brief \ref error_guessing
+TEST_CASE("Check correct arena destruction with enqueue") {
+    for (int i = 0; i < 100; ++i) {
+        tbb::task_scheduler_handle handle{ tbb::attach{} };
+        {
+            tbb::task_arena a(2, 0);
+
+            a.enqueue([] {
+                tbb::parallel_for(0, 100, [] (int) { std::this_thread::sleep_for(std::chrono::nanoseconds(10)); });
+            });
+            std::this_thread::sleep_for(std::chrono::microseconds(1));
+        }
+        tbb::finalize(handle, std::nothrow_t{});
+    }
 }
