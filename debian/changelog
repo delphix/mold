@@ -2,6 +2,10 @@ mold (2.34.0+dfsg-1) unstable; urgency=medium
 
   * New upstream release
 
+  [ Matthias Klose  ]
+  * When no package-metadata option is given, fall-back to the
+    envvar ELF_PACKAGE_METADATA.
+
  -- Sylvestre Ledru <sylvestre@debian.org>  Wed, 25 Sep 2024 12:30:51 +0200
 
 mold (2.32.1+dfsg-2) unstable; urgency=medium

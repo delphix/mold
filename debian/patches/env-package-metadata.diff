@@ -1,0 +1,19 @@
+Index: mold/src/cmdline.cc
+===================================================================
+--- mold.orig/src/cmdline.cc
++++ mold/src/cmdline.cc
+@@ -1506,6 +1506,14 @@ std::vector<std::string> parse_nonpositi
+       ctx.arg.dependency_file = ctx.arg.chroot + "/" + ctx.arg.dependency_file;
+   }
+ 
++  // No package-metadata option, fall-back to env ELF_PACKAGE_METADATA
++  if (ctx.arg.package_metadata.empty()) {
++    const char* env_package_metadata = getenv("ELF_PACKAGE_METADATA");
++    if (env_package_metadata && strcmp(env_package_metadata, "") != 0) {
++      ctx.arg.package_metadata = std::string(env_package_metadata);
++    }
++  }
++
+   // Mark GC root symbols
+   for (Symbol<E> *sym : ctx.arg.undefined)
+     sym->gc_root = true;
