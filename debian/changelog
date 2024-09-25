@@ -1,6 +1,7 @@
 mold (2.34.0+dfsg-1) unstable; urgency=medium
 
   * New upstream release
+  * Fix two missing-license-paragraph-in-dep5-copyright warnings
 
   [ Matthias Klose  ]
   * When no package-metadata option is given, fall-back to the
