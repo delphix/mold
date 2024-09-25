@@ -1,4 +1,4 @@
-# Copyright (c) 2020-2023 Intel Corporation
+# Copyright (c) 2020-2024 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,6 +29,9 @@ function(tbb_add_test)
     add_executable(${_tbb_test_TARGET_NAME} ${_tbb_test_SUBDIR}/${_tbb_test_NAME}.cpp)
     target_include_directories(${_tbb_test_TARGET_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR})
 
+    # cmake>=3.4 no longer adds flags to export symbols from executables (CMP0065)
+    set_property(TARGET ${_tbb_test_TARGET_NAME} PROPERTY ENABLE_EXPORTS TRUE)
+
     target_compile_options(${_tbb_test_TARGET_NAME}
         PRIVATE
         ${TBB_CXX_STD_FLAG}
@@ -39,6 +42,10 @@ function(tbb_add_test)
         ${TBB_TEST_COMPILE_FLAGS}
         ${TBB_COMMON_COMPILE_FLAGS}
     )
+
+    if (TBB_BUILD_APPLE_FRAMEWORKS)
+        add_compile_definitions(TBB_USE_APPLE_FRAMEWORKS)
+    endif()
 
     if (ANDROID_PLATFORM)
         # Expand the linker rpath by the CMAKE_LIBRARY_OUTPUT_DIRECTORY path since clang compiler from Android SDK
@@ -446,6 +453,17 @@ if (TARGET TBB::tbb)
     tbb_add_test(SUBDIR tbb NAME test_eh_thread DEPENDENCIES TBB::tbb)
     tbb_add_test(SUBDIR tbb NAME test_global_control DEPENDENCIES TBB::tbb)
     tbb_add_test(SUBDIR tbb NAME test_task DEPENDENCIES TBB::tbb)
+
+    if (TBB_FUZZ_TESTING AND NOT WIN32)
+        if (NOT ((CMAKE_CXX_COMPILER_ID STREQUAL Clang) OR (CMAKE_CXX_COMPILER_ID STREQUAL IntelLLVM)))
+            message(FATAL_ERROR "Fuzzing requires Clang or IntelLLVM compiler.")
+        endif()
+        tbb_add_test(SUBDIR tbb NAME test_fuzzing)
+        add_dependencies(test_fuzzing test_task)
+        target_compile_definitions(test_fuzzing PRIVATE CMD="$<TARGET_FILE:test_task> >/dev/null 2>&1")
+        target_link_options(test_fuzzing PRIVATE -fsanitize=fuzzer)
+    endif()
+
     tbb_add_test(SUBDIR tbb NAME test_concurrent_monitor DEPENDENCIES TBB::tbb)
     tbb_add_test(SUBDIR tbb NAME test_scheduler_mix DEPENDENCIES TBB::tbb)
 
@@ -456,9 +474,11 @@ if (TARGET TBB::tbb)
     )
 
     # HWLOC related test
-    tbb_add_tbbbind_test(SUBDIR tbb NAME test_arena_constraints)
+    if (NOT TBB_EMSCRIPTEN)
+        tbb_add_tbbbind_test(SUBDIR tbb NAME test_arena_constraints)
+    endif()
 
-    if (NOT "${CMAKE_SYSTEM_PROCESSOR}" MATCHES "mips")
+    if ((NOT "${CMAKE_SYSTEM_PROCESSOR}" MATCHES "mips") AND (NOT TBB_EMSCRIPTEN))
         # TODO: Fix for MIPS
         tbb_add_test(SUBDIR tbb NAME test_tbb_fork DEPENDENCIES TBB::tbb)
     endif()
@@ -533,7 +553,9 @@ if (TARGET TBB::tbb)
     tbb_add_test(SUBDIR conformance NAME conformance_graph DEPENDENCIES TBB::tbb)
 
     # HWLOC related conformance
-    tbb_add_tbbbind_test(SUBDIR conformance NAME conformance_arena_constraints)
+    if (NOT TBB_EMSCRIPTEN)
+        tbb_add_tbbbind_test(SUBDIR conformance NAME conformance_arena_constraints)
+    endif()
 
     if (MSVC AND BUILD_SHARED_LIBS AND CMAKE_VERSION VERSION_GREATER 3.13) # LINK_OPTIONS property first appeared in 3.13
                                                     # version of the CMake
@@ -543,7 +565,7 @@ if (TARGET TBB::tbb)
         target_include_directories(test_implicit_linkage_on_windows PRIVATE
         $<TARGET_PROPERTY:TBB::tbb,INTERFACE_INCLUDE_DIRECTORIES>)
         set_target_properties(test_implicit_linkage_on_windows PROPERTIES
-        LINK_OPTIONS /LIBPATH:$<TARGET_LINKER_FILE_DIR:TBB::tbb>)
+        LINK_OPTIONS LINKER:/LIBPATH:$<TARGET_LINKER_FILE_DIR:TBB::tbb>)
         add_dependencies(test_implicit_linkage_on_windows TBB::tbb)
     endif()
 endif()
@@ -551,62 +573,63 @@ endif()
 if (TARGET TBB::tbbmalloc)
     # TBB allocator tests
     if (NOT "${CMAKE_SYSTEM_PROCESSOR}" MATCHES "mips")
-        # Define TBB malloc tests
-        tbb_add_test(SUBDIR tbbmalloc NAME test_scalable_allocator DEPENDENCIES TBB::tbbmalloc)
-        tbb_add_test(SUBDIR tbbmalloc NAME test_malloc_pools DEPENDENCIES TBB::tbbmalloc)
-        tbb_add_test(SUBDIR tbbmalloc NAME test_malloc_init_shutdown DEPENDENCIES TBB::tbbmalloc)
-        tbb_add_test(SUBDIR tbbmalloc NAME test_malloc_regression DEPENDENCIES TBB::tbbmalloc)
-        if (TARGET TBB::tbb)
-            tbb_add_test(SUBDIR tbbmalloc NAME test_malloc_shutdown_hang DEPENDENCIES TBB::tbb TBB::tbbmalloc)
+        if (NOT TBB_EMSCRIPTEN)
+            # Define TBB malloc tests
+	    tbb_add_test(SUBDIR tbbmalloc NAME test_scalable_allocator DEPENDENCIES TBB::tbbmalloc)
+            tbb_add_test(SUBDIR tbbmalloc NAME test_malloc_pools DEPENDENCIES TBB::tbbmalloc)
+            tbb_add_test(SUBDIR tbbmalloc NAME test_malloc_init_shutdown DEPENDENCIES TBB::tbbmalloc)
+            tbb_add_test(SUBDIR tbbmalloc NAME test_malloc_regression DEPENDENCIES TBB::tbbmalloc)
+            if (TARGET TBB::tbb)
+                tbb_add_test(SUBDIR tbbmalloc NAME test_malloc_shutdown_hang DEPENDENCIES TBB::tbb TBB::tbbmalloc)
+            endif()
+
+            if (NOT (WINDOWS_STORE OR TBB_WINDOWS_DRIVER))
+                # TODO: Consider adding following tests on WINDOWS_STORE and TBB_WINDOWS_DRIVER platforms
+                tbb_add_test(SUBDIR tbbmalloc NAME test_malloc_compliance DEPENDENCIES TBB::tbbmalloc)
+                tbb_add_lib_test(SUBDIR tbbmalloc NAME test_malloc_used_by_lib DEPENDENCIES TBB::tbbmalloc)
+                tbb_add_test(SUBDIR tbbmalloc NAME test_malloc_used_by_lib DEPENDENCIES _test_malloc_used_by_lib)
+                tbb_add_lib_test(SUBDIR tbbmalloc NAME test_malloc_lib_unload)
+                tbb_add_test(SUBDIR tbbmalloc NAME test_malloc_lib_unload DEPENDENCIES _test_malloc_lib_unload)
+            endif()
+
+            enable_language(C)
+            tbb_add_c_test(SUBDIR tbbmalloc NAME test_malloc_pure_c DEPENDENCIES TBB::tbbmalloc)
         endif()
-
-        if (NOT (WINDOWS_STORE OR TBB_WINDOWS_DRIVER))
-            # TODO: Consider adding following tests on WINDOWS_STORE and TBB_WINDOWS_DRIVER platforms
-            tbb_add_test(SUBDIR tbbmalloc NAME test_malloc_compliance DEPENDENCIES TBB::tbbmalloc)
-            tbb_add_lib_test(SUBDIR tbbmalloc NAME test_malloc_used_by_lib DEPENDENCIES TBB::tbbmalloc)
-            tbb_add_test(SUBDIR tbbmalloc NAME test_malloc_used_by_lib DEPENDENCIES _test_malloc_used_by_lib)
-            tbb_add_lib_test(SUBDIR tbbmalloc NAME test_malloc_lib_unload)
-            tbb_add_test(SUBDIR tbbmalloc NAME test_malloc_lib_unload DEPENDENCIES _test_malloc_lib_unload)
-        endif()
-
-        enable_language(C)
-        tbb_add_c_test(SUBDIR tbbmalloc NAME test_malloc_pure_c DEPENDENCIES TBB::tbbmalloc)
-
         # ----------------------------------------------------------------------------------------
         # Whitebox testing
+        if (NOT TBB_EMSCRIPTEN)
+	    add_executable(test_malloc_whitebox tbbmalloc/test_malloc_whitebox.cpp)
 
-        add_executable(test_malloc_whitebox tbbmalloc/test_malloc_whitebox.cpp)
-
-        target_include_directories(test_malloc_whitebox
-            PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/../include
-            ${CMAKE_CURRENT_SOURCE_DIR}/..
-            ${CMAKE_CURRENT_SOURCE_DIR})
-        target_compile_definitions(test_malloc_whitebox PRIVATE __TBBMALLOC_BUILD)
-        target_compile_options(test_malloc_whitebox
-            PRIVATE
-            ${TBB_CXX_STD_FLAG}
-            ${TBB_WARNING_SUPPRESS}
-            ${TBB_TEST_COMPILE_FLAGS}
-            ${TBB_COMMON_COMPILE_FLAGS}
-            ${TBBMALLOC_LIB_COMPILE_FLAGS}
-        )
-        if (ANDROID_PLATFORM)
-            add_test(NAME test_malloc_whitebox
-                    COMMAND ${CMAKE_COMMAND}
-                            -DBINARIES_PATH=${CMAKE_LIBRARY_OUTPUT_DIRECTORY}
-                            -DTEST_NAME=test_malloc_whitebox
-                            -P ${PROJECT_SOURCE_DIR}/cmake/android/test_launcher.cmake)
-        else()
-            add_test(NAME test_malloc_whitebox COMMAND test_malloc_whitebox --force-colors=1)
+            target_include_directories(test_malloc_whitebox
+                PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/../include
+                ${CMAKE_CURRENT_SOURCE_DIR}/..
+                ${CMAKE_CURRENT_SOURCE_DIR})
+            target_compile_definitions(test_malloc_whitebox PRIVATE __TBBMALLOC_BUILD)
+            target_compile_options(test_malloc_whitebox
+                PRIVATE
+                ${TBB_CXX_STD_FLAG}
+                ${TBB_WARNING_SUPPRESS}
+                ${TBB_TEST_COMPILE_FLAGS}
+                ${TBB_COMMON_COMPILE_FLAGS}
+                ${TBBMALLOC_LIB_COMPILE_FLAGS}
+            )
+            if (ANDROID_PLATFORM)
+                add_test(NAME test_malloc_whitebox
+                        COMMAND ${CMAKE_COMMAND}
+                                -DBINARIES_PATH=${CMAKE_LIBRARY_OUTPUT_DIRECTORY}
+                                -DTEST_NAME=test_malloc_whitebox
+                                -P ${PROJECT_SOURCE_DIR}/cmake/android/test_launcher.cmake)
+            else()
+                add_test(NAME test_malloc_whitebox COMMAND test_malloc_whitebox --force-colors=1)
+            endif()
+            if (COMMAND target_link_options)
+                target_link_options(test_malloc_whitebox PRIVATE ${TBB_COMMON_LINK_FLAGS})
+            else()
+                target_link_libraries(test_malloc_whitebox PRIVATE ${TBB_COMMON_LINK_FLAGS})
+            endif()
+            target_link_libraries(test_malloc_whitebox PRIVATE Threads::Threads ${TBB_COMMON_LINK_LIBS})
         endif()
-        if (COMMAND target_link_options)
-            target_link_options(test_malloc_whitebox PRIVATE ${TBB_COMMON_LINK_FLAGS})
-        else()
-            target_link_libraries(test_malloc_whitebox PRIVATE ${TBB_COMMON_LINK_FLAGS})
-        endif()
-        target_link_libraries(test_malloc_whitebox PRIVATE Threads::Threads ${TBB_COMMON_LINK_LIBS})
-
         # ------------------------------------------------------------------------------------------
 
         # Define TBB malloc conformance tests
@@ -624,7 +647,9 @@ if (TARGET TBB::tbbmalloc)
         if (BUILD_SHARED_LIBS AND NOT TBB_SANITIZE MATCHES "thread" AND TBBMALLOC_PROXY_BUILD AND NOT MSVC_CXX_ARCHITECTURE_ID MATCHES "ARM64")
             # Define TBB malloc proxy tests
             tbb_add_lib_test(SUBDIR tbbmalloc NAME test_malloc_atexit DEPENDENCIES TBB::tbbmalloc_proxy TBB::tbbmalloc)
-            tbb_add_test(SUBDIR tbbmalloc NAME test_malloc_atexit DEPENDENCIES TBB::tbbmalloc_proxy TBB::tbbmalloc _test_malloc_atexit)
+	    if (NOT TBB_EMSCRIPTEN)
+	        tbb_add_test(SUBDIR tbbmalloc NAME test_malloc_atexit DEPENDENCIES TBB::tbbmalloc_proxy TBB::tbbmalloc _test_malloc_atexit)
+	    endif()
             tbb_add_test(SUBDIR tbbmalloc NAME test_malloc_overload DEPENDENCIES TBB::tbbmalloc_proxy)
             tbb_add_test(SUBDIR tbbmalloc NAME test_malloc_overload_disable DEPENDENCIES TBB::tbbmalloc_proxy TBB::tbbmalloc) # safer_msize call need to be available
             tbb_add_test(SUBDIR tbbmalloc NAME test_malloc_new_handler DEPENDENCIES TBB::tbbmalloc_proxy)

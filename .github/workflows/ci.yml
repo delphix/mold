@@ -1,133 +1,131 @@
 name: CI
 on:
   push:
-    branches: [ main ]
   pull_request:
-    branches: [ main ]
 env:
   UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
 jobs:
-  build-clang:
+  build-sanitizers:
     strategy:
       matrix:
         target:
-        # Disable PCH for the default configuration. This prevents relying on implicit includes.
-        - '-DCMAKE_DISABLE_PRECOMPILE_HEADERS=On'
+        - ''
         - '-DMOLD_USE_ASAN=On'
         - '-DMOLD_USE_TSAN=On'
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v3
     - uses: rui314/setup-mold@staging
-    - name: install-build-deps
-      run: sudo ./install-build-deps.sh update
-    - name: ccache
-      uses: hendrikmuhs/ccache-action@v1
-    - name: build and test
+    - run: sudo ./install-build-deps.sh
+    - name: build
       run: |
-        echo "/usr/lib/ccache:/usr/local/opt/ccache/libexec" >> $GITHUB_PATH
-        sudo apt-get install -y clang++-12
+        sudo apt-get install -y clang-18 clang gcc-multilib gdb dwarfdump zstd
         mkdir build
         cd build
-        cmake -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++-12 ${{ matrix.target }} ..
+        cmake -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 ${{ matrix.target }} ..
         cmake --build . -j$(nproc)
-        ctest . -j$(nproc)
+    - run: ctest --test-dir build -j$(nproc)
     - name: archive test results
       uses: actions/upload-artifact@v3
       if: failure()
       with:
         name: test-results-clang
         path: |
-          build/out
-          build/Testing
+          build
+          !build/CMakeFiles
 
-  build-gcc:
-    runs-on: ubuntu-20.04
+  build-multi-archs:
+    runs-on: ubuntu-latest
     container: gcc:11.1.0
     steps:
     - uses: actions/checkout@v3
     - name: install-build-deps
+      shell: bash
       run: |
         # Install cross toolchains
-        dpkg --add-architecture i386
-        ./install-build-deps.sh update
-        apt-get install -y sudo qemu-user gdb zstd dwarfdump xz-utils {gcc,g++}-10-{i686,aarch64,riscv64,powerpc,powerpc64,powerpc64le,s390x,sparc64,m68k,sh4,alpha}-linux-gnu {gcc,g++}-10-arm-linux-gnueabihf
-
-        for i in {i686,aarch64,riscv64,powerpc,powerpc64,powerpc64le,s390x,sparc64,m68k,sh4,alpha}-linux-gnu arm-linux-gnueabihf; do
-          ln -sf /usr/bin/$i-gcc-10 /usr/bin/$i-gcc
-          ln -sf /usr/bin/$i-g++-10 /usr/bin/$i-g++
-        done
+        ./install-build-deps.sh
+        ./install-cross-tools.sh
 
         # Install a RV32 toolchain from third party since it's not available
         # as an Ubuntu package.
-        mkdir /usr/local/rv32
-        wget -O- -q https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/2023.07.07/riscv32-glibc-ubuntu-20.04-gcc-nightly-2023.07.07-nightly.tar.gz | tar -C /usr/local/rv32 --strip-components=1 -xzf -
+        mkdir /rv32
+        wget -O- -q https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/2023.07.07/riscv32-glibc-ubuntu-20.04-gcc-nightly-2023.07.07-nightly.tar.gz | tar -C /rv32 --strip-components=1 -xzf -
 
-        ln -sf /usr/local/rv32/sysroot /usr/riscv32-linux-gnu
-        echo '/usr/local/rv32/bin/riscv32-unknown-linux-gnu-gcc -L/usr/riscv32-linux-gnu "$@"' > /usr/bin/riscv32-linux-gnu-gcc
-        echo '/usr/local/rv32/bin/riscv32-unknown-linux-gnu-g++ -L/usr/riscv32-linux-gnu "$@"' > /usr/bin/riscv32-linux-gnu-g++
+        ln -sf /rv32/sysroot /usr/riscv32-linux-gnu
+        echo '/rv32/bin/riscv32-unknown-linux-gnu-gcc -L/usr/riscv32-linux-gnu "$@"' > /usr/bin/riscv32-linux-gnu-gcc
+        echo '/rv32/bin/riscv32-unknown-linux-gnu-g++ -L/usr/riscv32-linux-gnu "$@"' > /usr/bin/riscv32-linux-gnu-g++
         chmod 755 /usr/bin/riscv32-linux-gnu-{gcc,g++}
 
         for i in objdump objcopy strip; do
-          ln -sf /usr/local/rv32/bin/riscv32-unknown-linux-gnu-$i /usr/bin/riscv32-linux-gnu-$i
+          ln -sf /rv32/bin/riscv32-unknown-linux-gnu-$i /usr/bin/riscv32-linux-gnu-$i
         done
 
         # Install a LoongArch toolchain
-        mkdir /usr/local/larch
-        wget -O- -q https://github.com/loongson/build-tools/releases/download/2023.08.08/CLFS-loongarch64-8.1-x86_64-cross-tools-gcc-glibc.tar.xz | tar -C /usr/local/larch --strip-components=1 --xz -xf -
+        mkdir /larch
+        wget -O- -q https://github.com/loongson/build-tools/releases/download/2024.08.08/x86_64-cross-tools-loongarch64-binutils_2.43-gcc_14.2.0-glibc_2.40.tar.xz | tar -C /larch --strip-components=1 --xz -xf -
 
-        ln -sf /usr/local/larch/target /usr/loongarch64-linux-gnu
-        cp -r /usr/local/larch/loongarch64-unknown-linux-gnu/lib/* /usr/loongarch64-linux-gnu/lib64/
+        cp -r /larch/loongarch64-unknown-linux-gnu/lib/* /larch/target/lib64
+        ln -sf /larch/target /usr/loongarch64-linux-gnu
 
-        for i in objdump objcopy strip; do
-          ln -sf /usr/local/larch/bin/loongarch64-unknown-linux-gnu-$i /usr/bin/loongarch64-linux-gnu-$i
+        for i in gcc g++ objdump objcopy strip; do
+          ln -sf /larch/bin/loongarch64-unknown-linux-gnu-$i /usr/bin/loongarch64-linux-gnu-$i
         done
 
-        echo '/usr/local/larch/bin/loongarch64-unknown-linux-gnu-gcc -L/usr/local/larch/loongarch64-unknown-linux-gnu "$@"' > /usr/bin/loongarch64-linux-gnu-gcc
-        echo '/usr/local/larch/bin/loongarch64-unknown-linux-gnu-g++ -L/usr/local/larch/loongarch64-unknown-linux-gnu "$@"' > /usr/bin/loongarch64-linux-gnu-g++
-        chmod 755 /usr/bin/loongarch64-linux-gnu-{gcc,g++}
-
-        wget -O/usr/local/bin/qemu-loongarch64 -q https://github.com/loongson/build-tools/releases/download/2023.08.08/qemu-loongarch64
+        wget -O /usr/local/bin/qemu-loongarch64 -q https://github.com/loongson/build-tools/releases/download/2023.08.08/qemu-loongarch64
         chmod 755 /usr/local/bin/qemu-loongarch64
 
-      shell: bash
-    - name: ccache
-      uses: hendrikmuhs/ccache-action@v1
-    - name: build and test
+        # Install Intel SDE CPU emulator for CET-related tests
+        mkdir /sde
+        wget -O- -q https://downloadmirror.intel.com/813591/sde-external-9.33.0-2024-01-07-lin.tar.xz | tar -C /sde --strip-components=1 --xz -xf -
+        ln -s /sde/sde /usr/bin
+    - name: build
       run: |
-        echo "/usr/lib/ccache:/usr/local/opt/ccache/libexec" >> $GITHUB_PATH
         mkdir build
         cd build
         cmake ..
         cmake --build . -j$(nproc)
-        ctest . -j$(nproc)
+    - run: ctest --test-dir build -j$(nproc)
     - name: archive test results
       uses: actions/upload-artifact@v3
       if: failure()
       with:
         name: test-results-gcc
         path: |
-          build/out
-          build/Testing
+          build
+          !build/CMakeFiles
 
-  build-macos:
-    runs-on: macos-11
+  build-distros:
     strategy:
       matrix:
-        target:
-        # Disable PCH for the default configuration. This prevents relying on implicit includes.
-        - '-DCMAKE_DISABLE_PRECOMPILE_HEADERS=On'
-        - '-DMOLD_USE_ASAN=On'
+        distro:
+        - alpine
+        - archlinux
+        - fedora
+        - gentoo/stage3
+        - opensuse/tumbleweed
+        - ubuntu:22.04
+    runs-on: ubuntu-latest
+    container: ${{ matrix.distro }}
     steps:
-    - uses: actions/checkout@v3
-    - name: ccache
-      uses: hendrikmuhs/ccache-action@v1
-    - name: build and test
+    - uses: actions/checkout@v2
+    - run: ./install-build-deps.sh
+    - name: build
       run: |
-        echo "/usr/lib/ccache:/usr/local/opt/ccache/libexec" >> $GITHUB_PATH
         mkdir build
         cd build
-        cmake ${{ matrix.target }} ..
+        cmake ..
+        cmake --build . -j$(nproc)
+    - run: ctest --test-dir build -j$(nproc)
+
+  build-macos:
+    runs-on: macos-12
+    steps:
+    - uses: actions/checkout@v3
+    - name: build
+      run: |
+        mkdir build
+        cd build
+        cmake ..
         cmake --build . -j$(sysctl -n hw.physicalcpu)
 
   build-windows:
@@ -140,3 +138,37 @@ jobs:
         cd build
         cmake -T clangcl ..
         cmake --build . -j $Env:NUMBER_OF_PROCESSORS
+
+  build-msys:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: UCRT64
+        update: true
+        pacboy: gcc-libs:p libwinpthread-git:p tbb:p zlib:p zstd:p dlfcn:p cc:p cmake:p ninja:p
+    - name: build
+      shell: msys2 {0}
+      run: |
+        mkdir build
+        cd build
+        cmake -GNinja -DMOLD_USE_MIMALLOC=OFF -DMOLD_USE_SYSTEM_TBB=ON ..
+        cmake --build . -j $(nproc)
+
+  build-freebsd:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Build and test
+      uses: vmactions/freebsd-vm@v1
+      with:
+        usesh: true
+        run: |
+          ./install-build-deps.sh
+          mkdir build
+          cd build
+          cmake ..
+          cmake --build . -j$(nproc)
+          ctest -j$(nproc)
