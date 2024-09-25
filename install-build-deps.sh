@@ -19,15 +19,12 @@ ubuntu-* | pop-* | linuxmint-* | debian-* | raspbian-*)
 fedora-* | amzn-* | rhel-*)
   dnf install -y gcc-g++ cmake glibc-static libstdc++-static diffutils util-linux
   ;;
-opensuse-leap-*)
-  zypper install -y make cmake gcc-c++ gcc11-c++ glibc-devel-static tar diffutils util-linux
-  ;;
-opensuse-tumbleweed-*)
+opensuse-*)
   zypper install -y make cmake gcc-c++ glibc-devel-static tar diffutils util-linux
   ;;
 gentoo-*)
   emerge-webrsync
-  emerge dev-build/cmake
+  FEATURES='getbinpkg binpkg-request-signature' emerge dev-build/cmake
   ;;
 arch-* | archarm-* | artix-* | endeavouros-*)
   pacman -Sy --needed --noconfirm base-devel cmake util-linux
@@ -42,6 +39,13 @@ alpine-*)
 clear-linux-*)
   swupd update
   swupd bundle-add c-basic diffutils
+  ;;
+almalinux-*)
+  dnf install -y gcc-toolset-13-gcc-c++ gcc-toolset-13-libstdc++-devel cmake diffutils
+  ;;
+freebsd-*)
+  pkg update
+  pkg install -y cmake bash binutils gcc
   ;;
 *)
   echo "Error: don't know anything about build dependencies on $ID-$VERSION_ID"
