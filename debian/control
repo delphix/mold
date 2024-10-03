@@ -3,7 +3,7 @@ Section: devel
 Priority: optional
 Maintainer: Sylvestre Ledru <sylvestre@debian.org>
 Build-Depends:
- cmake,
+ cmake (>= 3.18),
  debhelper-compat (= 12),
  dwarfdump,
  libssl-dev,
@@ -11,7 +11,8 @@ Build-Depends:
  pkg-config,
  zlib1g-dev,
  gdb,
- g++-10
+ g++-10,
+ libzstd-dev
 Standards-Version: 4.6.0
 Homepage: https://github.com/rui314/mold
 Vcs-Browser: https://salsa.debian.org/pkg-llvm-team/mold
